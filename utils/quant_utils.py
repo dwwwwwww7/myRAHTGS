@@ -141,7 +141,9 @@ class LsqQuan(Quantizer):
     
     def init_from(self, x, *args, **kwargs):
         with torch.no_grad():
+            # LSQ论文里的初始化方法
             self.s.data.fill_(x.detach().abs().mean().item() * 2 / (self.thd_pos ** 0.5))
+            # 以下为min-max初始化
             # min_val = x.detach().min()
             # max_val = x.detach().max()
             # if max_val == min_val:

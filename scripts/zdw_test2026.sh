@@ -8,8 +8,8 @@ TEST_ITERS="0 50 100 200 $ITERS"
 CONFIG=config4
 QUANT_TYPE=lsq    # vanilla or lsq
 MODEL_BASE="F:/3dgs_data/models"
-OUTPUT_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0305"
-CSV_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0305/csv"
+OUTPUT_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0308"
+CSV_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0308/csv"
 
 mkdir -p "$OUTPUT_BASE"
 mkdir -p "$CSV_BASE"
@@ -50,13 +50,6 @@ process_scene () {
     echo
 }
 
-# mic scene
-#SCENES=("mic" "lego" "drums" "ficus" "hotdog" "materials" "ship" "chair")
-#for SCENE in "${SCENES[@]}"; do
- #   process_scene "$SCENE" "/data/zdw/datasets/nerf_synthetic/$SCENE"
-#done
-
-
 # TUM scenes
 # SCENES=("train" "truck")
 SCENES=("train")
@@ -67,7 +60,7 @@ done
 # db
 #SCENES=("drjohnson" "playroom")
 #for SCENE in "${SCENES[@]}"; do
-#    process_scene "$SCENE" "E:/3dgs data/image&sparse/$SCENE"
+#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
 #done
 
 
@@ -75,7 +68,7 @@ done
 #SCENES=("counter" "room" "bicycle" "bonsai" "kitchen" "garden" "stump")
 #SCENES=("room")
 #for SCENE in "${SCENES[@]}"; do
-#    process_scene "$SCENE" "/data/zdw/datasets/360_v2/$SCENE"
+#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
 #done
 
 

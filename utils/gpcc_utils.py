@@ -7,6 +7,12 @@ import torch
 from tempfile import TemporaryDirectory
 from plyfile import PlyElement, PlyData
 
+# 获取项目根目录 (utils 文件夹的上级目录)
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 根据操作系统选择不同的默认可执行文件名称
+_TMC3_EXE_NAME = 'tmc3.exe' if os.name == 'nt' else 'tmc3'
+DEFAULT_GPCC_PATH = os.path.join(_ROOT_DIR, 'tmc13', _TMC3_EXE_NAME)
+
 
 def write_ply_geo_ascii(geo_data: np.ndarray, ply_path: str) -> None:
     """
@@ -27,10 +33,10 @@ def gpcc_encode(encoder_path: str, ply_path: str, bin_path: str) -> None:
     """
     Compress geometry point cloud by GPCC codec.
     """
-    # wine 是用于在 Linux 上运行 Windows 程序的工具，如果exe是linux上生成的，那么linux系统上也不需要wine
     # Windows 不需要 wine，Linux 需要 wine
-    # wine_prefix = '' if os.name == 'nt' else 'wine '
-    enc_cmd = (f'{encoder_path} '
+    # wine 是用于在 Linux 上运行 Windows 程序的工具，如果exe是linux上生成的，那么linux系统上也不需要wine
+    wine_prefix = '' if os.name == 'nt' else 'wine '
+    enc_cmd = (f'{wine_prefix}{encoder_path} '
                f'--mode=0 --trisoupNodeSizeLog2=0 --mergeDuplicatedPoints=0 --neighbourAvailBoundaryLog2=8 '
                f'--intra_pred_max_node_size_log2=6 --positionQuantizationScale=1 --inferredDirectCodingMode=1 '
                f'--maxNumQtBtBeforeOt=4 --minQtbtSizeLog2=0 --planarEnabled=0 --planarModeIdcmUse=0 '
@@ -39,7 +45,7 @@ def gpcc_encode(encoder_path: str, ply_path: str, bin_path: str) -> None:
     exit_code = os.system(enc_cmd)
     assert exit_code == 0, f'GPCC encoder failed with exit code {exit_code}.'
 
-def compress_gpcc(x: torch.Tensor, gpcc_codec_path=r"/data/zdw/zdw_data_2025/newRAHT/myMesonGS/tmc13/tmc3") -> bytes:
+def compress_gpcc(x: torch.Tensor, gpcc_codec_path=DEFAULT_GPCC_PATH) -> bytes:
     """
     Compress geometry point cloud by GPCC codec.
     """
@@ -59,9 +65,8 @@ def gpcc_decode(decoder_path: str, bin_path: str, recon_path: str) -> None:
     Decompress geometry point cloud by GPCC codec.
     """
     # Windows 不需要 wine，Linux 需要 wine
-    # wine 是用于在 Linux 上运行 Windows 程序的工具，如果exe是linux上生成的，那么linux系统上也不需要wine
-    # wine_prefix = '' if os.name == 'nt' else 'wine '
-    dec_cmd = (f'{decoder_path} '
+    wine_prefix = '' if os.name == 'nt' else 'wine '
+    dec_cmd = (f'{wine_prefix}{decoder_path} '
                f'--mode=1 --outputBinaryPly=1 '
                f'--compressedStreamPath={bin_path} --reconstructedDataPath={recon_path} ')
     dec_cmd += '> nul 2>&1' if os.name == 'nt' else '> /dev/null 2>&1'
@@ -78,7 +83,7 @@ def read_ply_geo_bin(ply_path: str) -> np.ndarray:
     means = np.stack([ply_data.data[name] for name in ['x', 'y', 'z']], axis=1)  # shape (N, 3)
     return means
 
-def decompress_gpcc(strings: bytes, gpcc_codec_path = r"/data/zdw/zdw_data_2025/newRAHT/myMesonGS/tmc13/tmc3") -> torch.Tensor:
+def decompress_gpcc(strings: bytes, gpcc_codec_path=DEFAULT_GPCC_PATH) -> torch.Tensor:
     """
     Decompress geometry point cloud by GPCC codec.
     """

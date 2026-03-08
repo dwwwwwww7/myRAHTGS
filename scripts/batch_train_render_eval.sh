@@ -17,45 +17,24 @@
 # 配置参数
 # ============================================================================
 
-# 数据集路径
-DATA_BASE="E:/3dgs data/image&sparse"
-MODEL_BASE="E:/3dgs data/models"
-OUTPUT_BASE="E:/3dgs data/MesonGS/output"
-CSV_BASE="E:/3dgs data/MesonGS/exp_data"
+# 路径配置
+MODEL_BASE="F:/3dgs_data/models"
+OUTPUT_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0308"
+CSV_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0308/csv"
+
 mkdir -p "$OUTPUT_BASE"
 mkdir -p "$CSV_BASE"
 
-# 要处理的场景列表
-declare -a SCENES=(
-    "playroom"
-	#"bicycle"
-    # "bonsai"
-    # "counter"
-    # "kitchen"
-    # "room"
-    # "stump"
-    # "garden"
-    # "train"
-     #"truck"
-    # "chair"
-    # "drums"
-    # "ficus"
-    # "hotdog"
-    # "lego"
-    # "mic"
-    # "materials"
-    # "ship"
-)
-
 # 训练参数
-ITERS=0                    # 微调迭代次数
-CONFIG="config3"            # 配置文件
-TEST_ITERS="0 $ITERS"       # 测试迭代（0=初始评估，ITERS=最终评估）
+ITERS=0                   # 微调迭代次数
+CONFIG="config4"             # 配置文件
+QUANT_TYPE="lsq"             # 量化类型: vanilla or lsq
+TEST_ITERS="0  $ITERS"  # 测试迭代（0=初始评估，ITERS=最终评估）
 
 # 流程控制
 SKIP_TRAINING=false          # 是否跳过训练步骤（使用已有模型）
-SKIP_TRAIN=true             # 是否跳过训练集渲染
-SKIP_TEST=false             # 是否跳过测试集渲染
+SKIP_TRAIN=true              # 是否跳过训练集渲染
+SKIP_TEST=false              # 是否跳过测试集渲染
 
 # GPU 设备
 CUDA_DEVICE=0
@@ -63,6 +42,9 @@ CUDA_DEVICE=0
 # 日志目录
 LOG_DIR="logs_batch"
 mkdir -p "$LOG_DIR"
+
+# 记录全局的场景名列表（用于最后的汇总分析）
+declare -a PROCESSED_SCENES=()
 
 # ============================================================================
 # 辅助函数
@@ -95,30 +77,35 @@ check_status() {
     fi
 }
 
-# ============================================================================
-# 主循环
-# ============================================================================
-
 print_separator "MesonGS 批量训练、渲染和评估"
-echo "场景列表: ${SCENES[@]}"
 echo "微调迭代: $ITERS"
 echo "配置文件: $CONFIG"
+echo "量化配置: $QUANT_TYPE"
 echo "GPU 设备: $CUDA_DEVICE"
 print_separator "开始处理"
 
 # 记录开始时间
 START_TIME=$(date +%s)
 
-# 统计信息
-TOTAL_SCENES=${#SCENES[@]}
+# 全局统计信息
+TOTAL_SCENES=0
 SUCCESS_COUNT=0
 FAIL_COUNT=0
 
-for SCENE in "${SCENES[@]}"; do
+# ============================================================================
+# 核心处理函数 process_scene
+# ============================================================================
+
+process_scene() {
+    local SCENE=$1
+    local DATAPATH=$2
+    
+    PROCESSED_SCENES+=("$SCENE")
+    TOTAL_SCENES=$((TOTAL_SCENES + 1))
+    
     print_separator "处理场景: $SCENE"
     
     # 构建路径
-    DATAPATH="$DATA_BASE/$SCENE"
     INITIALPATH="$MODEL_BASE/$SCENE/point_cloud/iteration_30000/point_cloud.ply"
     CSVPATH="$CSV_BASE/${SCENE}_${CONFIG}.csv"
     SAVEPATH="$OUTPUT_BASE/${SCENE}_${CONFIG}"
@@ -127,6 +114,9 @@ for SCENE in "${SCENES[@]}"; do
     TRAIN_LOG="$LOG_DIR/${SCENE}_train.log"
     RENDER_LOG="$LOG_DIR/${SCENE}_render.log"
     METRICS_LOG="$LOG_DIR/${SCENE}_metrics.log"
+    
+    echo "SAVEPATH: $SAVEPATH"
+    echo "CSVPATH: $CSVPATH"
     
     # ========================================================================
     # 步骤 1: 检查预训练模型是否存在
@@ -137,7 +127,7 @@ for SCENE in "${SCENES[@]}"; do
         echo "错误: 找不到预训练模型: $INITIALPATH"
         echo "跳过场景 $SCENE"
         ((FAIL_COUNT++))
-        continue
+        return 1
     fi
     echo "✓ 预训练模型存在: $INITIALPATH"
     
@@ -145,7 +135,7 @@ for SCENE in "${SCENES[@]}"; do
         echo "错误: 找不到数据集: $DATAPATH"
         echo "跳过场景 $SCENE"
         ((FAIL_COUNT++))
-        continue
+        return 1
     fi
     echo "✓ 数据集存在: $DATAPATH"
     
@@ -165,7 +155,7 @@ for SCENE in "${SCENES[@]}"; do
         if [ ! -d "$MODEL_PATH" ]; then
             echo "错误: 找不到模型目录: $MODEL_PATH"
             ((FAIL_COUNT++))
-            continue
+            return 1
         fi
         
         # 检查压缩文件是否存在
@@ -173,7 +163,7 @@ for SCENE in "${SCENES[@]}"; do
         if [ ! -f "$NPZ_PATH" ]; then
             echo "错误: 找不到压缩文件: $NPZ_PATH"
             ((FAIL_COUNT++))
-            continue
+            return 1
         fi
         
         echo "✓ 找到已训练模型"
@@ -199,6 +189,8 @@ for SCENE in "${SCENES[@]}"; do
             --finetune_lr_scale 1 \
             --raht \
             --per_block_quant \
+            --quant $QUANT_TYPE \
+            --lambda_sparsity 5e-7 \
             --clamp_color \
             --convert_SHs_python \
             --save_imp \
@@ -211,7 +203,7 @@ for SCENE in "${SCENES[@]}"; do
     if ! check_status $TRAIN_STATUS "微调训练/模型检查"; then
         echo "跳过后续步骤"
         ((FAIL_COUNT++))
-        continue
+        return 1
     fi
     
     # ========================================================================
@@ -222,7 +214,7 @@ for SCENE in "${SCENES[@]}"; do
     echo "开始渲染..."
     echo "日志文件: $RENDER_LOG"
     
-    # 构建渲染命令（参考 render.sh）
+    # 构建渲染命令
     RENDER_CMD="python render.py -s \"$DATAPATH\" -m \"$SAVEPATH\" --iteration $ITERS --dec_npz --eval"
     
     # 添加场景名称和日志名称
@@ -241,6 +233,7 @@ for SCENE in "${SCENES[@]}"; do
     
     echo "命令: $RENDER_CMD"
     
+    export CUDA_LAUNCH_BLOCKING=1
     CUDA_VISIBLE_DEVICES=$CUDA_DEVICE eval $RENDER_CMD 2>&1 | tee "$RENDER_LOG"
     
     RENDER_STATUS=$?
@@ -248,7 +241,7 @@ for SCENE in "${SCENES[@]}"; do
     if ! check_status $RENDER_STATUS "渲染"; then
         echo "跳过后续步骤"
         ((FAIL_COUNT++))
-        continue
+        return 1
     fi
     
     # ========================================================================
@@ -265,7 +258,7 @@ for SCENE in "${SCENES[@]}"; do
     
     if ! check_status $METRICS_STATUS "质量指标计算"; then
         ((FAIL_COUNT++))
-        continue
+        return 1
     fi
     
     # ========================================================================
@@ -283,8 +276,31 @@ for SCENE in "${SCENES[@]}"; do
     ((SUCCESS_COUNT++))
     
     print_separator "场景 $SCENE 全部完成"
-    
+    return 0
+}
+
+# ============================================================================
+# 场景执行
+# ============================================================================
+
+# TUM scenes
+# SCENES=("train" "truck")
+SCENES=("train")
+for SCENE in "${SCENES[@]}"; do
+    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
 done
+
+# db
+#SCENES=("drjohnson" "playroom")
+#for SCENE in "${SCENES[@]}"; do
+#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+#done
+
+# 360_v2 scenes
+#SCENES=("counter" "room" "bicycle" "bonsai" "kitchen" "garden" "stump")
+#for SCENE in "${SCENES[@]}"; do
+#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+#done
 
 # ============================================================================
 # 最终总结
@@ -307,7 +323,7 @@ echo "  总耗时: ${HOURS}h ${MINUTES}m ${SECONDS}s"
 echo ""
 
 echo "详细结果:"
-for SCENE in "${SCENES[@]}"; do
+for SCENE in "${PROCESSED_SCENES[@]}"; do
     SAVEPATH="$OUTPUT_BASE/${SCENE}_${CONFIG}"
     RESULTS_FILE="$SAVEPATH/results.json"
     
@@ -354,7 +370,7 @@ echo "生成汇总 CSV: $SUMMARY_CSV"
 # CSV 表头
 echo "Scene,PSNR,SSIM,LPIPS,Size_MB,Status" > "$SUMMARY_CSV"
 
-for SCENE in "${SCENES[@]}"; do
+for SCENE in "${PROCESSED_SCENES[@]}"; do
     SAVEPATH="$OUTPUT_BASE/${SCENE}_${CONFIG}"
     RESULTS_FILE="$SAVEPATH/results.json"
     NPZ_PATH="$SAVEPATH/point_cloud/iteration_$ITERS/pc_npz/bins.zip"
@@ -365,8 +381,8 @@ for SCENE in "${SCENES[@]}"; do
         LPIPS=$(jq -r '.ours_'$ITERS'.LPIPS' "$RESULTS_FILE" 2>/dev/null)
         
         if [ -f "$NPZ_PATH" ]; then
-            SIZE_BYTES=$(stat -f%z "$NPZ_PATH" 2>/dev/null || stat -c%s "$NPZ_PATH" 2>/dev/null)
-            SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1024 / 1024" | bc)
+            SIZE_BYTES=$(stat -c%s "$NPZ_PATH" 2>/dev/null || stat -f%z "$NPZ_PATH" 2>/dev/null)
+            SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1024 / 1024" | bc 2>/dev/null || echo "N/A")
         else
             SIZE_MB="N/A"
         fi

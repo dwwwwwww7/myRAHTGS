@@ -120,7 +120,8 @@ class Scene:
     def save_ft(self, iteration, pipe, per_channel_quant=False, per_block_quant=False, bit_packing=True):
         pc_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         print('save_npz gaussians:', pc_path)
-        self.gaussians.save_ft_ply(os.path.join(pc_path, "point_cloud.ply"))  ##开启后会保存ply
+        # 开启后会保存ply
+        #self.gaussians.save_ft_ply(os.path.join(pc_path, "point_cloud.ply")) 
         if pipe.save_ft_type == 'full_npz':
             print('save_npz gaussians:', pc_path)
             self.gaussians.save_full_npz(os.path.join(pc_path, "pc_npz"), pipe, per_channel_quant=per_channel_quant, per_block_quant=per_block_quant)

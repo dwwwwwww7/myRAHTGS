@@ -1,18 +1,43 @@
-MAINDIR=/your/path/to/mesongs
-DATADIR=/your/path/to/data
-CKPT= # use your path
-SCENENAME=mic
+#解压缩并渲染生成的npz文件,过程中会保存解压得到的ply文件
+ITERS=0
+CONFIG="config4"          # 配置文件
+OUTPUT_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0308"
+
+process_scene () {
+    local SCENE=$1
+    local DATAPATH=$2
+    echo "=== Processing scene: $SCENE ==="
+    SAVEPATH="$OUTPUT_BASE/${SCENE}_${CONFIG}"
+    # 调试：打印路径
+    echo "CSVPATH: $CSVPATH"
+    echo "SAVEPATH: $SAVEPATH"
+
+    export CUDA_LAUNCH_BLOCKING=1
+    export DEBUG_RENDER=1
+    CUDA_VISIBLE_DEVICES=0 python render.py -s "$DATAPATH" -m "$SAVEPATH" --iteration $ITERS --dec_npz --eval --skip_train
+    
+    echo "=== Finished scene: $SCENE ==="
+}
 
 
-CUDA_VISIBLE_DEVICES=0 python render.py -s $DATADIR/nerf_synthetic/$SCENENAME \
-    --given_ply_path $MAINDIR/output/$CKPT/point_cloud/iteration_0/pc_npz/bins.zip \
-    --eval \
-    --skip_train \
-    -w \
-    --dec_npz \
-    --scene_name $SCENENAME \
-    --csv_path $MAINDIR/exp_data/csv/test_$CKPT.csv \
-    --model_path $MAINDIR/output/$CKPT
+# TUM scenes
+# SCENES=("train" "truck")
+SCENES=("train")
+for SCENE in "${SCENES[@]}"; do
+    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+done
+
+# db
+#SCENES=("drjohnson" "playroom")
+#for SCENE in "${SCENES[@]}"; do
+#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+#done
 
 
-# --given_ply_path $MAINDIR/output/$CKPT/point_cloud/iteration_0/pc_npz
+# 360_v2 scenes
+#SCENES=("counter" "room" "bicycle" "bonsai" "kitchen" "garden" "stump")
+#SCENES=("room")
+#for SCENE in "${SCENES[@]}"; do
+#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+#done
+

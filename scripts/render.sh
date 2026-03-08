@@ -1,7 +1,7 @@
 #解压缩并渲染生成的npz文件,过程中会保存解压得到的ply文件
 ITERS=0
 CONFIG="config4"          # 配置文件
-OUTPUT_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0308"
+OUTPUT_BASE="/data/zdw/zdw_data_2025/newRAHT/myMesonGS/results_2026/lsq0306_10000"
 
 process_scene () {
     local SCENE=$1
@@ -24,13 +24,13 @@ process_scene () {
 # SCENES=("train" "truck")
 SCENES=("train")
 for SCENE in "${SCENES[@]}"; do
-    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+    process_scene "$SCENE" "/data/zdw/datasets/tandt_db/tandt/$SCENE"
 done
 
 # db
 #SCENES=("drjohnson" "playroom")
 #for SCENE in "${SCENES[@]}"; do
-#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+#    process_scene "$SCENE" "/data/zdw/datasets/tandt_db/db/$SCENE"
 #done
 
 
@@ -38,7 +38,7 @@ done
 #SCENES=("counter" "room" "bicycle" "bonsai" "kitchen" "garden" "stump")
 #SCENES=("room")
 #for SCENE in "${SCENES[@]}"; do
-#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+#    process_scene "$SCENE" "/data/zdw/datasets/360_v2/$SCENE"
 #done
 
 eration_0/pc_npz

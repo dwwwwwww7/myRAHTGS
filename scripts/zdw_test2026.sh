@@ -11,6 +11,7 @@ MODEL_BASE="/data/zdw/datasets/inria3DGS_pretrained_models"
 OUTPUT_BASE="/data/zdw/zdw_data_2025/newRAHT/myMesonGS/results_2026/lsq0306_10000"
 CSV_BASE="/data/zdw/zdw_data_2025/newRAHT/myMesonGS/results_2026/lsq0306_10000/csv"
 
+
 mkdir -p "$OUTPUT_BASE"
 mkdir -p "$CSV_BASE"
 
@@ -54,13 +55,13 @@ process_scene () {
 # SCENES=("train" "truck")
 SCENES=("train")
 for SCENE in "${SCENES[@]}"; do
-    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+    process_scene "$SCENE" "/data/zdw/datasets/tandt_db/tandt/$SCENE"
 done
 
 # db
 #SCENES=("drjohnson" "playroom")
 #for SCENE in "${SCENES[@]}"; do
-#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+#    process_scene "$SCENE" "/data/zdw/datasets/tandt_db/db/$SCENE"
 #done
 
 
@@ -68,7 +69,7 @@ done
 #SCENES=("counter" "room" "bicycle" "bonsai" "kitchen" "garden" "stump")
 #SCENES=("room")
 #for SCENE in "${SCENES[@]}"; do
-#    process_scene "$SCENE" "F:/3dgs_data/image&sparse/$SCENE"
+#    process_scene "$SCENE" "/data/zdw/datasets/360_v2/$SCENE"
 #done
 
 

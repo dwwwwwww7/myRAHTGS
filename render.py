@@ -99,6 +99,27 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
         # print('bg_color', bg_color)
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
+        # Save decompressed PLY file if loaded from NPZ (only if iteration is valid)
+        if render_args.dec_npz and hasattr(gaussians, 'save_decompressed_ply') and scene.loaded_iter is not None:
+            ply_save_path = os.path.join(
+                dataset.model_path, 
+                "point_cloud", 
+                f"iteration_{scene.loaded_iter}", 
+                "decompressed.ply"
+            )
+            print(f"\nSaving decompressed PLY file...")
+            gaussians.save_decompressed_ply(ply_save_path)
+        
+        # Ensure save_dir_name has a value (for metrics.py compatibility)
+        if not render_args.save_dir_name:
+            render_args.save_dir_name = "ours"
+        
+        # Automatically add iteration number suffix to save_dir_name
+        if scene.loaded_iter is not None:
+            original_save_dir = render_args.save_dir_name
+            render_args.save_dir_name = f"{original_save_dir}_{scene.loaded_iter}"
+            print(f"\nRender output directory: {render_args.save_dir_name}")
+        
         metric_vals = []
         
         if render_args.render_video:

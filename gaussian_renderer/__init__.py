@@ -23,6 +23,9 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.quant_utils import split_length
 
+PROFILE_TIME = True # Macro added for time profiling
+if PROFILE_TIME:
+    import time
 
 def ToEulerAngles_FT(q, save=False):
 
@@ -277,6 +280,13 @@ def ft_render(
     
     Background tensor (bg_color) must be on GPU!
     """
+    
+    # 控制调试信息只在第一次渲染时打印
+    if not hasattr(ft_render, '_first_render_done'):
+        ft_render._first_render_done = False
+    
+    # 判断是否应该打印调试信息
+    should_print_debug = debug and not training and not ft_render._first_render_done
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
@@ -309,7 +319,11 @@ def ft_render(
     )
 
     
-    rasterizer = GaussianRasterizerIndexed(raster_settings=raster_settings)
+    # Choose rasterizer based on whether we're using indexed mode
+    if pipe.use_indexed:
+        rasterizer = GaussianRasterizerIndexed(raster_settings=raster_settings)
+    else:
+        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
     
     # if training:
     #     if pipe.train_mode == 'rot':
@@ -328,24 +342,52 @@ def ft_render(
     #     shzero_range = [5, 8]
     # elif re_mode == 'euler':
     re_range = [1, 4]
-    shzero_range = [4, 7]
+    # shzero_range changed: now includes f_dc(3) + f_rest(45) = 48 dims
+    # raht_features: opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3) = 55 dims
+    shzero_range = [4, 52]  # f_dc + f_rest (scale is at [52:55])
     
     means3D = pc.get_xyz
     means2D = screenspace_points
 
 
     if raht:
+        if should_print_debug:
+            print("\n【RAHT变换】正向变换")
+            print(f"  输入特征维度: 55 (opacity + euler + f_dc + f_rest + scale)")
+        
         r = pc.get_ori_rotation
         norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
         q = r / norm[:, None]
         eulers = ToEulerAngles_FT(q, save=False)
-        rf = torch.concat([pc.get_origin_opacity, eulers, pc.get_features_dc.contiguous().squeeze()], -1)
+        # Include f_rest and scale in RAHT transform: 
+        # opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3) = 55 dims
+        rf = torch.concat([
+            pc.get_origin_opacity, 
+            eulers, 
+            pc.get_features_dc.contiguous().squeeze(),
+            pc.get_indexed_feature_extra.contiguous().flatten(-2),  # f_rest (45 dims)
+            pc.get_ori_scaling  # scale (3 dims)
+        ], -1)
+        
+        if should_print_debug:
+            print(f"  rf 形状: {rf.shape}")
+            print(f"  rf 范围: [{rf.min().item():.4f}, {rf.max().item():.4f}]")
 
         C = rf[pc.reorder]
+        
+        if should_print_debug:
+            print(f"  Morton排序后 C 形状: {C.shape}")
         iW1 = pc.res['iW1']
         iW2 = pc.res['iW2']
         iLeft_idx = pc.res['iLeft_idx']
         iRight_idx = pc.res['iRight_idx']
+
+        if should_print_debug:
+            print(f"  执行 {pc.depth * 3} 层 RAHT 变换...")
+        
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_raht_forward_start = time.time()
 
         for d in range(pc.depth * 3):
             w1 = iW1[d]
@@ -357,22 +399,63 @@ def ft_render(
                                                   C[left_idx], 
                                                   C[right_idx])
         
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_raht_forward_end = time.time()
+
+        if should_print_debug:
+            print(f"  RAHT变换后 C 范围: [{C.min().item():.4f}, {C.max().item():.4f}]")
+            print("\n【量化】分块量化")
+        
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_quant_start = time.time()
+
         quantC = torch.zeros_like(C)
         quantC[0] = C[0]
         if per_channel_quant:
             for i in range(C.shape[-1]):
+                if hasattr(pc.qas[i], 'init_yet') and not pc.qas[i].init_yet:
+                    pc.qas[i].init_from(C[1:, i])
                 quantC[1:, i] = pc.qas[i](C[1:, i])
         elif per_block_quant:
             qa_cnt = 0
             lc1 = C.shape[0] - 1
             split_ac = split_length(lc1, pc.n_block)
+            
+            if should_print_debug:
+                print(f"  块数量: {pc.n_block}")
+                print(f"  每块点数: {split_ac[:3]}... (前3块)")
+                print(f"  量化 55 维 RAHT 特征 (包含 scale)...")
+            
             for i in range(C.shape[-1]):
+                for j, length in enumerate(split_ac):
+                    qa_idx = qa_cnt + j
+                    if hasattr(pc.qas[qa_idx], 'init_yet') and not pc.qas[qa_idx].init_yet:
+                        start_idx = sum(split_ac[:j]) + 1
+                        end_idx = start_idx + length
+                        pc.qas[qa_idx].init_from(C[start_idx:end_idx, i])
+
                 quantC[1:, i] = seg_quant_ave(C[1:, i], split_ac, pc.qas[qa_cnt : qa_cnt + pc.n_block])
                 qa_cnt += pc.n_block
             
+            if should_print_debug:
+                print(f"  所有特征量化完成，使用了 {qa_cnt} 个量化器 (55 × {pc.n_block})")
+            
         else:
+            if hasattr(pc.qa, 'init_yet') and not pc.qa.init_yet:
+                pc.qa.init_from(C[1:])
             quantC[1:] = pc.qa(C[1:])
 
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_quant_end = time.time()
+
+        if should_print_debug:
+            print("\n【RAHT变换】逆变换")
+            print(f"  quantC 形状: {quantC.shape}")
+            print(f"  quantC 范围: [{quantC.min().item():.4f}, {quantC.max().item():.4f}]")
+        
         res_inv = pc.res_inv
         pos = res_inv['pos']
         iW1 = res_inv['iW1']
@@ -391,6 +474,13 @@ def ft_render(
         raht_features = torch.zeros(quantC.shape).cuda()
         OC = torch.zeros(quantC.shape).cuda()
         
+        if should_print_debug:
+            print(f"  执行 {pc.depth*3} 层逆 RAHT 变换...")
+        
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_raht_inverse_start = time.time()
+
         for i in range(pc.depth*3):
             w1 = iW1[i]
             w2 = iW2[i]
@@ -411,23 +501,23 @@ def ft_render(
 
         raht_features[pc.reorder] = OC
         
-        scales = pc.get_ori_scaling
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_raht_inverse_end = time.time()
         
-        if per_channel_quant:
-            scalesq = torch.zeros_like(scales).cuda()
-            scaleqa_offset = 7
-            for i in range(scaleqa_offset, scaleqa_offset + 3):
-                scalesq[:, i-scaleqa_offset] = pc.qas[i](scales[:, i-scaleqa_offset])
-
-        elif per_block_quant:
-            scalesq = torch.zeros_like(scales).cuda()
-            split_scale = split_length(scales.shape[0], pc.n_block)
-            for i in range(scales.shape[-1]):
-                # scalesq[:, i] = seg_quant(scales[:, i], pc.lseg, pc.qas[qa_cnt : qa_cnt + blocks_in_channel])
-                scalesq[:, i] = seg_quant_ave(scales[:, i], split_scale, pc.qas[qa_cnt: qa_cnt + pc.n_block])
-                qa_cnt += pc.n_block
-        else:
-            scalesq = pc.scale_qa(scales)
+        if should_print_debug:
+            print(f"  逆变换完成")
+            print(f"  raht_features 形状: {raht_features.shape}")
+            print(f"  raht_features 范围: [{raht_features.min().item():.4f}, {raht_features.max().item():.4f}]")
+            print(f"  提取特征: opacity[0:1], euler[1:4], all_sh[4:52], scale[52:55]")
+        
+        # Extract scale from raht_features (no longer need separate quantization)
+        scalesq = raht_features[:, 52:55]  # Extract scale from RAHT features
+        
+        if should_print_debug:
+            print(f"\n【特征提取】从 RAHT 特征提取 Scale")
+            print(f"  scalesq 形状: {scalesq.shape}")
+            print(f"  scalesq 范围: [{scalesq.min().item():.4f}, {scalesq.max().item():.4f}]")
                 
         scaling = torch.exp(scalesq)
         
@@ -447,36 +537,77 @@ def ft_render(
         rotations = None
         eulers = None
         colors_precomp = None
+        sh_indices = None
+        sh_zero = None
+        sh_ones = None
         
         if pipe.use_indexed:
             sh_zero = raht_features[:, shzero_range[0]:].unsqueeze(1).contiguous()
             sh_ones = pc.get_features_extra.reshape(-1, (pc.max_sh_degree+1)**2 - 1, 3)
             sh_indices = pc.get_feature_indices
         else:
-            features_dc = raht_features[:, shzero_range[0]:].unsqueeze(1)
-            feature_extra = pc.get_indexed_feature_extra
-            features = torch.cat((features_dc, feature_extra), dim=1)
-            shs_view = features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            # When not using indexed mode, compute colors directly from SH coefficients
+            # Extract all SH coefficients from raht_features: f_dc(3) + f_rest(45) = 48 dims
+            all_sh_features = raht_features[:, shzero_range[0]:shzero_range[1]]  # [N, 48]
+            # Reshape to [N, 16, 3] where 16 = (max_sh_degree+1)^2 = 4^2
+            n_sh = (pc.max_sh_degree + 1) ** 2  # 16
+            features = all_sh_features.reshape(-1, n_sh, 3)  # [N, 16, 3]
+            shs_view = features.transpose(1, 2).view(-1, 3, n_sh)  # [N, 3, 16]
             dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            # Set sh_* to None so rasterizer knows to use colors_precomp
+            sh_zero = None
+            sh_ones = None
+            sh_indices = None
     else:
         raise Exception("Sorry, w/o raht version is unimplemented.")
         
-    rendered_image, radii = rasterizer(
-        means3D = means3D,
-        means2D = means2D,
-        opacities = opacity,
-        sh_indices = sh_indices,
-        sh_zero = sh_zero,
-        sh_ones = sh_ones,
-        colors_precomp = colors_precomp,
-        scales = scales,
-        rotations = rotations,
-        cov3D_precomp = cov3D_precomp)
+    # Call rasterizer with appropriate parameters based on type
+    if pipe.use_indexed:
+        rendered_image, radii = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            opacities = opacity,
+            sh_indices = sh_indices,
+            sh_zero = sh_zero,
+            sh_ones = sh_ones,
+            colors_precomp = colors_precomp,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp)
+    else:
+        # GaussianRasterizer doesn't accept sh_indices, sh_zero, sh_ones
+        rendered_image, radii = rasterizer(
+            means3D = means3D,
+            means2D = means2D,
+            opacities = opacity,
+            colors_precomp = colors_precomp,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp)
 
-    return {"render": rendered_image,
-            "viewspace_points": screenspace_points,
-            "visibility_filter" : radii > 0,
-            "radii": radii}
+    # 返回结果，如果使用RAHT则包含系数C用于稀疏性损失
+    result = {
+        "render": rendered_image,
+        "viewspace_points": screenspace_points,
+        "visibility_filter": radii > 0,
+        "radii": radii
+    }
+    
+    # 如果使用RAHT且在训练模式，返回AC系数用于稀疏性损失
+    if raht and training and 'C' in locals():
+        result["raht_coeffs"] = C[1:]  # 只返回AC系数，不包括DC
+        if PROFILE_TIME:
+            result["profile"] = {
+                "raht_forward": t_raht_forward_end - t_raht_forward_start,
+                "quant": t_quant_end - t_quant_start,
+                "raht_inverse": t_raht_inverse_end - t_raht_inverse_start,
+            }
+    
+    # 标记第一次渲染已完成
+    if should_print_debug:
+        ft_render._first_render_done = True
+    
+    return result

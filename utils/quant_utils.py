@@ -70,7 +70,6 @@ class LSQPlusActivationQuantizer(nn.Module):
         self.beta = torch.nn.Parameter(torch.tensor([float(-1e-9)]), requires_grad=True)
         self.init_state = 0
 
-    # 量化/反量化
     def forward(self, activation):
         #V1
         # print(self.a_bits, self.batch_init)
@@ -100,6 +99,7 @@ def round_pass(x):
 class Quantizer(nn.Module):
     def __init__(self, bit):
         super().__init__()
+        self.bit = bit  # 保存 bit 属性
 
     def init_from(self, x, *args, **kwargs):
         pass
@@ -118,7 +118,7 @@ class IdentityQuan(Quantizer):
 
 
 class LsqQuan(Quantizer):
-    def __init__(self, bit, init_yet, all_positive=True, symmetric=False, per_channel=False):
+    def __init__(self, bit, init_yet, all_positive=True, symmetric=False):
         super().__init__(bit)
         
         if all_positive:
@@ -136,24 +136,23 @@ class LsqQuan(Quantizer):
                 self.thd_neg = - 2 ** (bit - 1)
                 self.thd_pos = 2 ** (bit - 1) - 1
 
-        self.per_channel = per_channel
         self.s = nn.Parameter(torch.ones(1))
         self.init_yet = init_yet
     
     def init_from(self, x, *args, **kwargs):
-        if self.per_channel:
-            self.s = nn.Parameter(
-                x.detach().abs().mean(dim=list(range(1, x.dim())), keepdim=True) * 2 / (self.thd_pos ** 0.5))
-        else:
-            self.s = nn.Parameter(x.detach().abs().mean() * 2 / (self.thd_pos ** 0.5))
+        with torch.no_grad():
+            self.s.data.fill_(x.detach().abs().mean().item() * 2 / (self.thd_pos ** 0.5))
+            # min_val = x.detach().min()
+            # max_val = x.detach().max()
+            # if max_val == min_val:
+            #     max_val = max_val + 1e-5
+            # scale_init = (max_val - min_val) / (self.thd_pos - self.thd_neg)
+            # self.s.data.fill_(scale_init.item())
         self.init_yet = True
-        # print('quant_utils.py Line 62:', self.s)
+        # print('quant_utils.py Line 62:', self.s)  # 打印初始化后的s
     
     def forward(self, x):
-        if self.per_channel:
-            s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
-        else:
-            s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
+        s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
         s_scale = grad_scale(self.s, s_grad_scale)
 
         x = x / s_scale

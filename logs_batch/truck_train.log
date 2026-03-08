@@ -1,0 +1,219 @@
+args.test_iterations [0, 100]
+Optimizing /data/zdw/zdw_data/3dgs data/MesonGS/output/truck_config3
+hyper_config config3 [27/11 15:04:52]
+debug False [27/11 15:04:52]
+Output folder: /data/zdw/zdw_data/3dgs data/MesonGS/output/truck_config3 [27/11 15:04:52]
+Tensorboard not available: not logging progress [27/11 15:04:52]
+Reading camera 1/251Reading camera 2/251Reading camera 3/251Reading camera 4/251Reading camera 5/251Reading camera 6/251Reading camera 7/251Reading camera 8/251Reading camera 9/251Reading camera 10/251Reading camera 11/251Reading camera 12/251Reading camera 13/251Reading camera 14/251Reading camera 15/251Reading camera 16/251Reading camera 17/251Reading camera 18/251Reading camera 19/251Reading camera 20/251Reading camera 21/251Reading camera 22/251Reading camera 23/251Reading camera 24/251Reading camera 25/251Reading camera 26/251Reading camera 27/251Reading camera 28/251Reading camera 29/251Reading camera 30/251Reading camera 31/251Reading camera 32/251Reading camera 33/251Reading camera 34/251Reading camera 35/251Reading camera 36/251Reading camera 37/251Reading camera 38/251Reading camera 39/251Reading camera 40/251Reading camera 41/251Reading camera 42/251Reading camera 43/251Reading camera 44/251Reading camera 45/251Reading camera 46/251Reading camera 47/251Reading camera 48/251Reading camera 49/251Reading camera 50/251Reading camera 51/251Reading camera 52/251Reading camera 53/251Reading camera 54/251Reading camera 55/251Reading camera 56/251Reading camera 57/251Reading camera 58/251Reading camera 59/251Reading camera 60/251Reading camera 61/251Reading camera 62/251Reading camera 63/251Reading camera 64/251Reading camera 65/251Reading camera 66/251Reading camera 67/251Reading camera 68/251Reading camera 69/251Reading camera 70/251Reading camera 71/251Reading camera 72/251Reading camera 73/251Reading camera 74/251Reading camera 75/251Reading camera 76/251Reading camera 77/251Reading camera 78/251Reading camera 79/251Reading camera 80/251Reading camera 81/251Reading camera 82/251Reading camera 83/251Reading camera 84/251Reading camera 85/251Reading camera 86/251Reading camera 87/251Reading camera 88/251Reading camera 89/251Reading camera 90/251Reading camera 91/251Reading camera 92/251Reading camera 93/251Reading camera 94/251Reading camera 95/251Reading camera 96/251Reading camera 97/251Reading camera 98/251Reading camera 99/251Reading camera 100/251Reading camera 101/251Reading camera 102/251Reading camera 103/251Reading camera 104/251Reading camera 105/251Reading camera 106/251Reading camera 107/251Reading camera 108/251Reading camera 109/251Reading camera 110/251Reading camera 111/251Reading camera 112/251Reading camera 113/251Reading camera 114/251Reading camera 115/251Reading camera 116/251Reading camera 117/251Reading camera 118/251Reading camera 119/251Reading camera 120/251Reading camera 121/251Reading camera 122/251Reading camera 123/251Reading camera 124/251Reading camera 125/251Reading camera 126/251Reading camera 127/251Reading camera 128/251Reading camera 129/251Reading camera 130/251Reading camera 131/251Reading camera 132/251Reading camera 133/251Reading camera 134/251Reading camera 135/251Reading camera 136/251Reading camera 137/251Reading camera 138/251Reading camera 139/251Reading camera 140/251Reading camera 141/251Reading camera 142/251Reading camera 143/251Reading camera 144/251Reading camera 145/251Reading camera 146/251Reading camera 147/251Reading camera 148/251Reading camera 149/251Reading camera 150/251Reading camera 151/251Reading camera 152/251Reading camera 153/251Reading camera 154/251Reading camera 155/251Reading camera 156/251Reading camera 157/251Reading camera 158/251Reading camera 159/251Reading camera 160/251Reading camera 161/251Reading camera 162/251Reading camera 163/251Reading camera 164/251Reading camera 165/251Reading camera 166/251Reading camera 167/251Reading camera 168/251Reading camera 169/251Reading camera 170/251Reading camera 171/251Reading camera 172/251Reading camera 173/251Reading camera 174/251Reading camera 175/251Reading camera 176/251Reading camera 177/251Reading camera 178/251Reading camera 179/251Reading camera 180/251Reading camera 181/251Reading camera 182/251Reading camera 183/251Reading camera 184/251Reading camera 185/251Reading camera 186/251Reading camera 187/251Reading camera 188/251Reading camera 189/251Reading camera 190/251Reading camera 191/251Reading camera 192/251Reading camera 193/251Reading camera 194/251Reading camera 195/251Reading camera 196/251Reading camera 197/251Reading camera 198/251Reading camera 199/251Reading camera 200/251Reading camera 201/251Reading camera 202/251Reading camera 203/251Reading camera 204/251Reading camera 205/251Reading camera 206/251Reading camera 207/251Reading camera 208/251Reading camera 209/251Reading camera 210/251Reading camera 211/251Reading camera 212/251Reading camera 213/251Reading camera 214/251Reading camera 215/251Reading camera 216/251Reading camera 217/251Reading camera 218/251Reading camera 219/251Reading camera 220/251Reading camera 221/251Reading camera 222/251Reading camera 223/251Reading camera 224/251Reading camera 225/251Reading camera 226/251Reading camera 227/251Reading camera 228/251Reading camera 229/251Reading camera 230/251Reading camera 231/251Reading camera 232/251Reading camera 233/251Reading camera 234/251Reading camera 235/251Reading camera 236/251Reading camera 237/251Reading camera 238/251Reading camera 239/251Reading camera 240/251Reading camera 241/251Reading camera 242/251Reading camera 243/251Reading camera 244/251Reading camera 245/251Reading camera 246/251Reading camera 247/251Reading camera 248/251Reading camera 249/251Reading camera 250/251Reading camera 251/251 [27/11 15:04:53]
+Loading Training Cameras 219 [27/11 15:04:53]
+Loading Test Cameras 32 [27/11 15:05:02]
+now I am loading ply, spatial_lr_scale is 5.847915220260621 [27/11 15:05:03]
+xyz.shape (2541226, 3) [27/11 15:06:51]
+opacities save shape (2541226, 1) [27/11 15:06:51]
+Load ply from /data/zdw/zdw_data/3dgs data/models/truck/point_cloud/iteration_30000/point_cloud.ply [27/11 15:06:55]
+training setup: finetune [27/11 15:06:55]
+
+====================================================================== [27/11 15:06:55]
+【步骤1】计算高斯点重要性 [27/11 15:06:55]
+====================================================================== [27/11 15:06:55]
+原始高斯点数量: 2,541,226 [27/11 15:06:55]
+Rendering progress:   0%|          | 0/219 [00:00<?, ?it/s]Rendering progress:   0%|          | 1/219 [00:00<00:26,  8.30it/s]Rendering progress:   1%|          | 2/219 [00:00<00:24,  8.93it/s]Rendering progress:   2%|▏         | 4/219 [00:00<00:24,  8.77it/s]Rendering progress:   2%|▏         | 5/219 [00:00<00:24,  8.81it/s]Rendering progress:   3%|▎         | 6/219 [00:00<00:23,  9.07it/s]Rendering progress:   4%|▎         | 8/219 [00:00<00:21, 10.02it/s]Rendering progress:   4%|▍         | 9/219 [00:00<00:21,  9.90it/s]Rendering progress:   5%|▍         | 10/219 [00:01<00:21,  9.76it/s]Rendering progress:   5%|▌         | 12/219 [00:01<00:20, 10.02it/s]Rendering progress:   6%|▋         | 14/219 [00:01<00:17, 11.42it/s]Rendering progress:   7%|▋         | 16/219 [00:01<00:17, 11.29it/s]Rendering progress:   8%|▊         | 18/219 [00:01<00:17, 11.24it/s]Rendering progress:   9%|▉         | 20/219 [00:01<00:17, 11.13it/s]Rendering progress:  10%|█         | 22/219 [00:02<00:17, 11.20it/s]Rendering progress:  11%|█         | 24/219 [00:02<00:17, 11.04it/s]Rendering progress:  12%|█▏        | 26/219 [00:02<00:16, 11.81it/s]Rendering progress:  13%|█▎        | 28/219 [00:02<00:16, 11.62it/s]Rendering progress:  14%|█▎        | 30/219 [00:02<00:16, 11.66it/s]Rendering progress:  15%|█▍        | 32/219 [00:02<00:16, 11.64it/s]Rendering progress:  16%|█▌        | 34/219 [00:03<00:15, 11.63it/s]Rendering progress:  16%|█▋        | 36/219 [00:03<00:16, 11.36it/s]Rendering progress:  17%|█▋        | 38/219 [00:03<00:15, 11.96it/s]Rendering progress:  18%|█▊        | 40/219 [00:03<00:16, 11.15it/s]Rendering progress:  19%|█▉        | 42/219 [00:03<00:15, 11.53it/s]Rendering progress:  20%|██        | 44/219 [00:04<00:15, 11.44it/s]Rendering progress:  21%|██        | 46/219 [00:04<00:15, 11.50it/s]Rendering progress:  22%|██▏       | 48/219 [00:04<00:15, 11.39it/s]Rendering progress:  23%|██▎       | 50/219 [00:04<00:15, 10.78it/s]Rendering progress:  24%|██▎       | 52/219 [00:04<00:17,  9.44it/s]Rendering progress:  24%|██▍       | 53/219 [00:05<00:19,  8.59it/s]Rendering progress:  25%|██▌       | 55/219 [00:05<00:17,  9.15it/s]Rendering progress:  26%|██▌       | 57/219 [00:05<00:16,  9.67it/s]Rendering progress:  27%|██▋       | 59/219 [00:05<00:16,  9.80it/s]Rendering progress:  27%|██▋       | 60/219 [00:05<00:17,  9.21it/s]Rendering progress:  28%|██▊       | 61/219 [00:05<00:17,  8.83it/s]Rendering progress:  28%|██▊       | 62/219 [00:05<00:17,  8.76it/s]Rendering progress:  29%|██▉       | 63/219 [00:06<00:17,  8.89it/s]Rendering progress:  30%|██▉       | 65/219 [00:06<00:15,  9.65it/s]Rendering progress:  31%|███       | 67/219 [00:06<00:15,  9.89it/s]Rendering progress:  32%|███▏      | 69/219 [00:06<00:15,  9.67it/s]Rendering progress:  32%|███▏      | 71/219 [00:06<00:15,  9.48it/s]Rendering progress:  33%|███▎      | 72/219 [00:06<00:15,  9.57it/s]Rendering progress:  33%|███▎      | 73/219 [00:07<00:15,  9.38it/s]Rendering progress:  34%|███▍      | 74/219 [00:07<00:16,  8.74it/s]Rendering progress:  34%|███▍      | 75/219 [00:07<00:16,  8.61it/s]Rendering progress:  35%|███▌      | 77/219 [00:07<00:14,  9.58it/s]Rendering progress:  36%|███▌      | 79/219 [00:07<00:14,  9.86it/s]Rendering progress:  37%|███▋      | 81/219 [00:07<00:13, 10.19it/s]Rendering progress:  38%|███▊      | 83/219 [00:08<00:13, 10.42it/s]Rendering progress:  39%|███▉      | 85/219 [00:08<00:12, 10.67it/s]Rendering progress:  40%|███▉      | 87/219 [00:08<00:12, 10.92it/s]Rendering progress:  41%|████      | 89/219 [00:08<00:11, 11.77it/s]Rendering progress:  42%|████▏     | 91/219 [00:08<00:11, 10.69it/s]Rendering progress:  42%|████▏     | 93/219 [00:08<00:11, 10.83it/s]Rendering progress:  43%|████▎     | 95/219 [00:09<00:11, 11.13it/s]Rendering progress:  44%|████▍     | 97/219 [00:09<00:11, 10.70it/s]Rendering progress:  45%|████▌     | 99/219 [00:09<00:10, 11.02it/s]Rendering progress:  46%|████▌     | 101/219 [00:09<00:10, 11.33it/s]Rendering progress:  47%|████▋     | 103/219 [00:09<00:09, 12.31it/s]Rendering progress:  48%|████▊     | 105/219 [00:09<00:08, 12.71it/s]Rendering progress:  49%|████▉     | 107/219 [00:10<00:09, 12.41it/s]Rendering progress:  50%|████▉     | 109/219 [00:10<00:09, 11.51it/s]Rendering progress:  51%|█████     | 111/219 [00:10<00:09, 11.03it/s]Rendering progress:  52%|█████▏    | 113/219 [00:10<00:09, 11.29it/s]Rendering progress:  53%|█████▎    | 115/219 [00:10<00:09, 11.52it/s]Rendering progress:  53%|█████▎    | 117/219 [00:11<00:08, 11.73it/s]Rendering progress:  54%|█████▍    | 119/219 [00:11<00:08, 12.08it/s]Rendering progress:  55%|█████▌    | 121/219 [00:11<00:08, 11.19it/s]Rendering progress:  56%|█████▌    | 123/219 [00:11<00:08, 11.29it/s]Rendering progress:  57%|█████▋    | 125/219 [00:11<00:08, 11.48it/s]Rendering progress:  58%|█████▊    | 127/219 [00:11<00:07, 11.56it/s]Rendering progress:  59%|█████▉    | 129/219 [00:12<00:08, 11.13it/s]Rendering progress:  60%|█████▉    | 131/219 [00:12<00:08, 10.82it/s]Rendering progress:  61%|██████    | 133/219 [00:12<00:08, 10.37it/s]Rendering progress:  62%|██████▏   | 135/219 [00:12<00:08,  9.94it/s]Rendering progress:  63%|██████▎   | 137/219 [00:12<00:08,  9.12it/s]Rendering progress:  63%|██████▎   | 138/219 [00:13<00:09,  8.23it/s]Rendering progress:  63%|██████▎   | 139/219 [00:13<00:09,  8.19it/s]Rendering progress:  64%|██████▍   | 140/219 [00:13<00:09,  8.21it/s]Rendering progress:  64%|██████▍   | 141/219 [00:13<00:09,  8.00it/s]Rendering progress:  65%|██████▌   | 143/219 [00:13<00:08,  8.80it/s]Rendering progress:  66%|██████▌   | 144/219 [00:13<00:08,  8.91it/s]Rendering progress:  67%|██████▋   | 146/219 [00:14<00:07,  9.79it/s]Rendering progress:  68%|██████▊   | 148/219 [00:14<00:06, 10.38it/s]Rendering progress:  68%|██████▊   | 150/219 [00:14<00:06, 10.88it/s]Rendering progress:  69%|██████▉   | 152/219 [00:14<00:06, 10.51it/s]Rendering progress:  70%|███████   | 154/219 [00:14<00:06, 10.75it/s]Rendering progress:  71%|███████   | 156/219 [00:14<00:05, 10.51it/s]Rendering progress:  72%|███████▏  | 158/219 [00:15<00:05, 10.22it/s]Rendering progress:  73%|███████▎  | 160/219 [00:15<00:05, 10.11it/s]Rendering progress:  74%|███████▍  | 162/219 [00:15<00:05, 10.06it/s]Rendering progress:  75%|███████▍  | 164/219 [00:15<00:05, 10.85it/s]Rendering progress:  76%|███████▌  | 166/219 [00:15<00:05, 10.23it/s]Rendering progress:  77%|███████▋  | 168/219 [00:16<00:04, 10.58it/s]Rendering progress:  78%|███████▊  | 170/219 [00:16<00:04, 10.65it/s]Rendering progress:  79%|███████▊  | 172/219 [00:16<00:04, 10.29it/s]Rendering progress:  79%|███████▉  | 174/219 [00:16<00:04, 11.14it/s]Rendering progress:  80%|████████  | 176/219 [00:16<00:03, 11.37it/s]Rendering progress:  81%|████████▏ | 178/219 [00:17<00:03, 10.60it/s]Rendering progress:  82%|████████▏ | 180/219 [00:17<00:03, 10.37it/s]Rendering progress:  83%|████████▎ | 182/219 [00:17<00:03, 11.48it/s]Rendering progress:  84%|████████▍ | 184/219 [00:17<00:03, 11.03it/s]Rendering progress:  85%|████████▍ | 186/219 [00:17<00:02, 11.10it/s]Rendering progress:  86%|████████▌ | 188/219 [00:17<00:02, 11.23it/s]Rendering progress:  87%|████████▋ | 190/219 [00:18<00:02, 11.28it/s]Rendering progress:  88%|████████▊ | 192/219 [00:18<00:02, 10.81it/s]Rendering progress:  89%|████████▊ | 194/219 [00:18<00:02, 11.47it/s]Rendering progress:  89%|████████▉ | 196/219 [00:18<00:02, 11.24it/s]Rendering progress:  90%|█████████ | 198/219 [00:18<00:01, 11.54it/s]Rendering progress:  91%|█████████▏| 200/219 [00:19<00:01, 10.22it/s]Rendering progress:  92%|█████████▏| 202/219 [00:19<00:01, 10.31it/s]Rendering progress:  93%|█████████▎| 204/219 [00:19<00:01,  8.52it/s]Rendering progress:  94%|█████████▎| 205/219 [00:19<00:01,  8.54it/s]Rendering progress:  95%|█████████▍| 207/219 [00:19<00:01,  9.47it/s]Rendering progress:  95%|█████████▌| 209/219 [00:20<00:00, 10.24it/s]Rendering progress:  96%|█████████▋| 211/219 [00:20<00:00, 10.07it/s]Rendering progress:  97%|█████████▋| 213/219 [00:20<00:00, 10.02it/s]Rendering progress:  98%|█████████▊| 215/219 [00:20<00:00, 10.02it/s]Rendering progress:  99%|█████████▉| 217/219 [00:20<00:00, 10.22it/s]Rendering progress: 100%|██████████| 219/219 [00:20<00:00, 10.16it/s]Rendering progress: 100%|██████████| 219/219 [00:20<00:00, 10.43it/s]
+重要性分数范围: [0.000000, 7899.654297] [27/11 15:07:16]
+重要性分数均值: 4.059384 [27/11 15:07:16]
+
+====================================================================== [27/11 15:07:16]
+【步骤2】剪枝不重要的高斯点 [27/11 15:07:16]
+====================================================================== [27/11 15:07:16]
+剪枝阈值: 40.0% [27/11 15:07:16]
+将要剪枝的点数: 1,016,491 (40.00%) [27/11 15:07:16]
+剪枝后剩余点数: 1,524,735 (60.00%) [27/11 15:07:16]
+实际剪枝数量: 1,016,491 [27/11 15:07:16]
+
+====================================================================== [27/11 15:07:16]
+【步骤3】八叉树编码 + RAHT准备 [27/11 15:07:16]
+====================================================================== [27/11 15:07:16]
+八叉树深度: 20 [27/11 15:07:16]
+RAHT变换: 启用 [27/11 15:07:16]
+Debug: V shape = (1524489, 3), depth = 20 [27/11 15:07:47]
+Debug: V dtype = int64 [27/11 15:07:47]
+Debug: N = 1524489, NN = 1524489, N_T = 3048978 [27/11 15:07:47]
+Debug: 数组大小 = 1524489 [27/11 15:07:47]
+Morton编码完成，点云已排序 [27/11 15:08:14]
+
+====================================================================== [27/11 15:08:14]
+【步骤4】初始化量化器 [27/11 15:08:14]
+====================================================================== [27/11 15:08:14]
+分块量化模式: 启用 [27/11 15:08:14]
+块数量 (n_block): 57 [27/11 15:08:14]
+RAHT特征维度: 55 (opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3)) [27/11 15:08:14]
+====================================================================== [27/11 15:08:14]
+初始化量化器（多位数配置） [27/11 15:08:14]
+====================================================================== [27/11 15:08:14]
+块数量: 57 [27/11 15:08:14]
+总量化器数量: 3135 (55维 × 57块) [27/11 15:08:14]
+ [27/11 15:08:14]
+量化位数配置: [27/11 15:08:14]
+  opacity (1维):      8-bit [27/11 15:08:14]
+  euler (3维):        8-bit [27/11 15:08:14]
+  f_dc (3维):         8-bit [27/11 15:08:14]
+  f_rest_0 (15维):    4-bit  [SH degree 1] [27/11 15:08:14]
+  f_rest_1 (15维):    4-bit  [SH degree 2] [27/11 15:08:14]
+  f_rest_2 (15维):    2-bit  [SH degree 3] [27/11 15:08:14]
+  scale (3维):        10-bit [27/11 15:08:14]
+====================================================================== [27/11 15:08:14]
+
+====================================================================== [27/11 15:08:14]
+【步骤5】VQ训练（已跳过） [27/11 15:08:14]
+====================================================================== [27/11 15:08:14]
+Skipping VQ - f_rest will use RAHT transform like f_dc [27/11 15:08:14]
+f_rest 将使用 RAHT 变换，无需 VQ 码本 [27/11 15:08:14]
+
+====================================================================== [27/11 15:08:14]
+【步骤6】初始评估（Iteration 0） [27/11 15:08:14]
+====================================================================== [27/11 15:08:14]
+开始测试集渲染... [27/11 15:08:14]
+  0%|          | 0/32 [00:00<?, ?it/s]  3%|▎         | 1/32 [00:19<10:00, 19.37s/it]  6%|▋         | 2/32 [00:41<10:21, 20.73s/it]  9%|▉         | 3/32 [01:02<10:12, 21.11s/it] 12%|█▎        | 4/32 [01:24<09:58, 21.38s/it] 16%|█▌        | 5/32 [01:46<09:45, 21.68s/it] 19%|█▉        | 6/32 [02:09<09:30, 21.95s/it] 22%|██▏       | 7/32 [02:31<09:09, 21.97s/it] 25%|██▌       | 8/32 [02:52<08:46, 21.92s/it] 28%|██▊       | 9/32 [03:14<08:19, 21.73s/it] 31%|███▏      | 10/32 [03:35<07:57, 21.70s/it] 34%|███▍      | 11/32 [03:57<07:37, 21.76s/it] 38%|███▊      | 12/32 [04:18<07:10, 21.52s/it] 41%|████      | 13/32 [04:40<06:47, 21.46s/it] 44%|████▍     | 14/32 [05:00<06:23, 21.29s/it] 47%|████▋     | 15/32 [05:19<05:47, 20.43s/it] 50%|█████     | 16/32 [05:22<04:02, 15.18s/it] 53%|█████▎    | 17/32 [05:25<02:52, 11.48s/it] 56%|█████▋    | 18/32 [05:28<02:04,  8.89s/it] 59%|█████▉    | 19/32 [05:30<01:31,  7.06s/it] 62%|██████▎   | 20/32 [05:33<01:09,  5.78s/it] 66%|██████▌   | 21/32 [05:36<00:55,  5.02s/it] 69%|██████▉   | 22/32 [05:39<00:43,  4.36s/it] 72%|███████▏  | 23/32 [05:55<01:09,  7.77s/it] 75%|███████▌  | 24/32 [05:59<00:53,  6.65s/it] 78%|███████▊  | 25/32 [06:02<00:38,  5.51s/it] 81%|████████▏ | 26/32 [06:05<00:28,  4.69s/it] 84%|████████▍ | 27/32 [06:07<00:20,  4.13s/it] 88%|████████▊ | 28/32 [06:10<00:14,  3.72s/it] 91%|█████████ | 29/32 [06:13<00:10,  3.42s/it] 94%|█████████▍| 30/32 [06:16<00:06,  3.23s/it] 97%|█████████▋| 31/32 [06:19<00:03,  3.10s/it]100%|██████████| 32/32 [06:21<00:00,  3.01s/it]100%|██████████| 32/32 [06:21<00:00, 11.93s/it]
+
+保存压缩文件... [27/11 15:14:36]
+save_npz gaussians: /data/zdw/zdw_data/3dgs data/MesonGS/output/truck_config3/point_cloud/iteration_0 [27/11 15:14:36]
+
+【保存压缩文件】 [27/11 15:14:36]
+  保存八叉树结构... [27/11 15:14:36]
+    oct.npz: 1524489 个点 [27/11 15:14:36]
+  跳过 VQ 文件（ntk.npz, um.npz） [27/11 15:14:36]
+
+  构建 RAHT 输入特征... [27/11 15:14:36]
+    rf 形状: torch.Size([1524489, 55]) (55维) [27/11 15:14:36]
+    包含: opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3) [27/11 15:14:36]
+
+  执行 RAHT 正向变换... [27/11 15:14:36]
+    RAHT 变换完成，C 形状: torch.Size([1524489, 55]) [27/11 15:14:36]
+
+  执行分块量化... [27/11 15:14:36]
+    分块量化模式 [27/11 15:14:36]
+    块数量: 57 [27/11 15:14:36]
+    量化 55 维 RAHT 特征 (包含 scale)... [27/11 15:14:36]
+    所有特征量化完成，使用了 3135 个量化器 (55 × 57) [27/11 15:14:37]
+    量化位数分布: {8, 2, 10, 4} bits [27/11 15:14:37]
+
+  保存 RAHT 系数 (包含 scale)... [27/11 15:14:38]
+    使用 uint16 存储（最大 10-bit） [27/11 15:14:38]
+    orgb.npz: 形状 (83846840,), 大小 327526.72 KB [27/11 15:14:44]
+    包含所有 55 维特征 (opacity + euler + f_dc + f_rest + scale) [27/11 15:14:44]
+
+  跳过独立的 Scale 文件 (ct.npz) - Scale 已包含在 RAHT 特征中 [27/11 15:14:44]
+
+  保存量化参数... [27/11 15:14:44]
+    t.npz: 6327 个参数 [27/11 15:14:44]
+
+  打包成 ZIP 文件... [27/11 15:14:44]
+
+【压缩完成】 [27/11 15:14:44]
+  文件大小: 26,210,880 B [27/11 15:14:44]
+  文件大小: 25596.56 KB [27/11 15:14:44]
+  文件大小: 25.00 MB [27/11 15:14:44]
+
+---------------------------------------------------------------------- [27/11 15:14:44]
+【初始评估结果】 [27/11 15:14:44]
+---------------------------------------------------------------------- [27/11 15:14:44]
+PSNR:  23.9642 dB [27/11 15:14:44]
+SSIM:  0.8366 [27/11 15:14:44]
+LPIPS: 0.1948 [27/11 15:14:44]
+文件大小: 25.00 MB [27/11 15:14:44]
+---------------------------------------------------------------------- [27/11 15:14:44]
+
+====================================================================== [27/11 15:14:44]
+【步骤7】微调训练 [27/11 15:14:44]
+====================================================================== [27/11 15:14:44]
+总迭代次数: 100 [27/11 15:14:44]
+学习率缩放: 0.8 [27/11 15:14:44]
+测试迭代: [0, 100] [27/11 15:14:44]
+稀疏性损失权重 (λ_s): 5e-07 [27/11 15:14:44]
+  启用稀疏性正则化，促进RAHT系数稀疏化 [27/11 15:14:44]
+====================================================================== [27/11 15:14:44]
+ [27/11 15:14:44]
+finetuning setup: finetune [27/11 15:14:44]
+微调进度:   0%|          | 0/100 [00:00<?, ?it/s]微调进度:   0%|          | 0/100 [00:24<?, ?it/s, 损失=0.206246, L1=0.033767, 稀疏=3.08e+05]微调进度:  10%|█         | 10/100 [00:24<03:37,  2.42s/it, 损失=0.206246, L1=0.033767, 稀疏=3.08e+05]微调进度:  10%|█         | 10/100 [00:48<03:37,  2.42s/it, 损失=0.204860, L1=0.032338, 稀疏=3.00e+05]微调进度:  20%|██        | 20/100 [00:48<03:13,  2.42s/it, 损失=0.204860, L1=0.032338, 稀疏=3.00e+05]微调进度:  20%|██        | 20/100 [01:12<03:13,  2.42s/it, 损失=0.201680, L1=0.035414, 稀疏=2.93e+05]微调进度:  30%|███       | 30/100 [01:12<02:49,  2.42s/it, 损失=0.201680, L1=0.035414, 稀疏=2.93e+05]微调进度:  30%|███       | 30/100 [01:36<02:49,  2.42s/it, 损失=0.195343, L1=0.032002, 稀疏=2.87e+05]微调进度:  40%|████      | 40/100 [01:36<02:25,  2.42s/it, 损失=0.195343, L1=0.032002, 稀疏=2.87e+05]微调进度:  40%|████      | 40/100 [02:02<02:25,  2.42s/it, 损失=0.194988, L1=0.032424, 稀疏=2.81e+05]微调进度:  50%|█████     | 50/100 [02:02<02:03,  2.47s/it, 损失=0.194988, L1=0.032424, 稀疏=2.81e+05]微调进度:  50%|█████     | 50/100 [02:37<02:03,  2.47s/it, 损失=0.194497, L1=0.039916, 稀疏=2.75e+05]微调进度:  60%|██████    | 60/100 [02:37<01:53,  2.83s/it, 损失=0.194497, L1=0.039916, 稀疏=2.75e+05]微调进度:  60%|██████    | 60/100 [03:01<01:53,  2.83s/it, 损失=0.187927, L1=0.027350, 稀疏=2.69e+05]微调进度:  70%|███████   | 70/100 [03:01<01:20,  2.70s/it, 损失=0.187927, L1=0.027350, 稀疏=2.69e+05]微调进度:  70%|███████   | 70/100 [03:26<01:20,  2.70s/it, 损失=0.181665, L1=0.028477, 稀疏=2.64e+05]微调进度:  80%|████████  | 80/100 [03:26<00:52,  2.61s/it, 损失=0.181665, L1=0.028477, 稀疏=2.64e+05]微调进度:  80%|████████  | 80/100 [03:50<00:52,  2.61s/it, 损失=0.178371, L1=0.031332, 稀疏=2.59e+05]微调进度:  90%|█████████ | 90/100 [03:50<00:25,  2.55s/it, 损失=0.178371, L1=0.031332, 稀疏=2.59e+05]微调进度:  90%|█████████ | 90/100 [04:14<00:25,  2.55s/it, 损失=0.181243, L1=0.039562, 稀疏=2.55e+05]微调进度: 100%|██████████| 100/100 [04:14<00:00,  2.51s/it, 损失=0.181243, L1=0.039562, 稀疏=2.55e+05]微调进度: 100%|██████████| 100/100 [04:14<00:00,  2.54s/it, 损失=0.181243, L1=0.039562, 稀疏=2.55e+05]
+
+微调完成！最终损失: 0.181243 (包含稀疏性正则化) [27/11 15:18:59]
+
+[ITER 100] Evaluating train: L1 0.031303949654102325 PSNR 25.901142120361328 [27/11 15:19:04]
+save_npz gaussians: /data/zdw/zdw_data/3dgs data/MesonGS/output/truck_config3/point_cloud/iteration_100 [27/11 15:20:41]
+
+【保存压缩文件】 [27/11 15:20:41]
+  保存八叉树结构... [27/11 15:20:41]
+    oct.npz: 1524489 个点 [27/11 15:20:42]
+  跳过 VQ 文件（ntk.npz, um.npz） [27/11 15:20:42]
+
+  构建 RAHT 输入特征... [27/11 15:20:42]
+    rf 形状: torch.Size([1524489, 55]) (55维) [27/11 15:20:42]
+    包含: opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3) [27/11 15:20:42]
+
+  执行 RAHT 正向变换... [27/11 15:20:42]
+    RAHT 变换完成，C 形状: torch.Size([1524489, 55]) [27/11 15:20:42]
+
+  执行分块量化... [27/11 15:20:42]
+    分块量化模式 [27/11 15:20:42]
+    块数量: 57 [27/11 15:20:42]
+    量化 55 维 RAHT 特征 (包含 scale)... [27/11 15:20:42]
+    所有特征量化完成，使用了 3135 个量化器 (55 × 57) [27/11 15:20:43]
+    量化位数分布: {8, 2, 10, 4} bits [27/11 15:20:43]
+
+  保存 RAHT 系数 (包含 scale)... [27/11 15:20:46]
+    使用 uint16 存储（最大 10-bit） [27/11 15:20:46]
+    orgb.npz: 形状 (83846840,), 大小 327526.72 KB [27/11 15:20:52]
+    包含所有 55 维特征 (opacity + euler + f_dc + f_rest + scale) [27/11 15:20:52]
+
+  跳过独立的 Scale 文件 (ct.npz) - Scale 已包含在 RAHT 特征中 [27/11 15:20:52]
+
+  保存量化参数... [27/11 15:20:52]
+    t.npz: 6327 个参数 [27/11 15:20:52]
+
+  打包成 ZIP 文件... [27/11 15:20:52]
+
+【压缩完成】 [27/11 15:20:53]
+  文件大小: 24,995,570 B [27/11 15:20:53]
+  文件大小: 24409.74 KB [27/11 15:20:53]
+  文件大小: 23.84 MB [27/11 15:20:53]
+Testset Evaluating 100. PSNR: 24.25019073486328, SSIM: 0.8486576080322266, LIPIS: 0.18338240683078766 [27/11 15:20:53]
+
+ Saving best Gaussians on Train Set. [27/11 15:20:53]
+save_npz gaussians: /data/zdw/zdw_data/3dgs data/MesonGS/output/truck_config3/point_cloud/iteration_best [27/11 15:20:53]
+
+【保存压缩文件】 [27/11 15:20:53]
+  保存八叉树结构... [27/11 15:20:53]
+    oct.npz: 1524489 个点 [27/11 15:20:53]
+  跳过 VQ 文件（ntk.npz, um.npz） [27/11 15:20:53]
+
+  构建 RAHT 输入特征... [27/11 15:20:53]
+    rf 形状: torch.Size([1524489, 55]) (55维) [27/11 15:20:53]
+    包含: opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3) [27/11 15:20:53]
+
+  执行 RAHT 正向变换... [27/11 15:20:53]
+    RAHT 变换完成，C 形状: torch.Size([1524489, 55]) [27/11 15:20:53]
+
+  执行分块量化... [27/11 15:20:53]
+    分块量化模式 [27/11 15:20:53]
+    块数量: 57 [27/11 15:20:53]
+    量化 55 维 RAHT 特征 (包含 scale)... [27/11 15:20:53]
+    所有特征量化完成，使用了 3135 个量化器 (55 × 57) [27/11 15:20:54]
+    量化位数分布: {8, 2, 10, 4} bits [27/11 15:20:54]
+
+  保存 RAHT 系数 (包含 scale)... [27/11 15:20:56]
+    使用 uint16 存储（最大 10-bit） [27/11 15:20:56]
+    orgb.npz: 形状 (83846840,), 大小 327526.72 KB [27/11 15:21:01]
+    包含所有 55 维特征 (opacity + euler + f_dc + f_rest + scale) [27/11 15:21:01]
+
+  跳过独立的 Scale 文件 (ct.npz) - Scale 已包含在 RAHT 特征中 [27/11 15:21:01]
+
+  保存量化参数... [27/11 15:21:01]
+    t.npz: 6327 个参数 [27/11 15:21:01]
+
+  打包成 ZIP 文件... [27/11 15:21:01]
+
+【压缩完成】 [27/11 15:21:02]
+  文件大小: 24,995,570 B [27/11 15:21:02]
+  文件大小: 24409.74 KB [27/11 15:21:02]
+  文件大小: 23.84 MB [27/11 15:21:02]
+
+Training complete. [27/11 15:21:02]

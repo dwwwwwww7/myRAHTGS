@@ -1,0 +1,2 @@
+usage: metrics.py [-h] --model_paths MODEL_PATHS [MODEL_PATHS ...]
+metrics.py: error: unrecognized arguments: --iteration 100

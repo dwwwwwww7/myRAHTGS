@@ -28,5 +28,5 @@ def searchForMaxIteration(folder):
     saved_iters = [int(fname.split("_")[-1]) for fname in os.listdir(folder)]
     return max(saved_iters)
 
-MAIN_DIR='/your/path/to/mesongs'
+MAIN_DIR='C:/Users/LENOVO/Desktop/RAHTGS/RAHT-from-MesonGS'
 # MAIN_DIR='/home/szxie/mesongs_os'

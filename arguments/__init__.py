@@ -64,6 +64,7 @@ class ModelParams(ParamGroup):
         self.percent=0.66
         self.per_channel_quant=False
         self.per_block_quant=True
+        self.bit_packing=True  # 位打包功能，默认开启（将被手动参数覆盖）
         self.clamp_color=True 
         self.meson_count=False 
         self.f_count=False
@@ -72,6 +73,8 @@ class ModelParams(ParamGroup):
         self.csv_path=''
         self.depth=12
         self.num_bits=8
+        self.lambda_sparsity=5e-7  # 稀疏性损失权重
+        self.quant_type="lsq"  # 量化器类型: "lsq" 或 "vanilla"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):
@@ -84,7 +87,7 @@ class PipelineParams(ParamGroup):
         self.convert_SHs_python = True
         self.compute_cov3D_python = False
         self.save_imp = False
-        self.use_indexed = True
+        self.use_indexed = False  # Changed to False since we no longer use VQ indexing
         self.depth_count = False
         self.save_mode = 'euler'
         self.scene_imp = ""

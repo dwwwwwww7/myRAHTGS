@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# 用的是PCS25的RAHT
 """
 Created on May 25, 2021
 Modified on Jul 20, 2024
@@ -12,10 +13,15 @@ The original C implementation is more readable.
 """
 import numpy as np
 import torch
-
+from tqdm import tqdm
+import scipy.sparse as sp
 
 # morton coding
 # convert voxlized and deduplicated point cloud to morton code
+
+# This is done because morton code allows to order elements in a more clever way, such that performing operations becomes easier
+# The key point is that nearby points in the space are closer also in this representation (it is a sort of zig-zag scan that changes direction every two positions)
+'''
 def copyAsort(V):
     # input
     # V: np.array (n,3), input vertices
@@ -64,9 +70,44 @@ def copyAsort(V):
     val=np.sort(val)
     val = val.astype(np.uint64)
     return W, val, reord
+'''
+###RIGHT MORTON CODING
+def interleave_bits(x, y, z):
+    """Interleaves the bits of three 21-bit integers (x, y, z) for Morton encoding."""
+    result = np.zeros_like(x, dtype=np.uint64)
+    for i in range(21):  # Process each bit up to 21 bits
+        mask = 1 << i
+        result |= ((x & mask) << (2 * i)) | ((y & mask) << (2 * i + 1)) | ((z & mask) << (2 * i + 2))
+    return result
 
+def copyAsort(V):
+    """
+    Computes Morton order encoding and sorts input vertices accordingly.
+    
+    Parameters:
+    V: np.array (n,3) - Input vertices with (z, y, x) coordinates
 
-
+    Returns:
+    W: np.array (n,) - Weights initialized to 1
+    val: np.array (n,) - Morton encoding values
+    reord: np.array (n,) - Indices that sort V in Morton order
+    """
+    V = V.astype(np.uint64)
+    
+    # Initialize weights
+    W = np.ones(V.shape[0], dtype=np.uint64)
+    
+    # Extract coordinates (z, y, x)
+    vz, vy, vx = V[:, 0], V[:, 1], V[:, 2]
+    
+    # Compute Morton code using interleaved bits
+    val = interleave_bits(vx, vy, vz)
+    
+    # Sort based on Morton codes
+    reord = np.argsort(val)
+    val = val[reord]  # Ensure val matches sorted order
+    
+    return W, val, reord
 # morton decoding
 # convert morton code to point cloud
 def val2V(val, factor):
@@ -180,16 +221,6 @@ def val2V(val, factor):
     return V_re
 
 
-
-
-
-
-
-
-
-
-
-
 def transform_batched(a0, a1, C0, C1):  
     # input
     # a0, a1: float, weight
@@ -265,6 +296,9 @@ def itransform_batched_torch(a0, a1, CT0, CT1):
     
     t0 = torch.tensor(a0[:,None]).cuda().float()
     t1 = torch.tensor(a1[:,None]).cuda().float()
+    #print(f"t0: {t0.shape}, t1: {t1.shape}")
+    #print(f"CT0: {CT0.shape}, CT1: {CT1.shape}")
+    #print(f"CT0*TO: {(t0*CT0).shape}, CT1*T1: {(t1*CT1).shape}")
     V0 = t0*CT0-t1*CT1
     V1 = t1*CT0+t0*CT1
     
@@ -723,7 +757,9 @@ def haar3D_torch(inC, depth, w, val, TMP):
     return C
 
 
-        
+# This is the function that is used to build the RAHT tree (previous ones are never used all through the project)
+# Notice that it doesn't compute coefficients, it simply creates pairs
+       
 def get_RAHT_tree(inV, depth):
     '''
     
@@ -769,6 +805,7 @@ def get_RAHT_tree(inV, depth):
     
     
     w, val, reord = copyAsort(inV)
+    #print(f"w: {w}")
     pos = np.arange(N).astype(np.uint64)        
      
     
@@ -784,36 +821,46 @@ def get_RAHT_tree(inV, depth):
         M = 0
         S = N
         
-        
+        # This put to 0 the last bit 
         temp=val.astype(np.uint64)&0xFFFFFFFFFFFFFFFE  
+        # This mask is used to understand whether the current element should be coupled with the next one 
         mask=temp[:-1]==temp[1:]
+        # The last one must be for sure False because there is no next element
         mask=np.concatenate((mask,[False])) 
-        
+       
+        # This includes indices that correspond to candidate pairs for merging
         comb_idx_array=np.where(mask==True)[0]
-        trans_idx_array=np.where(mask==False)[0]       
+        # This includes indices of candidate elements to be passed to the next element (because they don't belong to a pair)
+        trans_idx_array=np.where(mask==False)[0]
+        # From the prev array we should remove indices corresponding to second elements in pairs (they have False but not because they don't belong to a pair)
         trans_idx_array=np.setdiff1d(trans_idx_array, comb_idx_array+1)
         
+        # From the set of all indices, remove all the ones that correspond to the second half of a pair
         idxT_array=np.setdiff1d(np.arange(S), comb_idx_array+1)
         maskT=mask[idxT_array]        
         
+        # Non combined elements are simply passed to the next level as they are (same weight and position)
         wT[np.where(maskT==False)[0]] = w[trans_idx_array]
         posT[np.where(maskT==False)[0]] = pos[trans_idx_array]  
         
-        
-        wT[np.where(maskT==True)[0]] = w[comb_idx_array]+w[comb_idx_array+1]
+        # The weight of the parent is the sum of the weights of the two elements in the pair
+        wT[np.where(maskT==True)[0]] = w[comb_idx_array]+w[comb_idx_array+1] #We keep the position of the first element in the pair
+        # We keep the position of the first element in the pair
         posT[np.where(maskT==True)[0]] = pos[comb_idx_array]  
         
         
         
-        
+        # We discard the last bit in the morton code because we need less bits to describe all elements in the next layer  (keep only selected positions)
         valT = (val >> 1)[idxT_array]
         
         
         N_T=N
+        # Overall number of nodes at the next level
         N=N-comb_idx_array.shape[0]        
         M=N
         
-        
+        # This is just a way to rearrange indices to let the code to work properly
+        # Specifically, this tells to store information related to merged pairs in the last places
         N_idx_array=np.arange(N_T, N, -1)-NN-1
         wT[N_idx_array]=wT[np.where(maskT==True)[0]]                
         posT[N_idx_array]=pos[comb_idx_array+1]
@@ -1063,6 +1110,7 @@ def inv_haar3D_torch(inCT, depth, res_tree):
     # print('C-outC', torch.sum(torch.square(C - outC)))
     return outC  
 
+# This function is the one that in practice computes coefficients
 def haar3D_param(depth, w, val):
     N = val.shape[0]
     NN = N
@@ -1082,9 +1130,10 @@ def haar3D_param(depth, w, val):
     iRight_idx = []
     iPos = []
 
+    # The structure is identical to that of get_RAHT_tree 
     for d in range(depth):
         S = N  
-        
+        #print(f"Depth {d}, weights: {w}")
         temp=val.astype(np.uint64)&0xFFFFFFFFFFFFFFFE        
         mask=temp[:-1]==temp[1:]
         mask=np.concatenate((mask,[False]))
@@ -1095,7 +1144,7 @@ def haar3D_param(depth, w, val):
 
         idxT_array=np.setdiff1d(np.arange(S), comb_idx_array+1)
         maskT=mask[idxT_array]
-
+        #print(f"mask: {len(np.where(maskT==False)[0])}")
         wT[np.where(maskT==False)[0]] = w[trans_idx_array]
         wT[np.where(maskT==True)[0]] = w[comb_idx_array]+w[comb_idx_array+1]
         
@@ -1105,6 +1154,7 @@ def haar3D_param(depth, w, val):
         left_node_array, right_node_array = comb_idx_array, comb_idx_array+1
         a = np.sqrt((w[left_node_array])+(w[right_node_array]))
 
+        # Computation of coefficients
         iW1.append(np.sqrt((w[left_node_array]))/a)
         iW2.append(np.sqrt((w[right_node_array]))/a)
         
@@ -1122,14 +1172,14 @@ def haar3D_param(depth, w, val):
 
         pos[N:S] = posT[N:S]
         w[N:S] = wT[N:S]
-
+        
         val, valT = valT, val
         pos, posT = posT, pos
         w, wT = wT, w
     
     outW=np.zeros(w.shape)
     outW[pos]=w
-
+    #print(f"iW levels: {len(iW1)}, shapes: {[arr.shape for arr in iW1]}")
     res = {
         'w':outW, 
         'iW1':iW1,
@@ -1188,6 +1238,14 @@ def inv_haar3D_param(inV, depth):
 
         N_T=N
         N=N-comb_idx_array.shape[0] 
+
+
+        #### Added
+        N_T = int(N_T)
+        N = int(N)
+        NN = int(NN)
+        ####
+
         N_idx_array=np.arange(N_T, N, -1)-NN-1
 
         left_node_array, right_node_array = comb_idx_array, comb_idx_array+1
@@ -1206,7 +1264,7 @@ def inv_haar3D_param(inV, depth):
         iTrans_idx_CT.append(np.where(maskT==False)[0])
 
         iS.append(S)
-    
+    #print(f"iW levels: {len(iW1)}, shapes: {[arr.shape for arr in iW1]}")
     res = {     
         'pos': pos,   
         'iS':iS,
@@ -1225,3 +1283,203 @@ def inv_haar3D_param(inV, depth):
         } 
     
     return res
+'''
+def build_transform_matrix(res, size):
+    
+    rows = []
+    cols = []
+    vals = []
+    iW1 = res['iW1']
+    iW2 = res['iW2']
+    iLeft_idx = res['iLeft_idx']
+    iRight_idx = res['iRight_idx']
+    for i in tqdm(range(size), desc = "Computing transform matrix"):
+        C = torch.zeros((size,1)).to('cuda')
+        C[i,0] = 1
+        for d in range(len(iW1)):
+            w1 = iW1[d]
+            w2 = iW2[d]
+            left_idx = iLeft_idx[d]
+            right_idx = iRight_idx[d]
+            C[left_idx], C[right_idx] = transform_batched_torch(w1, 
+                                                w2, 
+                                                C[left_idx], 
+                                                C[right_idx])
+        nz = (C != 0).nonzero(as_tuple=True)[0]
+        for r in nz:
+            rows.append(r.item())
+            cols.append(i)
+            vals.append(C[r].item())
+    # now build a sparse COO tensor:
+    indices = torch.tensor([rows, cols], dtype=torch.long)
+    values  = torch.tensor(vals)
+    shape   = (size, size)
+    T_sparse = torch.sparse_coo_tensor(indices, values, shape)
+    return T_sparse
+
+        #self.transform_matrix =  build_transform_matrix(self.res, val.shape[0])
+        #torch.save(self.transform_matrix, 'mic_mat.pth')
+
+def build_transform_matrix(size, iW1, iW2, iLeft_idx, iRight_idx):
+    """
+    size:        N
+    iW1, iW2:    lists of 1D tensors of length N (one per transform step)
+    iLeft_idx, iRight_idx: lists of index-lists (or tensors) of length N
+    """
+    rows, cols, vals = [], [], []
+
+    # outer loop over columns
+    for col in tqdm(range(size), desc="Columns"):
+        # start with one-hot sparse map
+        sparse_C = {col: 1.0}
+
+        # inner loop over each transform step
+        for w1, w2, L, R in tqdm(
+            zip(iW1, iW2, iLeft_idx, iRight_idx),
+            desc="  Steps",
+            total=len(iW1),
+            leave=False
+        ):
+            # ensure L,R are Python lists for fast 'in' tests
+            L_list = list(L)
+            R_list = list(R)
+
+            new_C = {}
+
+            # 1) carry over untouched entries
+            for idx, val in sparse_C.items():
+                if idx not in L_list and idx not in R_list:
+                    new_C[idx] = new_C.get(idx, 0.0) + val
+
+            # 2) for each pair in the batch, apply the 2×2 rule
+            #    w1, w2 are length‑N tensors
+            for j, (l, r) in enumerate(zip(L_list, R_list)):
+                oldL = sparse_C.get(l, 0.0)
+                oldR = sparse_C.get(r, 0.0)
+
+                V0 = w1[j].item() * oldL + w2[j].item() * oldR
+                V1 = -w2[j].item() * oldL + w1[j].item() * oldR
+
+                new_C[l] = new_C.get(l, 0.0) + V0
+                new_C[r] = new_C.get(r, 0.0) + V1
+
+            sparse_C = new_C
+
+        # collect nonzero entries for this column
+        for row_idx, v in sparse_C.items():
+            rows.append(row_idx)
+            cols.append(col)
+            vals.append(v)
+
+    # build the final sparse COO matrix
+    indices = torch.tensor([rows, cols], dtype=torch.long, device='cuda')
+    values  = torch.tensor(vals, device='cuda')
+    return torch.sparse_coo_tensor(indices, values, (size, size))
+
+'''
+def build_transform_matrix(N, iW1, iW2, iLeft_idx, iRight_idx):
+    """
+    Costruisce la matrice di trasformazione come CSR usando SciPy,
+    applicando ad ogni step un insieme di Givens in C++.
+    """
+    # Parto da I_N in formato LIL (buono per assegnamenti)
+    T = sp.eye(N, format='lil', dtype=np.float32)
+
+    for w1_np, w2_np, Ls, Rs in tqdm(
+        zip(iW1, iW2, iLeft_idx, iRight_idx),
+        total=len(iW1),
+        desc="Tree depth"
+    ):
+        # Creo M = I_N come LIL
+        M = sp.eye(N, format='lil', dtype=np.float32)
+
+        # Loop sui singoli Givens
+        # Ls, Rs: array-like di indici; w1_np, w2_np: array-like di valori corrispondenti
+        for l, r, w1, w2 in zip(Ls, Rs, w1_np, w2_np):
+            # blocco 2x2 su (l,r):
+            M[l, l] =  w1
+            M[l, r] =  w2
+            M[r, l] = -w2
+            M[r, r] =  w1
+
+        # Converto M in CSR e lo moltiplico per T (sparse×sparse)
+        T = M.tocsr().dot(T)
+
+    # Alla fine ritorno T in CSR
+    return T.tocsr()
+
+def haar3D_build_transform_matrix(depth, w, val):
+    """
+    Merged version of haar3D_param + build_transform_matrix_scipy.
+    Directly computes the sparse transform matrix T.
+    """
+    N_orig = val.shape[0]
+    N = N_orig
+    NN = N
+    depth_total = depth * 3
+
+    wT = np.zeros((N,), dtype=np.uint64)
+    valT = np.zeros((N,), dtype=np.uint64)
+    posT = np.zeros((N,), dtype=np.int64)
+
+    pos = np.arange(N)
+
+    # Start with identity matrix in LIL for easy row edits
+    T = sp.eye(N, format='lil', dtype=np.float32)
+
+    for d in tqdm(range(depth_total), desc="Merged RAHT-Givens steps"):
+        S = N
+        temp = val.astype(np.uint64) & 0xFFFFFFFFFFFFFFFE        
+        mask = temp[:-1] == temp[1:]
+        mask = np.concatenate((mask, [False]))
+
+        comb_idx_array = np.where(mask == True)[0]
+        trans_idx_array = np.where(mask == False)[0]
+        trans_idx_array = np.setdiff1d(trans_idx_array, comb_idx_array + 1)
+
+        idxT_array = np.setdiff1d(np.arange(S), comb_idx_array + 1)
+        maskT = mask[idxT_array]
+
+        # Combine weights
+        wT[np.where(maskT == False)[0]] = w[trans_idx_array]
+        wT[np.where(maskT == True)[0]]  = w[comb_idx_array] + w[comb_idx_array + 1]
+
+        posT[np.where(maskT == False)[0]] = pos[trans_idx_array]
+        posT[np.where(maskT == True)[0]]  = pos[comb_idx_array]
+
+        left_node_array  = comb_idx_array
+        right_node_array = comb_idx_array + 1
+
+        a = np.sqrt(w[left_node_array] + w[right_node_array])
+        w1_array = np.sqrt(w[left_node_array]) / a
+        w2_array = np.sqrt(w[right_node_array]) / a
+
+        # Build sparse local matrix for this step
+        M = sp.eye(N_orig, format='lil', dtype=np.float32)
+        for l, r, w1, w2 in zip(pos[left_node_array], pos[right_node_array], w1_array, w2_array):
+            M[l, l] =  w1
+            M[l, r] =  w2
+            M[r, l] = -w2
+            M[r, r] =  w1
+
+        # Apply current level's transform
+        T = M.tocsr().dot(T)
+
+        # Prepare next level
+        valT = (val >> 1)[idxT_array]
+        N_T = N
+        N = N - comb_idx_array.shape[0]
+        N_idx_array = np.arange(N_T, N, -1) - NN - 1
+
+        wT[N_idx_array]   = wT[np.where(maskT == True)[0]]
+        posT[N_idx_array] = pos[comb_idx_array + 1]
+
+        pos[N:S] = posT[N:S]
+        w[N:S] = wT[N:S]
+
+        # Swap for next iteration
+        val, valT = valT, val
+        pos, posT = posT, pos
+        w, wT = wT, w
+
+    return T.tocsr()

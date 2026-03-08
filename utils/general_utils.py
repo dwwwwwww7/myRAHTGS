@@ -111,8 +111,10 @@ def build_scaling_rotation(s, r):
     L = R @ L
     return L
 
+
 def safe_state(silent):
     old_f = sys.stdout
+
     class F:
         def __init__(self, silent):
             self.silent = silent
@@ -132,4 +134,16 @@ def safe_state(silent):
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda:0"))
+
+    # 修复：只有在CUDA可用时才设置CUDA设备
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.set_device(torch.device("cuda:0"))
+            torch.cuda.manual_seed(0)
+            torch.cuda.manual_seed_all(0)
+        except Exception as e:
+            print(f"设置CUDA设备时出错: {e}")
+            # 可以选择回退到CPU或重新抛出异常
+            raise
+    else:
+        print("警告: CUDA不可用，将使用CPU")

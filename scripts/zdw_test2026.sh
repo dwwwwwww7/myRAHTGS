@@ -7,9 +7,9 @@ ITERS=200
 TEST_ITERS="0 50 100 200 $ITERS" 
 CONFIG=config4
 QUANT_TYPE=lsq    # vanilla or lsq
-MODEL_BASE="F:/3dgs_data/models"
-OUTPUT_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0308"
-CSV_BASE="F:/3dgs_data/my_RAHT_results2026/lsq0308/csv"
+MODEL_BASE="/data/zdw/datasets/inria3DGS_pretrained_models"
+OUTPUT_BASE="/data/zdw/zdw_data_2025/newRAHT/myMesonGS/results_2026/lsq0306_10000"
+CSV_BASE="/data/zdw/zdw_data_2025/newRAHT/myMesonGS/results_2026/lsq0306_10000/csv"
 
 mkdir -p "$OUTPUT_BASE"
 mkdir -p "$CSV_BASE"

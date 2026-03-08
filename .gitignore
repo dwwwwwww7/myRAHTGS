@@ -26,6 +26,6 @@ mesh_output/*
 *.dump
 data
 data/*
-scripts/*
-tmc13/*
-logs_batch/*
+#scripts/
+#tmc13/
+logs_batch/

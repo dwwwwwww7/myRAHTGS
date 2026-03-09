@@ -74,7 +74,8 @@ class ModelParams(ParamGroup):
         self.depth=12
         self.num_bits=8
         self.lambda_sparsity=5e-7  # 稀疏性损失权重
-        self.quant_type="lsq"  # 量化器类型: "lsq" 或 "vanilla"
+        self.lambda_rate=0.01  # ECSQ 码率损失权重 (R-D Loss 中的 λ)
+        self.quant_type="lsq"  # 量化器类型: "lsq", "vanilla", 或 "ecsq"
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

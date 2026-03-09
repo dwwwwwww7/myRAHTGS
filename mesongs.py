@@ -10,6 +10,7 @@
 #
 
 import csv
+import math
 import os
 import sys
 import uuid
@@ -22,6 +23,7 @@ from tqdm import tqdm
 
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import ft_render, render
+from utils.quant_utils import EcsqQuan
 from lpipsPyTorch import lpips
 from scene import GaussianModel, Scene
 from utils.general_utils import safe_state
@@ -925,6 +927,28 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
     
     gaussians.finetuning_setup(opt) #微调，需要固定位置，只对外观微调
 
+    # ============================================================
+    # ECSQ 辅助优化器 (aux_optimizer)
+    # 用于单独更新 EntropyBottleneck 内部的分位数参数（CDF 拟合参数）
+    # 这些参数不参与主 optimizer，需要独立的 aux_loss.backward()
+    # ============================================================
+    aux_optimizer = None
+    if (dataset.per_block_quant or dataset.per_channel_quant) and \
+       dataset.quant_type.lower() == "ecsq" and hasattr(gaussians, 'qas'):
+        # 【修正】只收集 EntropyBottleneck 内部的 quantiles（分位数参数）
+        # quantiles 专门用于拟合 CDF，固定使用单独优化器更新
+        # 不能把 _matrix/bias 等参数也混进来，否则会干扰主网络梯度
+        aux_quantiles = set()
+        for qa in gaussians.qas:
+            if isinstance(qa, EcsqQuan):
+                # quantiles 是 EntropyBottleneck 内维持 CDF 单调性约束的关键参数
+                aux_quantiles.add(qa.entropy_bottleneck.quantiles)
+        if aux_quantiles:
+            aux_optimizer = torch.optim.Adam(list(aux_quantiles), lr=1e-3)
+            print(f"\n【ECSQ】已创建 aux_optimizer，管理 {len(aux_quantiles)} 个 quantiles 参数")
+        else:
+            print("\n【ECSQ】警告：未找到 quantiles 参数，aux_optimizer 未创建")
+
     # 输出初始LSQ scale参数
     if dataset.per_block_quant and dataset.quant_type.lower() == "lsq":
         gaussians.print_lsq_scale_evolution(0)
@@ -971,30 +995,63 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         # 数据保真损失 (Data fidelity loss)
         loss_D = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
         
-        # 稀疏性损失 (Sparsity loss)
+        # 稀疏性损失 (Sparsity loss, 适用于 LSQ/Vanilla)
         loss_S = 0.0
         if dataset.lambda_sparsity > 0 and "raht_coeffs" in render_pkg:
-            # 获取RAHT AC系数
             raht_ac = render_pkg["raht_coeffs"]  # shape: [n_ac, n_ch]
-            
-            # 计算稀疏性损失: L_S = (1/n_ch) * Σ_i Σ_j |x_ij|
-            # 其中:
-            #   n_ch: 通道数（高斯属性数量）= 55
-            #   n_ac: AC系数数量 = 点数 - 1
-            #   x_ij: 第i个通道的第j个AC系数
-            # 该公式对应于每个通道的平均L1范数
             n_ch = raht_ac.shape[1]  # 通道数 (55)
-            n_ac = raht_ac.shape[0]   # AC系数数量
-            
-            # 实现: (1/n_ch) * sum(|x_ij|) for all i,j
-            # torch.abs(raht_ac).sum() 计算所有|x_ij|的总和
-            # 然后除以n_ch得到每个通道的平均L1范数
             loss_S = torch.abs(raht_ac).sum() / n_ch
         
-        # 总损失: L = (1 - λ_s) * L_D + λ_s * L_S
-        loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
+        # ============================================================
+        # ECSQ 码率损失 (Rate Loss)
+        # 【修正】直接遍历 qas 提取 last_likelihoods，而非从 render_pkg 间接获取
+        # 遍历完后立即清空缓存，防止积累导致显存溢出
+        # R = -log2(P(y_hat)) 即每个系数的比特数
+        # R_loss = total_bits / num_points (每点平均比特数)
+        # ============================================================
+        loss_R = 0.0
+        if dataset.quant_type.lower() == "ecsq" and hasattr(gaussians, 'qas'):
+            total_bits = 0.0
+            num_points = gaussians.get_xyz.shape[0]  # 高斯点总数
+            for qa in gaussians.qas:
+                if isinstance(qa, EcsqQuan) and qa.last_likelihoods is not None:
+                    # 香农信息量: bits = -log2(P)
+                    bits = -torch.log2(qa.last_likelihoods.clamp(min=1e-9)).sum()
+                    total_bits = total_bits + bits
+                    # 【关键】提取后立即清空，防止残留概率值占用显存
+                    qa.last_likelihoods = None
+            if num_points > 0 and isinstance(total_bits, torch.Tensor):
+                loss_R = total_bits / num_points
+        
+        # 总损失:
+        # - LSQ/Vanilla: L = (1 - λ_s) * L_D + λ_s * L_S  (稀疏性正则化)
+        # - ECSQ:        L = L_D + λ_r * L_R               (码率-失真联合优化)
+        if dataset.quant_type.lower() == "ecsq" and isinstance(loss_R, torch.Tensor):
+            loss = loss_D + dataset.lambda_rate * loss_R
+        else:
+            loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
+        
+        # 【修正 Step 3】先清空主优化器梯度，再 backward，顺序与规范一致
+        gaussians.optimizer.zero_grad(set_to_none=True)
+        if aux_optimizer is not None:
+            aux_optimizer.zero_grad(set_to_none=True)
         
         loss.backward()
+        
+        # ============================================================
+        # ECSQ 辅助损失更新 (aux_loss)
+        # EntropyBottleneck 内部维护用于 CDF 计算的分位数参数，
+        # 必须通过独立的 aux_loss.backward() 来更新，不能走主 optimizer
+        # ============================================================
+        if aux_optimizer is not None:
+            # 计算所有 EntropyBottleneck 的辅助损失：拟合 CDF，维持单调性约束
+            aux_loss = 0.0
+            for qa in gaussians.qas:
+                if isinstance(qa, EcsqQuan):
+                    aux_loss = aux_loss + qa.entropy_bottleneck.loss()
+            if isinstance(aux_loss, torch.Tensor):
+                aux_loss.backward()
+                aux_optimizer.step()
 
         iter_end.record()
 
@@ -1006,8 +1063,10 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                     "损失": f"{ema_loss_for_log:.6f}",
                     "L1": f"{Ll1.item():.6f}"
                 }
-                # 如果使用稀疏性损失，显示它
-                if dataset.lambda_sparsity > 0 and isinstance(loss_S, torch.Tensor):
+                # 显示对应模式的辅助损失
+                if dataset.quant_type.lower() == "ecsq" and isinstance(loss_R, torch.Tensor):
+                    postfix_dict["码率"] = f"{loss_R.item():.2e}"
+                elif dataset.lambda_sparsity > 0 and isinstance(loss_S, torch.Tensor):
                     postfix_dict["稀疏"] = f"{loss_S.item():.2e}"
                 progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
@@ -1053,10 +1112,9 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 scene.save_ft('best', pipe, per_channel_quant=dataset.per_channel_quant, per_block_quant=dataset.per_block_quant, bit_packing=dataset.bit_packing)
  
             
-            # Optimizer step
+            # Optimizer step（zero_grad 已在 backward 之前完成，此处只做 step）
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians.update_learning_rate(iteration+30000)
         # except Exception as e:
         #     print('error but go')

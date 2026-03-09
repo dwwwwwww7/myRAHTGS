@@ -21,7 +21,7 @@ from torch.autograd import Function
 from raht_torch import itransform_batched_torch, transform_batched_torch
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
-from utils.quant_utils import split_length
+from utils.quant_utils import split_length, EcsqQuan
 
 PROFILE_TIME = True # Macro added for time profiling
 if PROFILE_TIME:
@@ -447,6 +447,13 @@ def ft_render(
                 pc.qa.init_from(C[1:])
             quantC[1:] = pc.qa(C[1:])
 
+        # ====== ECSQ: 收集所有量化器的 likelihoods ======
+        ecsq_likelihoods_list = []
+        if per_block_quant or per_channel_quant:
+            for qa in pc.qas:
+                if isinstance(qa, EcsqQuan) and qa.last_likelihoods is not None:
+                    ecsq_likelihoods_list.append(qa.last_likelihoods)
+
         if PROFILE_TIME:
             torch.cuda.synchronize()
             t_quant_end = time.time()
@@ -605,6 +612,10 @@ def ft_render(
                 "quant": t_quant_end - t_quant_start,
                 "raht_inverse": t_raht_inverse_end - t_raht_inverse_start,
             }
+    
+    # ECSQ: 返回所有量化器的 likelihoods 用于 Rate Loss 计算
+    if raht and training and 'ecsq_likelihoods_list' in locals() and len(ecsq_likelihoods_list) > 0:
+        result["ecsq_likelihoods"] = torch.cat(ecsq_likelihoods_list)
     
     # 标记第一次渲染已完成
     if should_print_debug:

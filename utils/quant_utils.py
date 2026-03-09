@@ -4,6 +4,14 @@ import torch
 import torch.nn as nn
 from torch.autograd import Function
 
+# CompressAI 熵模型（ECSQ 量化器依赖）
+try:
+    from compressai.entropy_models import EntropyBottleneck
+    COMPRESSAI_AVAILABLE = True
+except ImportError:
+    COMPRESSAI_AVAILABLE = False
+    print("[WARNING] compressai 未安装，EcsqQuan 量化器不可用。请运行: pip install compressai")
+
 def split_length(length, n):
     base_length = length / n
     floor_length = int(base_length)
@@ -230,3 +238,107 @@ class VanillaQuan(Quantizer):
         x = round_pass(x)
         x = self.scale * (x - self.zero_point)
         return x
+
+
+# ============================================================================
+# ECSQ - 熵约束标量量化器 (Entropy-Constrained Scalar Quantization)
+# ============================================================================
+#
+# 原理：
+#   与 LSQ/Vanilla 等固定位宽量化器不同，ECSQ 不预设量化位数，
+#   而是通过联合优化 Rate-Distortion (R-D) 损失来自适应分配码率。
+#
+#   - Training 阶段：用 [-0.5, 0.5] 均匀噪声替代 Round，实现梯度完美反传
+#   - Inference 阶段：恢复真正的离散化 Round
+#   - 熵模型 (EntropyBottleneck) 会动态拟合量化后系数的 PDF，
+#     精确输出每个系数的 -log2(P)，用于 Rate Loss 的计算
+#   - 可学习步长 s 在 R-D 优化下自适应调整：
+#     对渲染贡献小的高频 AC 系数 → s 增大 → 量化后大面积归零 → 极度稀疏
+#
+# 使用方式：
+#   量化器 forward 返回反量化后的张量（与 LSQ/Vanilla 接口一致），
+#   同时将 likelihoods 暂存在 self.last_likelihoods 中，
+#   供训练循环在 forward 结束后提取并计算 Rate Loss。
+# ============================================================================
+
+class EcsqQuan(Quantizer):
+    """
+    熵约束可学习标量量化器 (ECSQ)
+    
+    不同于 LsqQuan/VanillaQuan 使用固定位宽，ECSQ 通过 CompressAI 的
+    EntropyBottleneck 动态拟合量化后系数的概率分布，用 R-D Loss 联合优化码率。
+    
+    Args:
+        channels: 熵模型的通道数（对应每个量化器处理的特征通道数，通常为1）
+        init_step_size: 初始步长
+    """
+    def __init__(self, channels=1, init_step_size=1.0):
+        super().__init__(bit=None)  # ECSQ 不受限于固定 bit，依靠熵模型动态优化
+        
+        if not COMPRESSAI_AVAILABLE:
+            raise RuntimeError(
+                "EcsqQuan 需要 compressai 库。请运行: pip install compressai"
+            )
+        
+        # 核心概率模型：学习量化后系数的概率密度函数 (PDF)
+        self.entropy_bottleneck = EntropyBottleneck(channels)
+        
+        # 可学习的步长参数 s，形状 (1, channels)
+        # 在 R-D 优化下，对渲染贡献小的系数的 s 会自动增大，
+        # 使得量化后大面积归零，达到极度稀疏化
+        self.s = nn.Parameter(torch.ones(1, channels) * init_step_size)
+        self.min_step_size = 1e-4
+        self.init_yet = False
+        
+        # 暂存前向传播产生的 likelihoods（概率），以免破坏原有仅返回 x 的 API
+        # 训练循环在 forward 结束后可通过 qa.last_likelihoods 提取
+        self.last_likelihoods = None
+
+    def init_from(self, x, *args, **kwargs):
+        """
+        根据输入数据的分布初始化步长（类似 LSQ 的初始化策略）
+        """
+        with torch.no_grad():
+            self.s.data.fill_(x.detach().abs().mean().item() * 2.0)
+        self.init_yet = True
+
+    def forward(self, x):
+        """
+        前向传播：
+          1. 将输入除以步长 s → 归一化
+          2. reshape 为 CompressAI 需要的 4D 格式 (B, C, H, W)
+          3. 送入 EntropyBottleneck：
+             - Training: 加均匀噪声模拟量化
+             - Inference: 真正 Round
+          4. 乘回步长 s → 反量化
+          5. 暂存 likelihoods 供 Rate Loss 计算
+        
+        Args:
+            x: 输入的 AC 系数，形状为 (N,) 的一维张量
+        
+        Returns:
+            x_q: 反量化后的张量，形状与输入一致（与 LSQ/Vanilla 接口兼容）
+        """
+        # 限制步长下界，防止除零
+        s_clamped = self.s.clamp(min=self.min_step_size)
+        
+        # 保存原始形状
+        orig_shape = x.shape
+        
+        # 归一化：除以步长
+        y = (x / s_clamped).view(1, 1, -1, 1)  # reshape 为 (B=1, C=1, H=N, W=1)
+        
+        # 送入 EntropyBottleneck
+        # Training 时：y_hat = y + uniform_noise (连续松弛)
+        # Inference 时：y_hat = round(y) (真正离散量化)
+        # likelihoods：每个元素被量化后的概率 P(y_hat)
+        y_hat, likelihoods = self.entropy_bottleneck(y)
+        
+        # 反量化：乘回步长，并恢复原始形状
+        x_q = (y_hat * s_clamped).view(orig_shape)
+        
+        # 将概率保存在模块内部，供后续计算 Rate Loss 时提取
+        # Rate Loss = -log2(likelihoods).sum() / num_points
+        self.last_likelihoods = likelihoods.view(orig_shape)
+        
+        return x_q

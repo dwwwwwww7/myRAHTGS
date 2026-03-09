@@ -27,7 +27,7 @@ from utils.general_utils import (build_rotation, build_scaling_rotation,
                                  get_expon_lr_func, inverse_sigmoid,
                                  strip_symmetric)
 from utils.graphics_utils import BasicPointCloud
-from utils.quant_utils import VanillaQuan, split_length, LsqQuan,LSQPlusActivationQuantizer
+from utils.quant_utils import VanillaQuan, split_length, LsqQuan, LSQPlusActivationQuantizer, EcsqQuan
 from utils.sh_utils import RGB2SH
 from utils.system_utils import mkdir_p
 from vq import vq_features
@@ -1126,8 +1126,85 @@ class GaussianModel:
 
             cf = C[0].cpu().numpy()
 
+            # ======== 检查是否使用 ECSQ ========
+            is_ecsq = hasattr(self, 'quant_type') and self.quant_type.lower() == "ecsq"
+            
             #print(f"\n  执行分块量化...")
-            if per_channel_quant:
+            if is_ecsq and (per_block_quant or per_channel_quant):
+                print(f"\n  执行 ECSQ 算术编码与量化...")
+                # save_dict 用于收集所有需要保存到 orgb.npz 的数据
+                save_dict = {'f': cf} # 保存未量化的 DC 系数
+                total_bitstream_bytes = 0
+                
+                if per_block_quant:
+                    qa_cnt = 0
+                    lc1 = C.shape[0] - 1 # AC 系数的数量
+                    split = split_length(lc1, self.n_block)
+                    
+                    print(f"    分块量化模式 (块数量: {self.n_block})")
+                    
+                    for i in range(C.shape[-1]):
+                        # 将当前特征维度的 AC 系数按块切分
+                        chunks = torch.split(C[1:, i], split)
+                        
+                        for chunk_idx, chunk_data in enumerate(chunks):
+                            qa = self.qas[qa_cnt]
+                            
+                            # 在 compress 之前，必须调用 update() 将训练阶段统计的 CDF 写入量化表
+                            # （实际工程中，通常只在保存模型前调用一次 update）
+                            qa.entropy_bottleneck.update()
+                            
+                            # --- 核心：ECSQ 算术编码流程 ---
+                            s_clamped = qa.s.clamp(min=qa.min_step_size)
+                            # 转换为 CompressAI 兼容的 (B, C, H, W) 形状
+                            y = (chunk_data / s_clamped).view(1, 1, -1, 1)
+                            
+                            # 调用底层的 ANS 算术编码器，直接生成极限压缩的字节流
+                            bitstream = qa.entropy_bottleneck.compress(y)[0]
+                            byte_array = np.frombuffer(bitstream, dtype=np.uint8)
+                            
+                            # 以维度和块编号作为独立 key 存入字典
+                            save_dict[f'i_ecsq_dim{i}_blk{chunk_idx}'] = byte_array
+                            trans_array.append(qa.s.item())
+                            
+                            total_bitstream_bytes += len(bitstream)
+                            
+                            qa_cnt += 1
+                            
+                    print(f"    ECSQ 算术编码总大小: {total_bitstream_bytes / 1024:.2f} KB")
+                    
+                    # 额外保存一些解码所需的元数据
+                    save_dict['ecsq_meta'] = np.array([C.shape[-1], self.n_block, lc1], dtype=np.int64)
+                    save_dict['split_info'] = np.array(split, dtype=np.int64)
+                    
+                    # 直接保存字典
+                    np.savez(os.path.join(bin_dir, 'orgb.npz'), **save_dict)
+                
+                elif per_channel_quant:
+                    # 单通道 ECSQ 压缩
+                    print(f"    按通道量化模式")
+                    for i in range(C.shape[-1]):
+                        qa = self.qas[i]
+                        qa.entropy_bottleneck.update()
+                        
+                        s_clamped = qa.s.clamp(min=qa.min_step_size)
+                        y = (C[1:, i] / s_clamped).view(1, 1, -1, 1)
+                        
+                        bitstream = qa.entropy_bottleneck.compress(y)[0]
+                        byte_array = np.frombuffer(bitstream, dtype=np.uint8)
+                        
+                        save_dict[f'i_ecsq_dim{i}'] = byte_array
+                        trans_array.append(qa.s.item())
+                        
+                        total_bitstream_bytes += len(bitstream)
+                        
+                    print(f"    ECSQ 算术编码总大小: {total_bitstream_bytes / 1024:.2f} KB")
+                    save_dict['ecsq_meta'] = np.array([C.shape[-1], C.shape[0]-1], dtype=np.int64)
+                    np.savez(os.path.join(bin_dir, 'orgb.npz'), **save_dict)
+
+                print(f"    orgb.npz 已包含算术编码的 AC 系数")
+
+            elif per_channel_quant:
                 qci = []
                 dqci = []
                 dim_bits = []
@@ -1311,11 +1388,12 @@ class GaussianModel:
             
                 
             else:
-                # 单一位宽模式（向后兼容）
-                print(f"    使用 uint8 存储（单一位宽模式）")
-                ##np.savez_compressed(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
-                np.savez(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
-                print(f"    orgb.npz: 形状 {qci.shape}, 大小 {qci.nbytes / 1024:.2f} KB")
+                if not is_ecsq:
+                    # 单一位宽模式（向后兼容）
+                    print(f"    使用 uint8 存储（单一位宽模式）")
+                    ##np.savez_compressed(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
+                    np.savez(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
+                    print(f"    orgb.npz: 形状 {qci.shape}, 大小 {qci.nbytes / 1024:.2f} KB")
             
             # Scale is now included in RAHT features, no separate ct.npz needed
             # print(f"\n  跳过独立的 Scale 文件 (ct.npz) - Scale 已包含在 RAHT 特征中")
@@ -1405,6 +1483,8 @@ class GaussianModel:
         
         self.dim_to_bit = dim_to_bit
         
+        self.quant_type = quant_type  # 保存量化类型供后续使用
+        
         # 创建量化器
         self.qas = nn.ModuleList([])
         for dim_idx in range(55):
@@ -1413,6 +1493,9 @@ class GaussianModel:
                 if quant_type.lower() == "lsq":
                     # LSQ (学习步长量化)
                     self.qas.append(LsqQuan(bit=bit, init_yet=False, all_positive=False).cuda())
+                elif quant_type.lower() == "ecsq":
+                    # ECSQ (熵约束量化)：不再依赖 bit_config，通过 R-D Loss 约束码率
+                    self.qas.append(EcsqQuan(channels=1).cuda())
                 else:
                     # VanillaQuan (传统量化)
                     self.qas.append(VanillaQuan(bit=bit).cuda())
@@ -1425,15 +1508,20 @@ class GaussianModel:
         print('='*50)
         print(f'量化器类型: {quant_type.upper()}')
         print(f'块数量: {n_block}')
+        print(f'量化器总数: {n_qs}')
         print()
-        print('量化位数配置:')
-        print(f'  opacity (1维):      {bit_config["opacity"]}-bit')
-        print(f'  euler (3维):        {bit_config["euler"]}-bit')
-        print(f'  f_dc (3维):         {bit_config["f_dc"]}-bit')
-        print(f'  f_rest_0 (9维):    {bit_config["f_rest_0"]}-bit  [SH degree 1]')
-        print(f'  f_rest_1 (15维):    {bit_config["f_rest_1"]}-bit  [SH degree 2]')
-        print(f'  f_rest_2 (21维):    {bit_config["f_rest_2"]}-bit  [SH degree 3]')
-        print(f'  scale (3维):        {bit_config["scale"]}-bit')
+        if quant_type.lower() == "ecsq":
+            print('码率分配: 自适应 (R-D 联合优化，由 EntropyBottleneck 控制)')
+            print('提示: 训练时需配置 aux_optimizer 更新 EntropyBottleneck 内部 CDF 参数')
+        else:
+            print('量化位数配置:')
+            print(f'  opacity (1维):      {bit_config["opacity"]}-bit')
+            print(f'  euler (3维):        {bit_config["euler"]}-bit')
+            print(f'  f_dc (3维):         {bit_config["f_dc"]}-bit')
+            print(f'  f_rest_0 (9维):    {bit_config["f_rest_0"]}-bit  [SH degree 1]')
+            print(f'  f_rest_1 (15维):    {bit_config["f_rest_1"]}-bit  [SH degree 2]')
+            print(f'  f_rest_2 (21维):    {bit_config["f_rest_2"]}-bit  [SH degree 3]')
+            print(f'  scale (3维):        {bit_config["scale"]}-bit')
         print('='*50)
     
     

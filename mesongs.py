@@ -1027,14 +1027,10 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         # - LSQ/Vanilla: L = (1 - λ_s) * L_D + λ_s * L_S  (稀疏性正则化)
         # - ECSQ:        L = L_D + λ_r * L_R               (码率-失真联合优化)
         if dataset.quant_type.lower() == "ecsq" and isinstance(loss_R, torch.Tensor):
-            loss = loss_D + dataset.lambda_rate * loss_R
+            loss =(1.0-dataset.lambda_rate) * loss_D + dataset.lambda_rate * loss_R
         else:
             loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
-        
-        # 【修正 Step 3】先清空主优化器梯度，再 backward，顺序与规范一致
-        gaussians.optimizer.zero_grad(set_to_none=True)
-        if aux_optimizer is not None:
-            aux_optimizer.zero_grad(set_to_none=True)
+   
         
         loss.backward()
         
@@ -1045,6 +1041,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         # ============================================================
         if aux_optimizer is not None:
             # 计算所有 EntropyBottleneck 的辅助损失：拟合 CDF，维持单调性约束
+            aux_optimizer.zero_grad(set_to_none=True)
             aux_loss = 0.0
             for qa in gaussians.qas:
                 if isinstance(qa, EcsqQuan):

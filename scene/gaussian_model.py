@@ -818,7 +818,16 @@ class GaussianModel:
         ]
 
         if hasattr(self, 'qas'):
-            l.append({'params': self.qas.parameters(), 'lr': 0.01, "name": "quantizers"})
+            # 【修复 ECSQ 参数冲突】
+            # CompressAI 的 quantiles 必须且只能由 aux_optimizer 单独更新（利用 aux_loss）
+            # 所以这里必须把 quantiles 从主网络参数中过滤掉，防止两个优化器互相打架
+            main_qas_params = []
+            for name, param in self.qas.named_parameters():
+                if "quantiles" not in name:
+                    main_qas_params.append(param)
+            
+            if main_qas_params:
+                l.append({'params': main_qas_params, 'lr': 0.001, "name": "quantizers"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -849,7 +858,16 @@ class GaussianModel:
         
         # 添加量化器的学习参数到优化器
         if hasattr(self, 'qas'):
-            l.append({'params': self.qas.parameters(), 'lr': 0.01, "name": "quantizers"})
+            # 【修复 ECSQ 参数冲突】
+            # CompressAI 的 quantiles 必须且只能由 aux_optimizer 单独更新（利用 aux_loss）
+            # 所以这里必须把 quantiles 从主网络参数中过滤掉，防止两个优化器互相打架
+            main_qas_params = []
+            for name, param in self.qas.named_parameters():
+                if "quantiles" not in name:
+                    main_qas_params.append(param)
+            
+            if main_qas_params:
+                l.append({'params': main_qas_params, 'lr': 0.001, "name": "quantizers"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -1178,7 +1196,7 @@ class GaussianModel:
                     save_dict['split_info'] = np.array(split, dtype=np.int64)
                     
                     # 直接保存字典
-                    np.savez(os.path.join(bin_dir, 'orgb.npz'), **save_dict)
+                    np.savez_compressed(os.path.join(bin_dir, 'orgb.npz'), **save_dict)
                 
                 elif per_channel_quant:
                     # 单通道 ECSQ 压缩
@@ -1318,77 +1336,77 @@ class GaussianModel:
                 trans_array.append(i_zp.item())
                 dim_bits = [self.qa.bit] * 55  # 所有维度使用相同的位数
                 
-            print(f"\n  保存 RAHT 系数 (包含 scale)...")
-            
-            # 选择存储方式：位打包 vs 分组存储
-            if per_block_quant or per_channel_quant:
-                from collections import defaultdict
+            if not is_ecsq:
+                print(f"\n  保存 RAHT 系数 (包含 scale)...")
                 
-                # 按位宽分组
-                bit_groups = defaultdict(list)
-                for dim_idx, bit in enumerate(dim_bits):
-                    bit_groups[bit].append(dim_idx)
+                # 选择存储方式：位打包 vs 分组存储
+                if per_block_quant or per_channel_quant:
+                    from collections import defaultdict
+                    
+                    # 按位宽分组
+                    bit_groups = defaultdict(list)
+                    for dim_idx, bit in enumerate(dim_bits):
+                        bit_groups[bit].append(dim_idx)
+                    
+                    if bit_packing:
+                        # 位打包存储（默认方式）
+                        print(f"    使用位打包存储:")
+                        print(f"      位宽配置: {set(dim_bits)} bits")
+                        print(f"      总位数: {sum(dim_bits)} bits/point")
+                        
+                    
+                        # 执行位打包
+                        bitstream = pack_bits(qci, dim_bits)
+                        bitstream_size = len(bitstream) / 1024
+                        
+                        save_dict = {
+                            'f': cf,  # DC 系数
+                            'i': np.frombuffer(bitstream, dtype=np.uint8),  # 位打包的AC系数
+                            'packed': np.array([1], dtype=np.uint8),  # 标记为位打包格式
+                            'bit_config': np.array(dim_bits, dtype=np.uint8),  # 位宽配置
+                            'signed_config': np.array(signed_flags, dtype=np.uint8)  # 有符号标记
+                        }
+                        
+                        print(f"      原始大小: {qci.nbytes / 1024:.2f} KB")
+                        print(f"      打包后大小: {bitstream_size:.2f} KB")
+                        print(f"      压缩比: {qci.nbytes / len(bitstream):.2f}x")
+                        
+                    else:
+                        # 分组存储（兼容模式）
+                        print(f"    按位宽分组存储 (兼容模式):")
+                        save_dict = {'f': cf}  # DC 系数
+                        total_size_uncompressed = 0
+                        
+                        for bit in sorted(bit_groups.keys()):
+                            dims = bit_groups[bit]
+                            
+                            # 选择最小的合适数据类型
+                            if bit <= 8:
+                                dtype = np.uint8
+                            elif bit <= 16:
+                                dtype = np.uint16
+                            else:
+                                dtype = np.uint32
+                            
+                            # 提取对应维度的数据（按列存储，保持数据规律性）
+                            group_data = qci[:, dims].astype(dtype)
+                            group_size = group_data.nbytes / 1024
+                            total_size_uncompressed += group_size
+                            
+                            # 保存到字典
+                            key = f'i_{bit}bit'
+                            save_dict[key] = group_data
+                            save_dict[f'dims_{bit}bit'] = np.array(dims, dtype=np.uint8)
+                            
+                            print(f"      {bit:2d}-bit: {len(dims):2d} 维度, {dtype.__name__:6s}, {group_size:8.2f} KB")
+                        
+                        print(f"    orgb.npz: 总大小 {total_size_uncompressed:.2f} KB (未压缩)")
+                    
+                    # 保存文件
+                    np.savez(os.path.join(bin_dir,'orgb.npz'), **save_dict)
                 
-                if bit_packing:
-                    # 位打包存储（默认方式）
-                    print(f"    使用位打包存储:")
-                    print(f"      位宽配置: {set(dim_bits)} bits")
-                    print(f"      总位数: {sum(dim_bits)} bits/point")
-                    
-                
-                    # 执行位打包
-                    bitstream = pack_bits(qci, dim_bits)
-                    bitstream_size = len(bitstream) / 1024
-                    
-                    save_dict = {
-                        'f': cf,  # DC 系数
-                        'i': np.frombuffer(bitstream, dtype=np.uint8),  # 位打包的AC系数
-                        'packed': np.array([1], dtype=np.uint8),  # 标记为位打包格式
-                        'bit_config': np.array(dim_bits, dtype=np.uint8),  # 位宽配置
-                        'signed_config': np.array(signed_flags, dtype=np.uint8)  # 有符号标记
-                    }
-                    
-                    print(f"      原始大小: {qci.nbytes / 1024:.2f} KB")
-                    print(f"      打包后大小: {bitstream_size:.2f} KB")
-                    print(f"      压缩比: {qci.nbytes / len(bitstream):.2f}x")
                     
                 else:
-                    # 分组存储（兼容模式）
-                    print(f"    按位宽分组存储 (兼容模式):")
-                    save_dict = {'f': cf}  # DC 系数
-                    total_size_uncompressed = 0
-                    
-                    for bit in sorted(bit_groups.keys()):
-                        dims = bit_groups[bit]
-                        
-                        # 选择最小的合适数据类型
-                        if bit <= 8:
-                            dtype = np.uint8
-                        elif bit <= 16:
-                            dtype = np.uint16
-                        else:
-                            dtype = np.uint32
-                        
-                        # 提取对应维度的数据（按列存储，保持数据规律性）
-                        group_data = qci[:, dims].astype(dtype)
-                        group_size = group_data.nbytes / 1024
-                        total_size_uncompressed += group_size
-                        
-                        # 保存到字典
-                        key = f'i_{bit}bit'
-                        save_dict[key] = group_data
-                        save_dict[f'dims_{bit}bit'] = np.array(dims, dtype=np.uint8)
-                        
-                        print(f"      {bit:2d}-bit: {len(dims):2d} 维度, {dtype.__name__:6s}, {group_size:8.2f} KB")
-                    
-                    print(f"    orgb.npz: 总大小 {total_size_uncompressed:.2f} KB (未压缩)")
-                
-                # 保存文件
-                np.savez(os.path.join(bin_dir,'orgb.npz'), **save_dict)
-            
-                
-            else:
-                if not is_ecsq:
                     # 单一位宽模式（向后兼容）
                     print(f"    使用 uint8 存储（单一位宽模式）")
                     ##np.savez_compressed(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
@@ -1494,8 +1512,8 @@ class GaussianModel:
                     # LSQ (学习步长量化)
                     self.qas.append(LsqQuan(bit=bit, init_yet=False, all_positive=False).cuda())
                 elif quant_type.lower() == "ecsq":
-                    # ECSQ (熵约束量化)：不再依赖 bit_config，通过 R-D Loss 约束码率
-                    self.qas.append(EcsqQuan(channels=1).cuda())
+                    # ECSQ (熵约束量化)：通过 R-D Loss 约束码率
+                    self.qas.append(EcsqQuan(bit=bit,init_yet=False, all_positive=False,channels=1).cuda())
                 else:
                     # VanillaQuan (传统量化)
                     self.qas.append(VanillaQuan(bit=bit).cuda())

@@ -29,3 +29,5 @@ data/*
 scripts/
 tmc13/
 logs_batch/
+results_2026/
+orgb_*.png

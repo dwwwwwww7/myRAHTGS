@@ -38,7 +38,7 @@ import glob
 
 
 
-def pack_bits(data, bit_depths):
+def pack_bits(data, bit_depths, signed_flags=None):
     """
     将多个不同位宽的整数打包成紧凑的字节流
     采用按属性打包策略：同一属性的所有高斯点打包在一起
@@ -46,6 +46,7 @@ def pack_bits(data, bit_depths):
     Args:
         data: numpy array, shape (N, C), 每列是一个通道的量化值
         bit_depths: list of int, 每个通道的位宽
+        signed_flags: list of bool, 每个通道是否为有符号整数（可选）
     
     Returns:
         bytes: 打包后的字节流
@@ -67,13 +68,17 @@ def pack_bits(data, bit_depths):
     # 按属性（列）打包，而不是按高斯点（行）打包
     for c in range(C):
         bits = bit_depths[c]
+        is_signed = signed_flags[c] if signed_flags is not None else False
+        
         for i in range(N):
             value = int(data[i, c])
 
-             # 处理有符号值：使用二补码转换为无符号表示
-            if value < 0:
-                value = value + (1 << bits)  # 二补码: -1 → 2^bits - 1
-            
+            # 【优化修改】：使用偏移量 (Offset Binning) 代替二补码
+            # LSQ 的有符号量化范围是 [-2^(b-1), 2^(b-1)-1]
+            # 我们给所有值加上一个偏移量 2^(b-1)，强制将其平移到 [0, 2^b-1] 的非负数域
+            if is_signed:
+                offset = 1 << (bits - 1)
+                value = value + offset
             
             # 确保值在有效范围内
             max_val = (1 << bits) - 1
@@ -149,8 +154,15 @@ def unpack_bits(bitstream, bit_depths, N, signed_flags=None):
                 bit_pos += 1
 
             # 二补码：还原有符号值
-            if is_signed and value >= (1 << (bits - 1)):
-                value = value - (1 << bits)
+            # if is_signed and value >= (1 << (bits - 1)):
+            #     value = value - (1 << bits)
+            
+            # 【优化修改】：使用偏移量 (Offset) 还原代替二补码逆向
+            # 打包时我们使用了: value = value + offset
+            # 所以解包时只需: value = value - offset
+            if is_signed:
+                offset = 1 << (bits - 1)
+                value = value - offset
             
             data[i, c] = value
     
@@ -818,7 +830,7 @@ class GaussianModel:
         ]
 
         if hasattr(self, 'qas'):
-            l.append({'params': self.qas.parameters(), 'lr': 0.01, "name": "quantizers"})
+            l.append({'params': self.qas.parameters(), 'lr': 0.005, "name": "quantizers"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -849,7 +861,7 @@ class GaussianModel:
         
         # 添加量化器的学习参数到优化器
         if hasattr(self, 'qas'):
-            l.append({'params': self.qas.parameters(), 'lr': 0.01, "name": "quantizers"})
+            l.append({'params': self.qas.parameters(), 'lr': 0.005, "name": "quantizers"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -1260,7 +1272,7 @@ class GaussianModel:
                     
                 
                     # 执行位打包
-                    bitstream = pack_bits(qci, dim_bits)
+                    bitstream = pack_bits(qci, dim_bits, signed_flags=signed_flags)
                     bitstream_size = len(bitstream) / 1024
                     
                     save_dict = {

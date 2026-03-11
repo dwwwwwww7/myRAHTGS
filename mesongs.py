@@ -858,7 +858,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             'f_rest_1': 4,
             'f_rest_2': 2,
         }
-        gaussians.init_qas(dataset.n_block, bit_config=bit_config, quant_type=dataset.quant_type)
+        gaussians.init_qas(dataset.n_block, bit_config=bit_config, quant_type=dataset.quant_type, encode=getattr(dataset, 'encode', 'deflate'))
         print(f"  通道量化: 启用")
     elif dataset.per_block_quant:
         print(f"  量化模式：per_block_quant")
@@ -871,7 +871,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             'f_rest_1': 4,      # sh_2 (SH degree 2: 15维)
             'f_rest_2': 2,      # sh_3 (SH degree 3: 21维)
         }
-        gaussians.init_qas(dataset.n_block, bit_config=bit_config, quant_type=dataset.quant_type)
+        gaussians.init_qas(dataset.n_block, bit_config=bit_config, quant_type=dataset.quant_type, encode=getattr(dataset, 'encode', 'deflate'))
     else:
         print(f"未知的量化模式")
 
@@ -892,6 +892,10 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         )
         
         #保存压缩文件
+        if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'qas'):
+            for qa in gaussians.qas:
+                if getattr(qa, 'encode', 'deflate').lower() == "ans" and hasattr(qa, 'entropy_bottleneck'):
+                    qa.entropy_bottleneck.update(force=True)
         zip_size = scene.save_ft("0", pipe, per_channel_quant=dataset.per_channel_quant, per_block_quant=dataset.per_block_quant, bit_packing=dataset.bit_packing)
         zip_size = zip_size / 1024 / 1024 # to MB
         
@@ -924,6 +928,19 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
     print("="*70 + "\n")
     
     gaussians.finetuning_setup(opt) #微调，需要固定位置，只对外观微调
+
+    # ==========================================
+    # 初始化 ECSQ/ANS 的辅助优化器 (拟合 CDF 曲线)
+    # ==========================================
+    aux_optimizer = None
+    if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'qas'):
+        aux_quantiles = set()
+        for qa in gaussians.qas:
+            if getattr(qa, 'encode', 'deflate').lower() == "ans" and hasattr(qa, 'entropy_bottleneck'):
+                aux_quantiles.add(qa.entropy_bottleneck.quantiles)
+        if aux_quantiles:
+            aux_optimizer = torch.optim.Adam(list(aux_quantiles), lr=1e-3)
+            print(f"\n【ANS 编码】已启用，初始化 aux_optimizer 管理 {len(aux_quantiles)} 个 CDF 参数")
 
     # 输出初始LSQ scale参数
     if dataset.per_block_quant and dataset.quant_type.lower() == "lsq":
@@ -991,10 +1008,48 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             # 然后除以n_ch得到每个通道的平均L1范数
             loss_S = torch.abs(raht_ac).sum() / n_ch
         
-        # 总损失: L = (1 - λ_s) * L_D + λ_s * L_S
-        loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
+        # ==========================================
+        # 提取概率并计算 Rate Loss (码率约束)
+        # ==========================================
+        loss_R = torch.tensor(0.0, device="cuda")
+        if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'qas'):
+            total_bits = torch.tensor(0.0, device="cuda")
+            num_points = gaussians.get_xyz.shape[0]
+            for qa in gaussians.qas:
+                if getattr(qa, 'encode', 'deflate').lower() == "ans" and qa.last_likelihoods is not None:
+                    # 香农信息量: bits = -log2(P)
+                    bits = -torch.log2(qa.last_likelihoods.clamp(min=1e-9)).sum()
+                    total_bits = total_bits + bits
+                    qa.last_likelihoods = None  # 提取后立即清空缓存
+            
+            if num_points > 0:
+                loss_R = total_bits / num_points
         
+        # ==========================================
+        # 组装最终 Loss
+        # ==========================================
+        if getattr(dataset, 'encode', 'deflate').lower() == "ans":
+            loss = loss_D + getattr(dataset, 'lambda_rate', 5e-7) * loss_R
+        else:
+            loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
+            
+        # 清空梯度
+        if aux_optimizer is not None:
+            aux_optimizer.zero_grad(set_to_none=True)
+            
         loss.backward()
+
+        # ==========================================
+        # ANS 辅助参数的反向传播
+        # ==========================================
+        if aux_optimizer is not None:
+            aux_loss = torch.tensor(0.0, device="cuda")
+            for qa in gaussians.qas:
+                if getattr(qa, 'encode', 'deflate').lower() == "ans" and hasattr(qa, 'entropy_bottleneck'):
+                    aux_loss = aux_loss + qa.entropy_bottleneck.loss()
+            if isinstance(aux_loss, torch.Tensor) and aux_loss.requires_grad:
+                aux_loss.backward()
+                aux_optimizer.step()
 
         iter_end.record()
 
@@ -1050,6 +1105,10 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             if cur_psnr > psnr_train:
                 psnr_train = cur_psnr
                 print("\n Saving best Gaussians on Train Set.")
+                if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'qas'):
+                    for qa in gaussians.qas:
+                        if getattr(qa, 'encode', 'deflate').lower() == "ans" and hasattr(qa, 'entropy_bottleneck'):
+                            qa.entropy_bottleneck.update(force=True)
                 scene.save_ft('best', pipe, per_channel_quant=dataset.per_channel_quant, per_block_quant=dataset.per_block_quant, bit_packing=dataset.bit_packing)
  
             

@@ -118,50 +118,53 @@ class IdentityQuan(Quantizer):
 
 
 class LsqQuan(Quantizer):
-    def __init__(self, bit, init_yet, all_positive=True, symmetric=False):
+    def __init__(self, bit, init_yet, all_positive=True, symmetric=False, encode="deflate", channels=1):
         super().__init__(bit)
         
         if all_positive:
             assert not symmetric, "Positive quantization cannot be symmetric"
-            # unsigned activation is quantized to [0, 2^b-1]
             self.thd_neg = 0
             self.thd_pos = 2 ** bit - 1
         else:
             if symmetric:
-                # signed weight/activation is quantized to [-2^(b-1)+1, 2^(b-1)-1]
                 self.thd_neg = - 2 ** (bit - 1) + 1
                 self.thd_pos = 2 ** (bit - 1) - 1
             else:
-                # signed weight/activation is quantized to [-2^(b-1), 2^(b-1)-1]
                 self.thd_neg = - 2 ** (bit - 1)
                 self.thd_pos = 2 ** (bit - 1) - 1
 
         self.s = nn.Parameter(torch.ones(1))
         self.init_yet = init_yet
-    
+        
+        # 🌟 新增：编码器选择与熵模型初始化
+        self.encode = encode
+        if self.encode.lower() == "ans":
+            from compressai.entropy_models import EntropyBottleneck
+            self.entropy_bottleneck = EntropyBottleneck(channels)
+        self.last_likelihoods = None
+
     def init_from(self, x, *args, **kwargs):
         with torch.no_grad():
-            # LSQ论文里的初始化方法
             self.s.data.fill_(x.detach().abs().mean().item() * 2 / (self.thd_pos ** 0.5))
-            # 以下为min-max初始化
-            # min_val = x.detach().min()
-            # max_val = x.detach().max()
-            # if max_val == min_val:
-            #     max_val = max_val + 1e-5
-            # scale_init = (max_val - min_val) / (self.thd_pos - self.thd_neg)
-            # self.s.data.fill_(scale_init.item())
         self.init_yet = True
-        # print('quant_utils.py Line 62:', self.s)  # 打印初始化后的s
     
     def forward(self, x):
         s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
         s_scale = grad_scale(self.s, s_grad_scale)
 
-        x = x / s_scale
-        x = torch.clamp(x, self.thd_neg, self.thd_pos)
-        x = round_pass(x)
-        x = x * s_scale
-        return x
+        # 1. 归一化与截断 (LSQ 原本逻辑)
+        x_norm = x / s_scale
+        x_clamped = torch.clamp(x_norm, self.thd_neg, self.thd_pos)
+        
+        # 2. 🌟 新增：如果使用 ANS，则在连续域（加噪）评估香农概率
+        if self.encode.lower() == "ans":
+            _, likelihoods = self.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
+            self.last_likelihoods = likelihoods.view(x.shape)
+        
+        # 3. 直通估计器 (STE) 离散化与反量化
+        x_q = round_pass(x_clamped)
+        x_q = x_q * s_scale
+        return x_q
 
 
 def calcScaleZeroPoint(min_val, max_val, num_bits=8):
@@ -183,34 +186,33 @@ def calcScaleZeroPoint(min_val, max_val, num_bits=8):
 
 
 class VanillaQuan(Quantizer):
-    def __init__(self, bit, all_positive=True, symmetric=False):
+    def __init__(self, bit, all_positive=True, symmetric=False, encode="deflate", channels=1):
         super().__init__(bit)
         
         if all_positive:
             assert not symmetric, "Positive quantization cannot be symmetric"
-            # unsigned activation is quantized to [0, 2^b-1]
             self.thd_neg = 0
             self.thd_pos = 2 ** bit - 1
         else:
             if symmetric:
-                # signed weight/activation is quantized to [-2^(b-1)+1, 2^(b-1)-1]
                 self.thd_neg = - 2 ** (bit - 1) + 1
                 self.thd_pos = 2 ** (bit - 1) - 1
             else:
-                # signed weight/activation is quantized to [-2^(b-1), 2^(b-1)-1]
                 self.thd_neg = - 2 ** (bit - 1)
                 self.thd_pos = 2 ** (bit - 1) - 1
 
         self.bit = bit
-        scale = torch.tensor([], requires_grad=False)
-        zero_point = torch.tensor([], requires_grad=False)
-        min_val = torch.tensor([], requires_grad=False)
-        max_val = torch.tensor([], requires_grad=False)
+        self.register_buffer('scale', torch.tensor([], requires_grad=False))
+        self.register_buffer('zero_point', torch.tensor([], requires_grad=False))
+        self.register_buffer('min_val', torch.tensor([], requires_grad=False)) 
+        self.register_buffer('max_val', torch.tensor([], requires_grad=False))
         
-        self.register_buffer('scale', scale)
-        self.register_buffer('zero_point', zero_point)
-        self.register_buffer('min_val', min_val) 
-        self.register_buffer('max_val', max_val)
+        # 🌟 新增：编码器选择与熵模型初始化
+        self.encode = encode
+        if self.encode.lower() == "ans":
+            from compressai.entropy_models import EntropyBottleneck
+            self.entropy_bottleneck = EntropyBottleneck(channels)
+        self.last_likelihoods = None
         
     def update(self, x):
         if self.max_val.nelement() == 0 or self.max_val.data < x.max().data:
@@ -225,8 +227,17 @@ class VanillaQuan(Quantizer):
     
     def forward(self, x):
         self.update(x)
-        x = self.zero_point + (x / self.scale)
-        x = torch.clamp(x, self.thd_neg, self.thd_pos)
-        x = round_pass(x)
-        x = self.scale * (x - self.zero_point)
-        return x
+        
+        # 1. 归一化与截断
+        x_norm = self.zero_point + (x / self.scale)
+        x_clamped = torch.clamp(x_norm, self.thd_neg, self.thd_pos)
+        
+        # 2. 🌟 新增：如果使用 ANS，则在连续域评估香农概率
+        if self.encode.lower() == "ans":
+            _, likelihoods = self.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
+            self.last_likelihoods = likelihoods.view(x.shape)
+            
+        # 3. 离散化与反量化
+        x_q = round_pass(x_clamped)
+        x_q = self.scale * (x_q - self.zero_point)
+        return x_q

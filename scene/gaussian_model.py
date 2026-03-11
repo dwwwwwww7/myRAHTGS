@@ -1138,196 +1138,238 @@ class GaussianModel:
 
             cf = C[0].cpu().numpy()
 
-            #print(f"\n  执行分块量化...")
-            if per_channel_quant:
+            is_ans = False
+            if hasattr(self, 'qas') and len(self.qas) > 0:
+                is_ans = getattr(self.qas[0], 'encode', 'deflate').lower() == 'ans'
+
+            if is_ans:
+                print(f"    ANS 编码模式")
                 qci = []
-                dqci = []
-                dim_bits = []
-                signed_flags = []
+                qa_cnt = 0
                 for i in range(C.shape[-1]):
                     # 兼容不同量化器的属性名
-                    qa = self.qas[i]
-                    dim_bits.append(qa.bit)
-                    if hasattr(qa, 'scale'):
-                        # VanillaQuan
-                        i_scale = qa.scale
-                        i_zp = qa.zero_point
-                        i_signed = False
-                    elif hasattr(qa, 's'):
-                        # LsqQuan
-                        i_scale = qa.s
-                        i_zp = torch.tensor(0.0, device=qa.s.device)
-                         # all_positive=False 时使用有符号量化
-                        i_signed = not hasattr(qa, 'thd_neg') or qa.thd_neg < 0
-                    else:
-                        raise ValueError(f"Unsupported quantizer type: {type(qa)}")
+                    qa = self.qas[qa_cnt]
                     
-                    signed_flags.append(i_signed)
-                    q_tensor_i = quantize_tensor(
-                                x=C[1:, i],
-                                scale=i_scale,
-                                zero_point=i_zp,
-                                num_bits=qa.bit,
-                                signed=i_signed
-                                ).cpu().numpy().reshape(-1, 1)
-                    qci.append(
-                        q_tensor_i
-                    )
+                    if hasattr(qa, 's'):
+                        x_norm = C[1:, i] / qa.s
+                    else:
+                        x_norm = qa.zero_point + (C[1:, i] / qa.scale)
+                    y_clamped = torch.clamp(x_norm, qa.thd_neg, qa.thd_pos).round()  # 【注意】算术编码前要 round
+                    
+                    bitstream = qa.entropy_bottleneck.compress(y_clamped.view(1, 1, -1, 1))[0]
+                    # np.frombuffer 产生的是只读数组，将其复制一下
+                    bitstream_bytes = np.frombuffer(bitstream, dtype=np.uint8).copy()
+                    
+                    # 记录此维度的字节长度，方便加载时拆分
+                    qci.append(np.array([len(bitstream_bytes)], dtype=np.int32)) 
+                    qci.append(bitstream_bytes)
+                    
+                    if hasattr(qa, 's'):
+                        trans_array.extend([qa.s.item(), 0.0])
+                    else:
+                        trans_array.extend([qa.scale.item(), qa.zero_point.item()])
+                    
+                    qa_cnt += self.n_block if per_block_quant else 1
 
-                    dqci.append(
-                        (q_tensor_i.astype(np.float32) - i_zp.item()) * i_scale.item()
-                    )
+                bitstream_concat = np.concatenate(qci)
+                save_dict = {
+                    'f': cf,
+                    'i': bitstream_concat,
+                    'packed': np.array([2], dtype=np.uint8) # 2代表 ANS 格式
+                }
+                np.savez(os.path.join(bin_dir,'orgb.npz'), **save_dict)
+                print(f"      ANS 字节流总大小: {len(bitstream_concat) / 1024:.2f} KB")
 
+            if not is_ans:
+                if per_channel_quant:
+                    qci = []
+                    dqci = []
+                    dim_bits = []
+                    signed_flags = []
+                    for i in range(C.shape[-1]):
+                        # 兼容不同量化器的属性名
+                        qa = self.qas[i]
+                        dim_bits.append(qa.bit)
+                        if hasattr(qa, 'scale'):
+                            # VanillaQuan
+                            i_scale = qa.scale
+                            i_zp = qa.zero_point
+                            i_signed = False
+                        elif hasattr(qa, 's'):
+                            # LsqQuan
+                            i_scale = qa.s
+                            i_zp = torch.tensor(0.0, device=qa.s.device)
+                             # all_positive=False 时使用有符号量化
+                            i_signed = not hasattr(qa, 'thd_neg') or qa.thd_neg < 0
+                        else:
+                            raise ValueError(f"Unsupported quantizer type: {type(qa)}")
+                    
+                        signed_flags.append(i_signed)
+                        q_tensor_i = quantize_tensor(
+                                    x=C[1:, i],
+                                    scale=i_scale,
+                                    zero_point=i_zp,
+                                    num_bits=qa.bit,
+                                    signed=i_signed
+                                    ).cpu().numpy().reshape(-1, 1)
+                        qci.append(
+                            q_tensor_i
+                        )
+
+                        dqci.append(
+                            (q_tensor_i.astype(np.float32) - i_zp.item()) * i_scale.item()
+                        )
+
+                        trans_array.append(i_scale.item())
+                        trans_array.append(i_zp.item())
+
+                    trans_array.extend(dim_bits)
+
+                    qci = np.concatenate(qci, axis=-1)
+                    dqci = np.concatenate(dqci, axis=-1)
+                elif per_block_quant:
+                    qa_cnt = 0
+                    lc1 = C.shape[0] - 1
+                    qci = [] 
+                    split = split_length(lc1, self.n_block)
+                
+                    print(f"    分块量化模式")
+                    print(f"    块数量: {self.n_block}")
+                    print(f"    量化 55 维 RAHT 特征 (包含 scale)...")
+                
+                    # 保存每个维度的量化位数信息
+                    dim_bits = []
+                    signed_flags = []
+                
+                    for i in range(C.shape[-1]):
+                        # 获取当前维度的量化位数
+                        qa = self.qas[qa_cnt]
+                        current_bit = qa.bit
+                        dim_bits.append(current_bit)
+
+                        # 判断是否有符号量化
+                        if hasattr(qa, 's'):
+                            is_signed = not hasattr(qa, 'thd_neg') or qa.thd_neg < 0
+                        else:
+                            is_signed = False
+                        signed_flags.append(is_signed)
+                    
+                        t1, trans1 = torch_vanilla_quant_ave(C[1:, i], split, self.qas[qa_cnt : qa_cnt + self.n_block])
+                        qci.append(t1.reshape(-1, 1))  # 添加维度: (N,) -> (N, 1)
+                        trans_array.extend(trans1)
+                        qa_cnt += self.n_block
+                
+                    print(f"    所有特征量化完成，使用了 {qa_cnt} 个量化器 (55 × {self.n_block})")
+                    print(f"    量化位数分布: {set(dim_bits)} bits")
+                
+                    # 保存量化位数配置
+                    trans_array.extend(dim_bits)  # 添加55个维度的bit信息
+                
+                    qci = np.concatenate(qci, axis=-1)  # 现在形状是 (N, 55)
+                
+                    # 调试：打印 qci 的形状
+                    print(f"    qci 形状: {qci.shape}")
+                else:
+                    # 兼容不同量化器的属性名
+                    if hasattr(self.qa, 'scale'):
+                        # VanillaQuan
+                        i_scale = self.qa.scale
+                        i_zp = self.qa.zero_point
+                        i_signed = False
+                    elif hasattr(self.qa, 's'):
+                        # LsqQuan
+                        i_scale = self.qa.s
+                        i_zp = torch.tensor(0.0, device=self.qa.s.device)
+                        i_signed = not hasattr(self.qa, 'thd_neg') or self.qa.thd_neg < 0
+                    else:
+                        raise ValueError(f"Unsupported quantizer type: {type(self.qa)}")
+                
+                    qci = quantize_tensor(
+                        C[1:],
+                        scale=i_scale,
+                        zero_point=i_zp,
+                        num_bits=self.qa.bit,
+                        signed=i_signed
+                    ).cpu().numpy()
                     trans_array.append(i_scale.item())
                     trans_array.append(i_zp.item())
-
-                trans_array.extend(dim_bits)
-
-                qci = np.concatenate(qci, axis=-1)
-                dqci = np.concatenate(dqci, axis=-1)
-            elif per_block_quant:
-                qa_cnt = 0
-                lc1 = C.shape[0] - 1
-                qci = [] 
-                split = split_length(lc1, self.n_block)
+                    dim_bits = [self.qa.bit] * 55  # 所有维度使用相同的位数
                 
-                print(f"    分块量化模式")
-                print(f"    块数量: {self.n_block}")
-                print(f"    量化 55 维 RAHT 特征 (包含 scale)...")
+                print(f"\n  保存 RAHT 系数 (包含 scale)...")
+            
+                # 选择存储方式：位打包 vs 分组存储
+                if per_block_quant or per_channel_quant:
+                    from collections import defaultdict
                 
-                # 保存每个维度的量化位数信息
-                dim_bits = []
-                signed_flags = []
+                    # 按位宽分组
+                    bit_groups = defaultdict(list)
+                    for dim_idx, bit in enumerate(dim_bits):
+                        bit_groups[bit].append(dim_idx)
                 
-                for i in range(C.shape[-1]):
-                    # 获取当前维度的量化位数
-                    qa = self.qas[qa_cnt]
-                    current_bit = qa.bit
-                    dim_bits.append(current_bit)
-
-                    # 判断是否有符号量化
-                    if hasattr(qa, 's'):
-                        is_signed = not hasattr(qa, 'thd_neg') or qa.thd_neg < 0
+                    if bit_packing:
+                        # 位打包存储（默认方式）
+                        print(f"    使用位打包存储:")
+                        print(f"      位宽配置: {set(dim_bits)} bits")
+                        print(f"      总位数: {sum(dim_bits)} bits/point")
+                    
+                
+                        # 执行位打包
+                        bitstream = pack_bits(qci, dim_bits, signed_flags=signed_flags)
+                        bitstream_size = len(bitstream) / 1024
+                    
+                        save_dict = {
+                            'f': cf,  # DC 系数
+                            'i': np.frombuffer(bitstream, dtype=np.uint8),  # 位打包的AC系数
+                            'packed': np.array([1], dtype=np.uint8),  # 标记为位打包格式
+                            'bit_config': np.array(dim_bits, dtype=np.uint8),  # 位宽配置
+                            'signed_config': np.array(signed_flags, dtype=np.uint8)  # 有符号标记
+                        }
+                    
+                        print(f"      原始大小: {qci.nbytes / 1024:.2f} KB")
+                        print(f"      打包后大小: {bitstream_size:.2f} KB")
+                        print(f"      压缩比: {qci.nbytes / len(bitstream):.2f}x")
+                    
                     else:
-                        is_signed = False
-                    signed_flags.append(is_signed)
+                        # 分组存储（兼容模式）
+                        print(f"    按位宽分组存储 (兼容模式):")
+                        save_dict = {'f': cf}  # DC 系数
+                        total_size_uncompressed = 0
                     
-                    t1, trans1 = torch_vanilla_quant_ave(C[1:, i], split, self.qas[qa_cnt : qa_cnt + self.n_block])
-                    qci.append(t1.reshape(-1, 1))  # 添加维度: (N,) -> (N, 1)
-                    trans_array.extend(trans1)
-                    qa_cnt += self.n_block
-                
-                print(f"    所有特征量化完成，使用了 {qa_cnt} 个量化器 (55 × {self.n_block})")
-                print(f"    量化位数分布: {set(dim_bits)} bits")
-                
-                # 保存量化位数配置
-                trans_array.extend(dim_bits)  # 添加55个维度的bit信息
-                
-                qci = np.concatenate(qci, axis=-1)  # 现在形状是 (N, 55)
-                
-                # 调试：打印 qci 的形状
-                print(f"    qci 形状: {qci.shape}")
-            else:
-                # 兼容不同量化器的属性名
-                if hasattr(self.qa, 'scale'):
-                    # VanillaQuan
-                    i_scale = self.qa.scale
-                    i_zp = self.qa.zero_point
-                    i_signed = False
-                elif hasattr(self.qa, 's'):
-                    # LsqQuan
-                    i_scale = self.qa.s
-                    i_zp = torch.tensor(0.0, device=self.qa.s.device)
-                    i_signed = not hasattr(self.qa, 'thd_neg') or self.qa.thd_neg < 0
-                else:
-                    raise ValueError(f"Unsupported quantizer type: {type(self.qa)}")
-                
-                qci = quantize_tensor(
-                    C[1:],
-                    scale=i_scale,
-                    zero_point=i_zp,
-                    num_bits=self.qa.bit,
-                    signed=i_signed
-                ).cpu().numpy()
-                trans_array.append(i_scale.item())
-                trans_array.append(i_zp.item())
-                dim_bits = [self.qa.bit] * 55  # 所有维度使用相同的位数
-                
-            print(f"\n  保存 RAHT 系数 (包含 scale)...")
-            
-            # 选择存储方式：位打包 vs 分组存储
-            if per_block_quant or per_channel_quant:
-                from collections import defaultdict
-                
-                # 按位宽分组
-                bit_groups = defaultdict(list)
-                for dim_idx, bit in enumerate(dim_bits):
-                    bit_groups[bit].append(dim_idx)
-                
-                if bit_packing:
-                    # 位打包存储（默认方式）
-                    print(f"    使用位打包存储:")
-                    print(f"      位宽配置: {set(dim_bits)} bits")
-                    print(f"      总位数: {sum(dim_bits)} bits/point")
-                    
-                
-                    # 执行位打包
-                    bitstream = pack_bits(qci, dim_bits, signed_flags=signed_flags)
-                    bitstream_size = len(bitstream) / 1024
-                    
-                    save_dict = {
-                        'f': cf,  # DC 系数
-                        'i': np.frombuffer(bitstream, dtype=np.uint8),  # 位打包的AC系数
-                        'packed': np.array([1], dtype=np.uint8),  # 标记为位打包格式
-                        'bit_config': np.array(dim_bits, dtype=np.uint8),  # 位宽配置
-                        'signed_config': np.array(signed_flags, dtype=np.uint8)  # 有符号标记
-                    }
-                    
-                    print(f"      原始大小: {qci.nbytes / 1024:.2f} KB")
-                    print(f"      打包后大小: {bitstream_size:.2f} KB")
-                    print(f"      压缩比: {qci.nbytes / len(bitstream):.2f}x")
-                    
-                else:
-                    # 分组存储（兼容模式）
-                    print(f"    按位宽分组存储 (兼容模式):")
-                    save_dict = {'f': cf}  # DC 系数
-                    total_size_uncompressed = 0
-                    
-                    for bit in sorted(bit_groups.keys()):
-                        dims = bit_groups[bit]
+                        for bit in sorted(bit_groups.keys()):
+                            dims = bit_groups[bit]
                         
-                        # 选择最小的合适数据类型
-                        if bit <= 8:
-                            dtype = np.uint8
-                        elif bit <= 16:
-                            dtype = np.uint16
-                        else:
-                            dtype = np.uint32
+                            # 选择最小的合适数据类型
+                            if bit <= 8:
+                                dtype = np.uint8
+                            elif bit <= 16:
+                                dtype = np.uint16
+                            else:
+                                dtype = np.uint32
                         
-                        # 提取对应维度的数据（按列存储，保持数据规律性）
-                        group_data = qci[:, dims].astype(dtype)
-                        group_size = group_data.nbytes / 1024
-                        total_size_uncompressed += group_size
+                            # 提取对应维度的数据（按列存储，保持数据规律性）
+                            group_data = qci[:, dims].astype(dtype)
+                            group_size = group_data.nbytes / 1024
+                            total_size_uncompressed += group_size
                         
-                        # 保存到字典
-                        key = f'i_{bit}bit'
-                        save_dict[key] = group_data
-                        save_dict[f'dims_{bit}bit'] = np.array(dims, dtype=np.uint8)
+                            # 保存到字典
+                            key = f'i_{bit}bit'
+                            save_dict[key] = group_data
+                            save_dict[f'dims_{bit}bit'] = np.array(dims, dtype=np.uint8)
                         
-                        print(f"      {bit:2d}-bit: {len(dims):2d} 维度, {dtype.__name__:6s}, {group_size:8.2f} KB")
+                            print(f"      {bit:2d}-bit: {len(dims):2d} 维度, {dtype.__name__:6s}, {group_size:8.2f} KB")
                     
-                    print(f"    orgb.npz: 总大小 {total_size_uncompressed:.2f} KB (未压缩)")
+                        print(f"    orgb.npz: 总大小 {total_size_uncompressed:.2f} KB (未压缩)")
                 
-                # 保存文件
-                np.savez(os.path.join(bin_dir,'orgb.npz'), **save_dict)
+                    # 保存文件
+                    np.savez(os.path.join(bin_dir,'orgb.npz'), **save_dict)
             
                 
-            else:
-                # 单一位宽模式（向后兼容）
-                print(f"    使用 uint8 存储（单一位宽模式）")
-                ##np.savez_compressed(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
-                np.savez(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
-                print(f"    orgb.npz: 形状 {qci.shape}, 大小 {qci.nbytes / 1024:.2f} KB")
+                else:
+                    # 单一位宽模式（向后兼容）
+                    print(f"    使用 uint8 存储（单一位宽模式）")
+                    ##np.savez_compressed(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
+                    np.savez(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
+                    print(f"    orgb.npz: 形状 {qci.shape}, 大小 {qci.nbytes / 1024:.2f} KB")
             
             # Scale is now included in RAHT features, no separate ct.npz needed
             # print(f"\n  跳过独立的 Scale 文件 (ct.npz) - Scale 已包含在 RAHT 特征中")
@@ -1347,7 +1389,7 @@ class GaussianModel:
             print(f"  文件大小: {zip_file_size / 1024 / 1024:.2f} MB")
 
 
-    def init_qas(self, n_block, bit_config=None, quant_type="vanilla"):
+    def init_qas(self, n_block, bit_config=None, quant_type="vanilla", encode="deflate"):
         """
         初始化量化器，支持不同属性使用不同的量化位数
         
@@ -1424,10 +1466,10 @@ class GaussianModel:
             for _ in range(n_block):
                 if quant_type.lower() == "lsq":
                     # LSQ (学习步长量化)
-                    self.qas.append(LsqQuan(bit=bit, init_yet=False, all_positive=False).cuda())
+                    self.qas.append(LsqQuan(bit=bit, init_yet=False, all_positive=False, encode=encode).cuda())
                 else:
                     # VanillaQuan (传统量化)
-                    self.qas.append(VanillaQuan(bit=bit).cuda())
+                    self.qas.append(VanillaQuan(bit=bit, encode=encode).cuda())
 
         
         n_qs = len(self.qas)

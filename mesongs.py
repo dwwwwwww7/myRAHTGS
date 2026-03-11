@@ -893,9 +893,12 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         
         #保存压缩文件
         if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'qas'):
+            seen_ebs = set()
             for qa in gaussians.qas:
                 if getattr(qa, 'encode', 'deflate').lower() == "ans" and hasattr(qa, 'entropy_bottleneck'):
-                    qa.entropy_bottleneck.update(force=True)
+                    if qa.entropy_bottleneck not in seen_ebs:
+                        qa.entropy_bottleneck.update(force=True)
+                        seen_ebs.add(qa.entropy_bottleneck)
         zip_size = scene.save_ft("0", pipe, per_channel_quant=dataset.per_channel_quant, per_block_quant=dataset.per_block_quant, bit_packing=dataset.bit_packing)
         zip_size = zip_size / 1024 / 1024 # to MB
         
@@ -1044,9 +1047,12 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         # ==========================================
         if aux_optimizer is not None:
             aux_loss = torch.tensor(0.0, device="cuda")
+            seen_ebs = set()
             for qa in gaussians.qas:
                 if getattr(qa, 'encode', 'deflate').lower() == "ans" and hasattr(qa, 'entropy_bottleneck'):
-                    aux_loss = aux_loss + qa.entropy_bottleneck.loss()
+                    if qa.entropy_bottleneck not in seen_ebs:
+                        aux_loss = aux_loss + qa.entropy_bottleneck.loss()
+                        seen_ebs.add(qa.entropy_bottleneck)
             if isinstance(aux_loss, torch.Tensor) and aux_loss.requires_grad:
                 aux_loss.backward()
                 aux_optimizer.step()
@@ -1106,9 +1112,12 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 psnr_train = cur_psnr
                 print("\n Saving best Gaussians on Train Set.")
                 if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'qas'):
+                    seen_ebs = set()
                     for qa in gaussians.qas:
                         if getattr(qa, 'encode', 'deflate').lower() == "ans" and hasattr(qa, 'entropy_bottleneck'):
-                            qa.entropy_bottleneck.update(force=True)
+                            if qa.entropy_bottleneck not in seen_ebs:
+                                qa.entropy_bottleneck.update(force=True)
+                                seen_ebs.add(qa.entropy_bottleneck)
                 scene.save_ft('best', pipe, per_channel_quant=dataset.per_channel_quant, per_block_quant=dataset.per_block_quant, bit_packing=dataset.bit_packing)
  
             

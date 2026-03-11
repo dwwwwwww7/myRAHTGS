@@ -120,7 +120,7 @@ class IdentityQuan(Quantizer):
 
 
 class LsqQuan(Quantizer):
-    def __init__(self, bit, init_yet, all_positive=True, symmetric=False, encode="deflate", channels=1):
+    def __init__(self, bit, init_yet, all_positive=True, symmetric=False, encode="deflate", channels=1, shared_eb=None):
         super().__init__(bit)
         
         if all_positive:
@@ -144,8 +144,11 @@ class LsqQuan(Quantizer):
         # 🌟 新增：编码器选择与熵模型初始化
         self.encode = encode
         if self.encode.lower() == "ans":
-            from compressai.entropy_models import EntropyBottleneck
-            self.entropy_bottleneck = EntropyBottleneck(channels)
+            if shared_eb is not None:
+                self.entropy_bottleneck = shared_eb
+            else:
+                from compressai.entropy_models import EntropyBottleneck
+                self.entropy_bottleneck = EntropyBottleneck(channels)
         self.last_likelihoods = None
 
     def init_from(self, x, *args, **kwargs):
@@ -200,7 +203,7 @@ def calcScaleZeroPoint(min_val, max_val, num_bits=8):
 
 
 class VanillaQuan(Quantizer):
-    def __init__(self, bit, all_positive=True, symmetric=False, encode="deflate", channels=1):
+    def __init__(self, bit, all_positive=True, symmetric=False, encode="deflate", channels=1, shared_eb=None):
         super().__init__(bit)
         
         if all_positive:
@@ -227,8 +230,11 @@ class VanillaQuan(Quantizer):
         # 🌟 新增：编码器选择与熵模型初始化
         self.encode = encode
         if self.encode.lower() == "ans":
-            from compressai.entropy_models import EntropyBottleneck
-            self.entropy_bottleneck = EntropyBottleneck(channels)
+            if shared_eb is not None:
+                self.entropy_bottleneck = shared_eb
+            else:
+                from compressai.entropy_models import EntropyBottleneck
+                self.entropy_bottleneck = EntropyBottleneck(channels)
         self.last_likelihoods = None
         
     def update(self, x):

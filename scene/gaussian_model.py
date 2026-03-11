@@ -1143,33 +1143,72 @@ class GaussianModel:
                 is_ans = getattr(self.qas[0], 'encode', 'deflate').lower() == 'ans'
 
             if is_ans:
-                print(f"    ANS 编码模式")
+                # 按 7 个大类重新组织数据，进行统一共享编码
                 qci = []
+                group_data = {
+                    'opacity': [],
+                    'euler': [],
+                    'f_dc': [],
+                    'f_rest_0': [],
+                    'f_rest_1': [],
+                    'f_rest_2': [],
+                    'scale': []
+                }
+                
+                # 1. 归一化、截断取整，并将特征分拣装入各自的大类容器中
                 qa_cnt = 0
                 for i in range(C.shape[-1]):
-                    # 兼容不同量化器的属性名
                     qa = self.qas[qa_cnt]
                     
                     if hasattr(qa, 's'):
                         x_norm = C[1:, i] / qa.s
-                    else:
-                        x_norm = qa.zero_point + (C[1:, i] / qa.scale)
-                    y_clamped = torch.clamp(x_norm, qa.thd_neg, qa.thd_pos).round()  # 【注意】算术编码前要 round
-                    
-                    bitstream = qa.entropy_bottleneck.compress(y_clamped.view(1, 1, -1, 1))[0]
-                    # np.frombuffer 产生的是只读数组，将其复制一下
-                    bitstream_bytes = np.frombuffer(bitstream, dtype=np.uint8).copy()
-                    
-                    # 记录此维度的字节长度，方便加载时拆分
-                    qci.append(np.array([len(bitstream_bytes)], dtype=np.int32)) 
-                    qci.append(bitstream_bytes)
-                    
-                    if hasattr(qa, 's'):
                         trans_array.extend([qa.s.item(), 0.0])
                     else:
+                        x_norm = qa.zero_point + (C[1:, i] / qa.scale)
                         trans_array.extend([qa.scale.item(), qa.zero_point.item()])
+                        
+                    y_clamped = torch.clamp(x_norm, qa.thd_neg, qa.thd_pos).round()
                     
+                    if i == 0:
+                        group_key = 'opacity'
+                    elif 1 <= i <= 3:
+                        group_key = 'euler'
+                    elif 4 <= i <= 6:
+                        group_key = 'f_dc'
+                    elif 7 <= i <= 15:
+                        group_key = 'f_rest_0'
+                    elif 16 <= i <= 30:
+                        group_key = 'f_rest_1'
+                    elif 31 <= i <= 51:
+                        group_key = 'f_rest_2'
+                    else:
+                        group_key = 'scale'
+                        
+                    group_data[group_key].append(y_clamped.view(1, 1, -1, 1))
                     qa_cnt += self.n_block if per_block_quant else 1
+
+                # 2. 对每个大类将其各个维度的特征拼接后，调用对应的、唯一的那一个 CDF 网络执行算术编码
+                # 遍历字典时保持固定的顺序
+                group_order = ['opacity', 'euler', 'f_dc', 'f_rest_0', 'f_rest_1', 'f_rest_2', 'scale']
+                for g_key in group_order:
+                    # 如果该大类没有特征（几乎不可能，但防跳错），跳过
+                    if not group_data[g_key]:
+                        continue
+                        
+                    # 比如 euler 下有 3 个通道，将其拼接成 (1, 3, N, 1) 的形状，然后送到唯一的那个 euler_CDF 中去压缩！
+                    stacked_features = torch.cat(group_data[g_key], dim=1)
+                    
+                    # 找到该组所对应的 EntropyBottleneck (找该组的第一个维度的量化器即可)
+                    # 比如 'opacity' 是第 0 个量化器，'f_rest_0' 是第 7 个量化器...
+                    eb_idx_map = {'opacity': 0, 'euler': 1, 'f_dc': 4, 'f_rest_0': 7, 'f_rest_1': 16, 'f_rest_2': 31, 'scale': 52}
+                    eb = self.qas[eb_idx_map[g_key]].entropy_bottleneck
+                    
+                    # 执行 ANS 并得到该大类的整条位流 (Bitstream)
+                    bitstream = eb.compress(stacked_features)[0]
+                    bitstream_bytes = np.frombuffer(bitstream, dtype=np.uint8).copy()
+                    
+                    qci.append(np.array([len(bitstream_bytes)], dtype=np.int32)) 
+                    qci.append(bitstream_bytes)
 
                 bitstream_concat = np.concatenate(qci)
                 save_dict = {
@@ -1459,17 +1498,48 @@ class GaussianModel:
         
         self.dim_to_bit = dim_to_bit
         
+        # 🌟 新增：按 7 个属性大类创建共享的 CDF 网络
+        shared_ebs = {}
+        if encode.lower() == "ans":
+            from compressai.entropy_models import EntropyBottleneck
+            shared_ebs['opacity'] = EntropyBottleneck(1).cuda()
+            shared_ebs['euler'] = EntropyBottleneck(1).cuda()
+            shared_ebs['f_dc'] = EntropyBottleneck(1).cuda()
+            shared_ebs['f_rest_0'] = EntropyBottleneck(1).cuda()
+            shared_ebs['f_rest_1'] = EntropyBottleneck(1).cuda()
+            shared_ebs['f_rest_2'] = EntropyBottleneck(1).cuda()
+            shared_ebs['scale'] = EntropyBottleneck(1).cuda()
+        
         # 创建量化器
         self.qas = nn.ModuleList([])
         for dim_idx in range(55):
             bit = dim_to_bit[dim_idx]
+            
+            # 分配它属于哪一个共享大类
+            if dim_idx == 0:
+                group_key = 'opacity'
+            elif 1 <= dim_idx <= 3:
+                group_key = 'euler'
+            elif 4 <= dim_idx <= 6:
+                group_key = 'f_dc'
+            elif 7 <= dim_idx <= 15:
+                group_key = 'f_rest_0'
+            elif 16 <= dim_idx <= 30:
+                group_key = 'f_rest_1'
+            elif 31 <= dim_idx <= 51:
+                group_key = 'f_rest_2'
+            else:
+                group_key = 'scale'
+                
+            eb = shared_ebs.get(group_key) if encode.lower() == "ans" else None
+
             for _ in range(n_block):
                 if quant_type.lower() == "lsq":
                     # LSQ (学习步长量化)
-                    self.qas.append(LsqQuan(bit=bit, init_yet=False, all_positive=False, encode=encode).cuda())
+                    self.qas.append(LsqQuan(bit=bit, init_yet=False, all_positive=False, encode=encode, shared_eb=eb).cuda())
                 else:
                     # VanillaQuan (传统量化)
-                    self.qas.append(VanillaQuan(bit=bit, encode=encode).cuda())
+                    self.qas.append(VanillaQuan(bit=bit, encode=encode, shared_eb=eb).cuda())
 
         
         n_qs = len(self.qas)

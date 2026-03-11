@@ -1112,6 +1112,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             # Optimizer step（zero_grad 已在 backward 之前完成，此处只做 step）
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
+                gaussians.optimizer.zero_grad(set_to_none=True)   #优化
                 gaussians.update_learning_rate(iteration+30000)
         # except Exception as e:
         #     print('error but go')

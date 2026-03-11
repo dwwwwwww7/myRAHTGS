@@ -1195,17 +1195,33 @@ class GaussianModel:
                     if not group_data[g_key]:
                         continue
                         
-                    # 比如 euler 下有 3 个通道，将其拼接成 (1, 3, N, 1) 的形状，然后送到唯一的那个 euler_CDF 中去压缩！
+                    # 比如 euler 下有 3 个通道，将其拼接成 (1, 3, N, 1) 的形状
                     stacked_features = torch.cat(group_data[g_key], dim=1)
+                    
+                    # 【核心修复】：由于 EntropyBottleneck 初始化为单通道 (channels=1)以实现共享
+                    # 我们必须将 (1, C, N, 1) 展平为连续的单通道序列 (1, 1, C * N, 1) 
+                    # 否则底层的 C++ 算术编码器在按 channels 索引时会发生严重的段错误 (Segmentation Fault)！
+                    B, C_dim, N_pts, D_dim = stacked_features.shape
+                    stacked_features_flat = stacked_features.contiguous().view(B, 1, C_dim * N_pts, D_dim)
                     
                     # 找到该组所对应的 EntropyBottleneck (找该组的第一个维度的量化器即可)
                     # 比如 'opacity' 是第 0 个量化器，'f_rest_0' 是第 7 个量化器...
                     eb_idx_map = {'opacity': 0, 'euler': 1, 'f_dc': 4, 'f_rest_0': 7, 'f_rest_1': 16, 'f_rest_2': 31, 'scale': 52}
                     eb = self.qas[eb_idx_map[g_key]].entropy_bottleneck
                     
+                    # 【致命段错误修复】：
+                    # CompressAI 的底层 C++ ANS 引擎仅支持 CPU 内存指针！
+                    # 如果丢入 CUDA 上的特征和缓冲字典，C++ 底层寻址会直接引发段错误 (Segmentation Fault)。
+                    # 所以先将模型和特征挪回 CPU 执行压缩。
+                    eb_cpu = eb.cpu()
+                    stacked_features_cpu = stacked_features_flat.cpu()
+                    
                     # 执行 ANS 并得到该大类的整条位流 (Bitstream)
-                    bitstream = eb.compress(stacked_features)[0]
+                    bitstream = eb_cpu.compress(stacked_features_cpu)[0]
                     bitstream_bytes = np.frombuffer(bitstream, dtype=np.uint8).copy()
+                    
+                    # 压缩完毕将共享网络放回 GPU，避免影响后续调用
+                    eb.cuda()
                     
                     qci.append(np.array([len(bitstream_bytes)], dtype=np.int32)) 
                     qci.append(bitstream_bytes)

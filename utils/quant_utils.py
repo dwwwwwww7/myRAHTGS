@@ -3,6 +3,8 @@ import math
 import torch
 import torch.nn as nn
 from torch.autograd import Function
+from compressai.entropy_models import EntropyBottleneck
+
 
 def split_length(length, n):
     base_length = length / n
@@ -123,13 +125,16 @@ class LsqQuan(Quantizer):
         
         if all_positive:
             assert not symmetric, "Positive quantization cannot be symmetric"
+            # unsigned activation is quantized to [0, 2^b-1]
             self.thd_neg = 0
             self.thd_pos = 2 ** bit - 1
         else:
             if symmetric:
+                # signed weight/activation is quantized to [-2^(b-1)+1, 2^(b-1)-1]
                 self.thd_neg = - 2 ** (bit - 1) + 1
                 self.thd_pos = 2 ** (bit - 1) - 1
             else:
+                # signed weight/activation is quantized to [-2^(b-1), 2^(b-1)-1]
                 self.thd_neg = - 2 ** (bit - 1)
                 self.thd_pos = 2 ** (bit - 1) - 1
 
@@ -145,8 +150,17 @@ class LsqQuan(Quantizer):
 
     def init_from(self, x, *args, **kwargs):
         with torch.no_grad():
+            # LSQ论文里的初始化方法
             self.s.data.fill_(x.detach().abs().mean().item() * 2 / (self.thd_pos ** 0.5))
+            # 以下为min-max初始化
+            # min_val = x.detach().min()
+            # max_val = x.detach().max()
+            # if max_val == min_val:
+            #     max_val = max_val + 1e-5
+            # scale_init = (max_val - min_val) / (self.thd_pos - self.thd_neg)
+            # self.s.data.fill_(scale_init.item())
         self.init_yet = True
+        # print('quant_utils.py Line 62:', self.s)  # 打印初始化后的s
     
     def forward(self, x):
         s_grad_scale = 1.0 / ((self.thd_pos * x.numel()) ** 0.5)
@@ -191,13 +205,16 @@ class VanillaQuan(Quantizer):
         
         if all_positive:
             assert not symmetric, "Positive quantization cannot be symmetric"
+            # unsigned activation is quantized to [0, 2^b-1]
             self.thd_neg = 0
             self.thd_pos = 2 ** bit - 1
         else:
             if symmetric:
+                # signed weight/activation is quantized to [-2^(b-1)+1, 2^(b-1)-1]
                 self.thd_neg = - 2 ** (bit - 1) + 1
                 self.thd_pos = 2 ** (bit - 1) - 1
             else:
+                # signed weight/activation is quantized to [-2^(b-1), 2^(b-1)-1]
                 self.thd_neg = - 2 ** (bit - 1)
                 self.thd_pos = 2 ** (bit - 1) - 1
 

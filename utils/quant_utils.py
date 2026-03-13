@@ -147,9 +147,9 @@ class LsqQuan(Quantizer):
             if shared_eb is not None:
                 self.entropy_bottleneck = shared_eb
             else:
-                from compressai.entropy_models import EntropyBottleneck
                 self.entropy_bottleneck = EntropyBottleneck(channels)
         self.last_likelihoods = None
+        self.last_clamped = None
 
     def init_from(self, x, *args, **kwargs):
         with torch.no_grad():
@@ -173,10 +173,11 @@ class LsqQuan(Quantizer):
         x_norm = x / s_scale
         x_clamped = torch.clamp(x_norm, self.thd_neg, self.thd_pos)
         
-        # 2. 🌟 新增：如果使用 ANS，则在连续域（加噪）评估香农概率
+        # 2. 🌟 新增：缓存 clamped 值供外部批处理，不再此处直接调用 EB 以节省开销
         if self.encode.lower() == "ans":
-            _, likelihoods = self.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
-            self.last_likelihoods = likelihoods.view(x.shape)
+            # _, likelihoods = self.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
+            # self.last_likelihoods = likelihoods.view(x.shape)
+            self.last_clamped = x_clamped
         
         # 3. 直通估计器 (STE) 离散化与反量化
         x_q = round_pass(x_clamped)
@@ -233,9 +234,9 @@ class VanillaQuan(Quantizer):
             if shared_eb is not None:
                 self.entropy_bottleneck = shared_eb
             else:
-                from compressai.entropy_models import EntropyBottleneck
                 self.entropy_bottleneck = EntropyBottleneck(channels)
         self.last_likelihoods = None
+        self.last_clamped = None
         
     def update(self, x):
         if self.max_val.nelement() == 0 or self.max_val.data < x.max().data:
@@ -255,10 +256,11 @@ class VanillaQuan(Quantizer):
         x_norm = self.zero_point + (x / self.scale)
         x_clamped = torch.clamp(x_norm, self.thd_neg, self.thd_pos)
         
-        # 2. 🌟 新增：如果使用 ANS，则在连续域评估香农概率
+        # 2. 🌟 新增：缓存 clamped 值供外部批处理
         if self.encode.lower() == "ans":
-            _, likelihoods = self.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
-            self.last_likelihoods = likelihoods.view(x.shape)
+            # _, likelihoods = self.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
+            # self.last_likelihoods = likelihoods.view(x.shape)
+            self.last_clamped = x_clamped
             
         # 3. 离散化与反量化
         x_q = round_pass(x_clamped)

@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
+from compressai.entropy_models import EntropyBottleneck
 
 from raht_torch import (copyAsort, get_RAHT_tree, haar3D_param,
                         inv_haar3D_param, inv_haar3D_torch,
@@ -1160,15 +1161,21 @@ class GaussianModel:
                 for i in range(C.shape[-1]):
                     qa = self.qas[qa_cnt]
                     
+                    # 让量化器自己在 eval() 模式下吐出反量化后的绝对安全值
+                    x_q = qa(C[1:, i])
+                    
                     if hasattr(qa, 's'):
-                        x_norm = C[1:, i] / qa.s
+                        # 除回步长，得到绝对干净的离散整数 y_hat (例如 -2.0, -1.0, 0.0, 1.0, 2.0)
+                        y_hat = x_q / qa.s
                         trans_array.extend([qa.s.item(), 0.0])
                     else:
-                        x_norm = qa.zero_point + (C[1:, i] / qa.scale)
+                        y_hat = (x_q / qa.scale) + qa.zero_point
                         trans_array.extend([qa.scale.item(), qa.zero_point.item()])
                         
-                    y_clamped = torch.clamp(x_norm, qa.thd_neg, qa.thd_pos).round()
-                    
+                    # 兜底截断保护（由于量化器内部已经截断过了，这里其实是冗余的，但保留以防万一）
+                    y_clamped = torch.clamp(y_hat, qa.thd_neg, qa.thd_pos).round()
+
+
                     if i == 0:
                         group_key = 'opacity'
                     elif 1 <= i <= 3:
@@ -1187,53 +1194,55 @@ class GaussianModel:
                     group_data[group_key].append(y_clamped.view(1, 1, -1, 1))
                     qa_cnt += self.n_block if per_block_quant else 1
 
-                # 2. 对每个大类将其各个维度的特征拼接后，调用对应的、唯一的那一个 CDF 网络执行算术编码
-                # 遍历字典时保持固定的顺序
+                 # 2. 对每个大类执行算术编码
                 group_order = ['opacity', 'euler', 'f_dc', 'f_rest_0', 'f_rest_1', 'f_rest_2', 'scale']
+                eb_state_dicts = {}  # 🌟 新增：保存熵模型状态
+
+               # ----------------- 修复代码 -----------------
+                ans_save_dict = {
+                    'f': cf,
+                    'packed': np.array([2], dtype=np.uint8) # 2代表 ANS 格式
+                }
+                
+                # 首先更新 CDF (你原来的逻辑非常好)
+                seen_ebs = {}
                 for g_key in group_order:
-                    # 如果该大类没有特征（几乎不可能，但防跳错），跳过
-                    if not group_data[g_key]:
-                        continue
+                    if not group_data[g_key]: continue
+                    eb_idx_map = {'opacity': 0, 'euler': 1, 'f_dc': 4, 'f_rest_0': 7, 'f_rest_1': 16, 'f_rest_2': 31, 'scale': 52}
+                    eb = self.qas[eb_idx_map[g_key]].entropy_bottleneck
+                    if eb not in seen_ebs:
+                        eb.update() 
+                        seen_ebs[eb] = g_key
+
+                total_ans_bytes = 0
+                for g_key in group_order:
+                    if not group_data[g_key]: continue
                         
-                    # 比如 euler 下有 3 个通道，将其拼接成 (1, 3, N, 1) 的形状
                     stacked_features = torch.cat(group_data[g_key], dim=1)
-                    
-                    # 【核心修复】：由于 EntropyBottleneck 初始化为单通道 (channels=1)以实现共享
-                    # 我们必须将 (1, C, N, 1) 展平为连续的单通道序列 (1, 1, C * N, 1) 
-                    # 否则底层的 C++ 算术编码器在按 channels 索引时会发生严重的段错误 (Segmentation Fault)！
                     B, C_dim, N_pts, D_dim = stacked_features.shape
                     stacked_features_flat = stacked_features.contiguous().view(B, 1, C_dim * N_pts, D_dim)
                     
-                    # 找到该组所对应的 EntropyBottleneck (找该组的第一个维度的量化器即可)
-                    # 比如 'opacity' 是第 0 个量化器，'f_rest_0' 是第 7 个量化器...
                     eb_idx_map = {'opacity': 0, 'euler': 1, 'f_dc': 4, 'f_rest_0': 7, 'f_rest_1': 16, 'f_rest_2': 31, 'scale': 52}
                     eb = self.qas[eb_idx_map[g_key]].entropy_bottleneck
                     
-                    # 【致命段错误修复】：
-                    # CompressAI 的底层 C++ ANS 引擎仅支持 CPU 内存指针！
-                    # 如果丢入 CUDA 上的特征和缓冲字典，C++ 底层寻址会直接引发段错误 (Segmentation Fault)。
-                    # 所以先将模型和特征挪回 CPU 执行压缩。
                     eb_cpu = eb.cpu()
                     stacked_features_cpu = stacked_features_flat.cpu()
                     
-                    # 执行 ANS 并得到该大类的整条位流 (Bitstream)
+                    # 压缩
                     bitstream = eb_cpu.compress(stacked_features_cpu)[0]
-                    bitstream_bytes = np.frombuffer(bitstream, dtype=np.uint8).copy()
+                    bitstream_bytes = np.frombuffer(bitstream, dtype=np.uint8)
                     
-                    # 压缩完毕将共享网络放回 GPU，避免影响后续调用
                     eb.cuda()
                     
-                    qci.append(np.array([len(bitstream_bytes)], dtype=np.int32)) 
-                    qci.append(bitstream_bytes)
+                    # 【核心修改】：直接把每个大类的二进制流作为独立的 key 存入字典
+                    ans_save_dict[f'ans_{g_key}'] = bitstream_bytes
+                    # 同时必须把原来的 shape 存下来，否则解压时无法 decompress!
+                    ans_save_dict[f'shape_{g_key}'] = np.array(stacked_features_flat.shape, dtype=np.int32)
+                    
+                    total_ans_bytes += len(bitstream_bytes)
 
-                bitstream_concat = np.concatenate(qci)
-                save_dict = {
-                    'f': cf,
-                    'i': bitstream_concat,
-                    'packed': np.array([2], dtype=np.uint8) # 2代表 ANS 格式
-                }
-                np.savez(os.path.join(bin_dir,'orgb.npz'), **save_dict)
-                print(f"      ANS 字节流总大小: {len(bitstream_concat) / 1024:.2f} KB")
+                np.savez(os.path.join(bin_dir,'orgb.npz'), **ans_save_dict)
+                print(f"      ANS 字节流总大小: {total_ans_bytes / 1024:.2f} KB")
 
             if not is_ans:
                 if per_channel_quant:
@@ -1517,7 +1526,6 @@ class GaussianModel:
         # 🌟 新增：按 7 个属性大类创建共享的 CDF 网络
         shared_ebs = {}
         if encode.lower() == "ans":
-            from compressai.entropy_models import EntropyBottleneck
             shared_ebs['opacity'] = EntropyBottleneck(1).cuda()
             shared_ebs['euler'] = EntropyBottleneck(1).cuda()
             shared_ebs['f_dc'] = EntropyBottleneck(1).cuda()

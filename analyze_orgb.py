@@ -136,7 +136,7 @@ if __name__ == "__main__":
     # -----------------------------------------------------------------
     # 【请在这里手动填写你要分析的 orgb.npz 文件的绝对路径或相对路径】
     # -----------------------------------------------------------------
-    ORGB_PATH = "/data/zdw/myRAHT2026/myRAHTGS/results_2026/lsq0311/train_config4/point_cloud/iteration_0/pc_npz/bins/orgb.npz" 
+    ORGB_PATH = "/data/zdw/myRAHT2026/myRAHTGS/results_2026/ANS0311/train_config4/point_cloud/iteration_1000/pc_npz/bins/orgb.npz" 
     
     if ORGB_PATH == "example_exp_dir/bins/orgb.npz" or not os.path.exists(ORGB_PATH):
         print(f"⚠️ 请使用代码编辑器打开此脚本，并将 ORGB_PATH 修改为实际存在的 orgb.npz 文件路径。")

@@ -450,6 +450,52 @@ def ft_render(
         if PROFILE_TIME:
             torch.cuda.synchronize()
             t_quant_end = time.time()
+        
+        # === ANS 批处理优化 (按 7 个语义属性组并行) ===
+        total_ans_bits = torch.tensor(0.0, device="cuda")
+        if raht and hasattr(pc, 'qas') and len(pc.qas) > 0:
+            if getattr(pc.qas[0], 'encode', 'deflate').lower() == "ans":
+                # 定义 7 个属性组容器和对应的 EB 实例映射
+                group_data = {
+                    'opacity': [], 'euler': [], 'f_dc': [],
+                    'f_rest_0': [], 'f_rest_1': [], 'f_rest_2': [], 'scale': []
+                }
+                group_ebs = {}
+
+                # 遍历 55 个 RAHT 维度 (opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3))
+                for dim_idx in range(55):
+                    # 确定当前维度所属的 CDF 共享组
+                    if dim_idx == 0: g_key = 'opacity'
+                    elif 1 <= dim_idx <= 3: g_key = 'euler'
+                    elif 4 <= dim_idx <= 6: g_key = 'f_dc'
+                    elif 7 <= dim_idx <= 15: g_key = 'f_rest_0'
+                    elif 16 <= dim_idx <= 30: g_key = 'f_rest_1'
+                    elif 31 <= dim_idx <= 51: g_key = 'f_rest_2'
+                    else: g_key = 'scale'
+                    
+                    # 每个维度包含 n_block 个分块量化器
+                    for b_idx in range(pc.n_block):
+                        qa_idx = dim_idx * pc.n_block + b_idx
+                        qa = pc.qas[qa_idx]
+                        if hasattr(qa, 'last_clamped') and qa.last_clamped is not None:
+                            group_data[g_key].append(qa.last_clamped.flatten())
+                            if g_key not in group_ebs:
+                                group_ebs[g_key] = qa.entropy_bottleneck
+                            qa.last_clamped = None # 计算前清空缓存，节省显存
+
+                # 按照 7 个大类执行批处理概率建模
+                num_points = pc.get_xyz.shape[0]
+                for g_key, clamped_list in group_data.items():
+                    if clamped_list and g_key in group_ebs:
+                        eb = group_ebs[g_key]
+                        # 拼接组内所有维度和分块的数据 (例如 scale 组拼接后长度为 3*N)
+                        all_clamped = torch.cat(clamped_list).view(1, 1, -1, 1)
+                        _, likelihoods = eb(all_clamped)
+                        # 累加香农信息量 bits = -log2(P)
+                        group_bits = -torch.log2(likelihoods.clamp(min=1e-9)).sum()
+                        total_ans_bits += group_bits
+                        # avg_bpp = group_bits.item() / num_points if num_points > 0 else 0
+                        # print(f"  {g_key:<12} | {group_bits.item():<15.2f} | {avg_bpp:<12.4f}")
 
         if should_print_debug:
             print("\n【RAHT变换】逆变换")
@@ -593,7 +639,8 @@ def ft_render(
         "render": rendered_image,
         "viewspace_points": screenspace_points,
         "visibility_filter": radii > 0,
-        "radii": radii
+        "radii": radii,
+        "total_bits": total_ans_bits
     }
     
     # 如果使用RAHT且在训练模式，返回AC系数用于稀疏性损失

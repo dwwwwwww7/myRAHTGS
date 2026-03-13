@@ -1010,35 +1010,32 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             # torch.abs(raht_ac).sum() 计算所有|x_ij|的总和
             # 然后除以n_ch得到每个通道的平均L1范数
             loss_S = torch.abs(raht_ac).sum() / n_ch
-        
+        print(f"迭代 {iteration}: AC_loss = {loss_S.item():.2e} (初始值)")
         # ==========================================
         # 提取概率并计算 Rate Loss (码率约束)
         # ==========================================
         loss_R = torch.tensor(0.0, device="cuda")
-        if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'qas'):
-            total_bits = torch.tensor(0.0, device="cuda")
+
+        if "total_bits" in render_pkg:
+            total_bits = render_pkg["total_bits"]
             num_points = gaussians.get_xyz.shape[0]
-            for qa in gaussians.qas:
-                if getattr(qa, 'encode', 'deflate').lower() == "ans" and qa.last_likelihoods is not None:
-                    # 香农信息量: bits = -log2(P)
-                    bits = -torch.log2(qa.last_likelihoods.clamp(min=1e-9)).sum()
-                    total_bits = total_bits + bits
-                    qa.last_likelihoods = None  # 提取后立即清空缓存
-            
             if num_points > 0:
+                if iteration % 10 == 0:
+                    print(f"迭代 {iteration}: 当前总比特数 = {total_bits.item():.2f} bits, 平均每点 = {total_bits.item()/num_points:.4f} bits/point")
                 loss_R = total_bits / num_points
         
         # ==========================================
         # 组装最终 Loss
         # ==========================================
-        if getattr(dataset, 'encode', 'deflate').lower() == "ans":
-            loss = loss_D + getattr(dataset, 'lambda_rate', 5e-7) * loss_R
+        if dataset.encode.lower() == "ans":
+            print(f"最终损失函数loss=loss = {(1.0 - dataset.lambda_rate):.1f} * {loss_D:.4f}+{dataset.lambda_rate:.1f} * {loss_R:.2f}")
+            loss = (1.0 - dataset.lambda_rate) * loss_D+dataset.lambda_rate * loss_R
         else:
             loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
             
         # 清空梯度
-        if aux_optimizer is not None:
-            aux_optimizer.zero_grad(set_to_none=True)
+        # if aux_optimizer is not None:
+        #     aux_optimizer.zero_grad(set_to_none=True)
             
         loss.backward()
 
@@ -1070,6 +1067,8 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 # 如果使用稀疏性损失，显示它
                 if dataset.lambda_sparsity > 0 and isinstance(loss_S, torch.Tensor):
                     postfix_dict["稀疏"] = f"{loss_S.item():.2e}"
+                if dataset.encode.lower() == "ans" and isinstance(loss_R, torch.Tensor):
+                    postfix_dict["码率loss"] = f"{loss_R.item():.2e}"
                 progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
             

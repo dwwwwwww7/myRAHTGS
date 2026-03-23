@@ -77,6 +77,7 @@ class ModelParams(ParamGroup):
         self.quant_type="lsq"  # 量化器类型: "lsq" 或 "vanilla"
         self.encode="deflate" # 熵编码方式: "deflate" 或 "ANS"
         self.lambda_rate=0.001  # 使用ANS熵编码时的R权重
+        self.ans_subgroup_count=4
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

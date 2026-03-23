@@ -1123,6 +1123,7 @@ def haar3D_param(depth, w, val):
     # w, val, reorder = copyAsort(inV)
 
     pos = np.arange(N)
+    depth_CT = np.zeros((N, )).astype(np.int64) - 1
 
     iW1 = []
     iW2 = []
@@ -1161,6 +1162,10 @@ def haar3D_param(depth, w, val):
         iLeft_idx.append(pos[left_node_array]+0)
         iRight_idx.append(pos[right_node_array]+0)
 
+        depth_CT[pos[trans_idx_array]] = d
+        depth_CT[pos[left_node_array]] = d
+        depth_CT[pos[right_node_array]] = d
+
         valT = (val >> 1)[idxT_array]
             
         N_T=N
@@ -1182,6 +1187,7 @@ def haar3D_param(depth, w, val):
     #print(f"iW levels: {len(iW1)}, shapes: {[arr.shape for arr in iW1]}")
     res = {
         'w':outW, 
+        'depth_CT':depth_CT,
         'iW1':iW1,
         'iW2':iW2,
         'iLeft_idx':iLeft_idx,

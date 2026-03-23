@@ -454,7 +454,7 @@ def ft_render(
         # === ANS 批处理优化 (按 7 个语义属性组并行) ===
         total_ans_bits = torch.tensor(0.0, device="cuda")
         if raht and hasattr(pc, 'qas') and len(pc.qas) > 0:
-            if getattr(pc.qas[0], 'encode', 'deflate').lower() == "ans":
+            if False and getattr(pc.qas[0], 'encode', 'deflate').lower() == "ans":
                 # 定义 7 个属性组容器和对应的 EB 实例映射
                 group_data = {
                     'opacity': [], 'euler': [], 'f_dc': [],
@@ -502,6 +502,39 @@ def ft_render(
             print(f"  quantC 形状: {quantC.shape}")
             print(f"  quantC 范围: [{quantC.min().item():.4f}, {quantC.max().item():.4f}]")
         
+        if raht and hasattr(pc, 'qas') and len(pc.qas) > 0:
+            if getattr(pc.qas[0], 'encode', 'deflate').lower() == "ans" and hasattr(pc, 'ans_entropy_bottlenecks'):
+                group_data = pc.build_empty_ans_group_data()
+                ac_subgroups = getattr(pc, 'raht_subgroup_ids', np.zeros((0,), dtype=np.int64))
+                ac_len = C.shape[0] - 1
+                split_for_ans = split_ac if per_block_quant else [ac_len]
+
+                for dim_idx in range(55):
+                    block_start = 0
+                    qa_base = dim_idx * len(split_for_ans)
+                    for block_idx, block_len in enumerate(split_for_ans):
+                        qa_idx = qa_base + block_idx
+                        if qa_idx >= len(pc.qas):
+                            continue
+                        qa = pc.qas[qa_idx]
+                        if hasattr(qa, 'last_clamped') and qa.last_clamped is not None:
+                            row_subgroups = ac_subgroups[block_start:block_start + block_len]
+                            pc.collect_ans_symbols_for_dim(
+                                group_data,
+                                dim_idx,
+                                qa.last_clamped.flatten(),
+                                row_subgroups,
+                            )
+                            qa.last_clamped = None
+                        block_start += block_len
+
+                for group_key, clamped_list in group_data.items():
+                    if clamped_list:
+                        eb = pc.get_ans_entropy_model(group_key)
+                        all_clamped = torch.cat(clamped_list).view(1, 1, -1, 1)
+                        _, likelihoods = eb(all_clamped)
+                        total_ans_bits += -torch.log2(likelihoods.clamp(min=1e-9)).sum()
+
         res_inv = pc.res_inv
         pos = res_inv['pos']
         iW1 = res_inv['iW1']

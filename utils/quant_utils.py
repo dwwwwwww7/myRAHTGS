@@ -144,10 +144,9 @@ class LsqQuan(Quantizer):
         # 🌟 新增：编码器选择与熵模型初始化
         self.encode = encode
         if self.encode.lower() == "ans":
-            if shared_eb is not None:
-                self.entropy_bottleneck = shared_eb
-            else:
-                self.entropy_bottleneck = EntropyBottleneck(channels)
+            self.entropy_bottleneck = shared_eb
+        else:
+            self.entropy_bottleneck = None
         self.last_likelihoods = None
         self.last_clamped = None
 
@@ -231,10 +230,9 @@ class VanillaQuan(Quantizer):
         # 🌟 新增：编码器选择与熵模型初始化
         self.encode = encode
         if self.encode.lower() == "ans":
-            if shared_eb is not None:
-                self.entropy_bottleneck = shared_eb
-            else:
-                self.entropy_bottleneck = EntropyBottleneck(channels)
+            self.entropy_bottleneck = shared_eb
+        else:
+            self.entropy_bottleneck = None
         self.last_likelihoods = None
         self.last_clamped = None
         

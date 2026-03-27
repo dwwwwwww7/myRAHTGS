@@ -19,6 +19,8 @@ from scene.gaussian_model import GaussianModel
 from utils.camera_utils import camera_to_JSON, cameraList_from_camInfos
 from utils.system_utils import searchForMaxIteration
 
+MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_FORWARD = True
+
 
 class Scene:
 
@@ -117,7 +119,20 @@ class Scene:
         
         return point_cloud_path
 
-    def save_ft(self, iteration, pipe, per_channel_quant=False, per_block_quant=False, bit_packing=True):
+    def save_ft(
+        self,
+        iteration,
+        pipe,
+        per_channel_quant=False,
+        per_block_quant=False,
+        bit_packing=True,
+        save_probability_plots=False,
+        export_ans_offline_fit=False,
+        export_ans_offline_fit_steps=1000,
+        export_ans_offline_fit_main_lr=1e-3,
+        export_ans_offline_fit_aux_lr=1e-3,
+        export_ans_offline_fit_plot_interval=100,
+    ):
         pc_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         print('save_npz gaussians:', pc_path)
         # 开启后会保存ply
@@ -126,7 +141,21 @@ class Scene:
             print('save_npz gaussians:', pc_path)
             self.gaussians.save_full_npz(os.path.join(pc_path, "pc_npz"), pipe, per_channel_quant=per_channel_quant, per_block_quant=per_block_quant)
         else:
-            self.gaussians.save_npz(os.path.join(pc_path, "pc_npz"), pipe, per_channel_quant=per_channel_quant, per_block_quant=per_block_quant, bit_packing=bit_packing)
+            self.gaussians.save_npz(
+                os.path.join(pc_path, "pc_npz"),
+                pipe,
+                per_channel_quant=per_channel_quant,
+                per_block_quant=per_block_quant,
+                bit_packing=bit_packing,
+                export_ans_offline_fit=export_ans_offline_fit,
+                export_ans_offline_fit_steps=export_ans_offline_fit_steps,
+                export_ans_offline_fit_main_lr=export_ans_offline_fit_main_lr,
+                export_ans_offline_fit_aux_lr=export_ans_offline_fit_aux_lr,
+                export_ans_offline_fit_plot_interval=export_ans_offline_fit_plot_interval,
+                save_probability_plots=(
+                    save_probability_plots if MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_FORWARD else False
+                ),
+            )
         return os.path.getsize(os.path.join(pc_path, "pc_npz", "bins.zip"))
         
     def getTrainCameras(self, scale=1.0):

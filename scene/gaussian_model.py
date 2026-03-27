@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import json
 import os
 import time
 import zipfile
@@ -36,6 +37,12 @@ from vq import vq_features
 from utils.gpcc_utils import compress_gpcc, decompress_gpcc
 import zipfile
 import glob
+
+MACRO_ENABLE_ANS_PROBABILITY_PLOT_EXPORT = True
+MACRO_ANS_PROBABILITY_PLOTS_DIRNAME = "probability_plots"
+MACRO_ANS_PROBABILITY_PLOT_MANIFEST = "plot_manifest.json"
+MACRO_ANS_PROBABILITY_DIAGNOSTICS = "symbol_probability_diagnostics.json"
+MACRO_ANS_FIT_PROGRESS_PLOTS_DIRNAME = "probability_plots_fit_progress"
 
 ATTR_GROUP_SLICES = {
     'opacity': list(range(0, 1)),
@@ -466,18 +473,9 @@ def torch_vanilla_quant(x, lseg, qas):
         else:
             r = lx
         
-        # 兼容不同量化器的属性名
-        if hasattr(qas[cnt], 'scale'):
-            # VanillaQuan 使用 scale 和 zero_point
-            i_scale = qas[cnt].scale
-            i_zp = qas[cnt].zero_point
-            i_signed = False
-        elif hasattr(qas[cnt], 's'):
-            # LsqQuan 使用 s，没有 zero_point
-            i_scale = qas[cnt].s
-            i_zp = torch.tensor(0.0, device=qas[cnt].s.device)  # LSQ 使用对称量化
-            # all_positive=False 时使用有符号量化
-            i_signed = not hasattr(qas[cnt], 'thd_neg') or qas[cnt].thd_neg < 0
+        # Unified quantizer parameter path for both Vanilla and LSQ.
+        if hasattr(qas[cnt], 'get_quant_params'):
+            i_scale, i_zp, i_signed = qas[cnt].get_quant_params()
         else:
             raise ValueError(f"Unsupported quantizer type: {type(qas[cnt])}")
         
@@ -487,7 +485,7 @@ def torch_vanilla_quant(x, lseg, qas):
             scale=i_scale,
             zero_point=i_zp,
             num_bits=i_bit,
-            signed=i_signed).cpu().numpy())
+            signed=i_signed).detach().cpu().numpy())
         trans.extend([i_scale.item(), i_zp.item()])
         cnt+=1
     return np.concatenate(outs, axis=0), trans
@@ -498,18 +496,9 @@ def torch_vanilla_quant_ave(x, split, qas):
     outs = []
     trans = []
     for length in split:
-        # 兼容不同量化器的属性名
-        if hasattr(qas[cnt], 'scale'):
-            # VanillaQuan 使用 scale 和 zero_point
-            i_scale = qas[cnt].scale
-            i_zp = qas[cnt].zero_point
-            i_signed = False
-        elif hasattr(qas[cnt], 's'):
-            # LsqQuan 使用 s，没有 zero_point
-            i_scale = qas[cnt].s
-            i_zp = torch.tensor(0.0, device=qas[cnt].s.device)  # LSQ 使用对称量化
-            # all_positive=False 时使用有符号量化
-            i_signed = not hasattr(qas[cnt], 'thd_neg') or qas[cnt].thd_neg < 0
+        # Unified quantizer parameter path for both Vanilla and LSQ.
+        if hasattr(qas[cnt], 'get_quant_params'):
+            i_scale, i_zp, i_signed = qas[cnt].get_quant_params()
         else:
             raise ValueError(f"Unsupported quantizer type: {type(qas[cnt])}")
         
@@ -519,7 +508,7 @@ def torch_vanilla_quant_ave(x, split, qas):
             scale=i_scale,
             zero_point=i_zp,
             num_bits=i_bit,
-            signed=i_signed).cpu().numpy())  
+            signed=i_signed).detach().cpu().numpy())  
         trans.extend([i_scale.item(), i_zp.item()])
         cnt += 1
         start += length
@@ -845,6 +834,488 @@ class GaussianModel:
 
         return ans_save_dict, total_ans_bytes
 
+    # === NEW: export-time ANS offline fitting helpers ===
+    # This block is intentionally isolated from the original ANS export path.
+    def clone_ans_entropy_bottleneck_state_to_cpu(self):
+        runtime_buffer_suffixes = (
+            "._quantized_cdf",
+            "._cdf_length",
+            "._offset",
+        )
+        return {
+            key: value.detach().cpu().clone()
+            for key, value in self.ans_entropy_bottlenecks.state_dict().items()
+            if not key.endswith(runtime_buffer_suffixes)
+        }
+
+    def restore_ans_entropy_bottleneck_state(self, state_dict):
+        self.ans_entropy_bottlenecks.load_state_dict(state_dict, strict=False)
+        for eb in self.ans_entropy_bottlenecks.values():
+            eb.update(force=True)
+            eb.eval()
+
+    def build_export_ans_fit_targets(self, group_data, dim_ranges):
+        fit_targets = {}
+        total_symbols = 0
+
+        for attr_group in ATTR_GROUP_ORDER:
+            dims = self.get_attr_group_dims(attr_group)
+            group_support_min = min(dim_ranges[idx][0] for idx in dims)
+            group_support_max = max(dim_ranges[idx][1] for idx in dims)
+            support_values = list(range(group_support_min, group_support_max + 1))
+            support_size = len(support_values)
+
+            for subgroup_idx in range(self.ans_effective_subgroup_count):
+                group_key = self.get_ans_group_key(attr_group, subgroup_idx)
+                symbols_list = group_data[group_key]
+                counts = np.zeros((support_size,), dtype=np.float32)
+                symbol_count = 0
+
+                if symbols_list:
+                    symbols = torch.cat(symbols_list).detach().cpu().numpy().astype(np.int32)
+                    symbol_count = int(symbols.size)
+                    if symbol_count > 0:
+                        unique_vals, unique_counts = np.unique(symbols, return_counts=True)
+                        indices = unique_vals - group_support_min
+                        valid_mask = (indices >= 0) & (indices < support_size)
+                        counts[indices[valid_mask]] = unique_counts[valid_mask].astype(np.float32)
+
+                fit_targets[group_key] = {
+                    "support_values": support_values,
+                    "counts": counts,
+                    "symbol_count": symbol_count,
+                }
+                total_symbols += symbol_count
+
+        return fit_targets, total_symbols
+
+    def offline_fit_ans_entropy_models_for_export(
+        self,
+        group_data,
+        qci,
+        dim_bits,
+        dim_ranges,
+        output_dir=None,
+        save_fit_progress_plots=False,
+        steps=1000,
+        main_lr=1e-3,
+        aux_lr=1e-3,
+        plot_interval=100,
+    ):
+        steps = max(0, int(steps))
+        if steps <= 0 or len(self.ans_entropy_bottlenecks) == 0:
+            return []
+
+        fit_targets, total_symbols = self.build_export_ans_fit_targets(group_data, dim_ranges)
+        if total_symbols <= 0:
+            return []
+
+        device = next(iter(self.ans_entropy_bottlenecks.parameters())).device
+        prepared_targets = {}
+        for group_key, target in fit_targets.items():
+            prepared_targets[group_key] = {
+                "symbol_count": target["symbol_count"],
+                "support_tensor": torch.tensor(
+                    target["support_values"],
+                    dtype=torch.float32,
+                    device=device,
+                ).view(1, 1, -1, 1),
+                "counts_tensor": torch.tensor(
+                    target["counts"],
+                    dtype=torch.float32,
+                    device=device,
+                ),
+            }
+
+        main_params = [
+            param for name, param in self.ans_entropy_bottlenecks.named_parameters()
+            if not name.endswith("quantiles")
+        ]
+        aux_params = [eb.quantiles for eb in self.ans_entropy_bottlenecks.values()]
+
+        main_optimizer = torch.optim.Adam(main_params, lr=main_lr) if main_params else None
+        aux_optimizer = torch.optim.Adam(aux_params, lr=aux_lr) if aux_params else None
+        fit_history = []
+        plot_interval = max(1, int(plot_interval))
+
+        with torch.enable_grad():
+            for eb in self.ans_entropy_bottlenecks.values():
+                eb.train()
+
+            for step_idx in range(1, steps + 1):
+                if main_optimizer is not None:
+                    main_optimizer.zero_grad(set_to_none=True)
+
+                total_bits_per_symbol = 0.0
+                total_nll = 0.0
+
+                for group_key, target in prepared_targets.items():
+                    if target["symbol_count"] <= 0:
+                        continue
+
+                    eb = self.get_ans_entropy_model(group_key)
+                    _, likelihood = eb(target["support_tensor"])
+                    likelihood = likelihood.reshape(-1).clamp(min=1e-9)
+
+                    weighted_nll = -(target["counts_tensor"] * torch.log(likelihood)).sum()
+                    loss = weighted_nll / float(total_symbols)
+
+                    if main_optimizer is not None:
+                        loss.backward()
+
+                    total_nll += float(loss.detach().item())
+                    total_bits_per_symbol += float(
+                        (
+                            -(target["counts_tensor"] * torch.log2(likelihood)).sum()
+                            / float(total_symbols)
+                        ).detach().item()
+                    )
+
+                if main_optimizer is not None:
+                    main_optimizer.step()
+
+                aux_loss_value = 0.0
+                if aux_optimizer is not None:
+                    aux_optimizer.zero_grad(set_to_none=True)
+                    aux_loss = torch.tensor(0.0, device=device)
+                    for eb in self.ans_entropy_bottlenecks.values():
+                        aux_loss = aux_loss + eb.loss()
+                    if aux_loss.requires_grad:
+                        aux_loss.backward()
+                        aux_optimizer.step()
+                        aux_loss_value = float(aux_loss.detach().item())
+
+                fit_history.append(
+                    {
+                        "step": int(step_idx),
+                        "nll_per_symbol_nats": float(total_nll),
+                        "bits_per_symbol": float(total_bits_per_symbol),
+                        "aux_loss": float(aux_loss_value),
+                    }
+                )
+
+                if step_idx == 1 or step_idx == steps or step_idx % 100 == 0:
+                    print(
+                        f"      [export-offline-fit] step {step_idx:4d}/{steps} | "
+                        f"bits/sym={total_bits_per_symbol:.6f} | aux={aux_loss_value:.6f}"
+                    )
+
+                if save_fit_progress_plots and output_dir is not None:
+                    if step_idx % plot_interval == 0 or step_idx == steps:
+                        for eb in self.ans_entropy_bottlenecks.values():
+                            eb.update(force=True)
+                        diagnostics = self.build_ans_probability_diagnostics(
+                            qci.astype(np.int32),
+                            dim_bits,
+                            dim_ranges,
+                        )
+                        manifest_path = self.save_export_fit_progress_plots(
+                            diagnostics,
+                            output_dir,
+                            step_idx,
+                        )
+                        fit_history[-1]["plot_manifest"] = manifest_path
+
+        for eb in self.ans_entropy_bottlenecks.values():
+            eb.update(force=True)
+            eb.eval()
+
+        return fit_history
+
+    def _get_matplotlib_pyplot(self):
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        return plt
+
+    def _select_probability_tick_positions(self, x_values, max_ticks=17):
+        if x_values.size <= max_ticks:
+            return x_values
+        indices = np.linspace(0, x_values.size - 1, num=max_ticks, dtype=int)
+        return x_values[indices]
+
+    def _sanitize_probability_plot_name(self, name):
+        return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
+
+    def estimate_ans_distribution_from_model(self, eb, support_values):
+        if not support_values:
+            return {}, 0.0
+
+        device = eb.quantiles.device
+        was_training = eb.training
+        eb.eval()
+        with torch.no_grad():
+            x = torch.tensor(support_values, dtype=torch.float32, device=device).view(1, 1, -1, 1)
+            _, likelihood = eb(x)
+            likelihood = likelihood.reshape(-1).detach().cpu().numpy().astype(np.float64)
+
+        if was_training:
+            eb.train()
+
+        support_mass = float(likelihood.sum())
+        if support_mass > 0:
+            normalized = likelihood / support_mass
+        else:
+            normalized = np.zeros_like(likelihood)
+
+        probabilities = {
+            str(int(symbol)): float(prob)
+            for symbol, prob in zip(support_values, normalized.tolist())
+        }
+        return probabilities, support_mass
+
+    def build_ans_probability_diagnostics(self, qci, dim_bits, dim_ranges):
+        if isinstance(qci, np.ndarray):
+            group_data = self.build_ans_group_tensors_from_qci(qci.astype(np.float32))
+        else:
+            group_data = self.build_ans_group_tensors_from_qci(qci.to(torch.float32))
+
+        diagnostics = {
+            "effective_subgroup_count": int(self.ans_effective_subgroup_count),
+            "groups": {},
+            "aggregated_groups": {},
+        }
+
+        for attr_group in ATTR_GROUP_ORDER:
+            dims = self.get_attr_group_dims(attr_group)
+            dim_bitwidths = [int(dim_bits[idx]) for idx in dims]
+            group_support_min = min(dim_ranges[idx][0] for idx in dims)
+            group_support_max = max(dim_ranges[idx][1] for idx in dims)
+            group_support = list(range(group_support_min, group_support_max + 1))
+            diagnostics["groups"][attr_group] = {}
+
+            aggregated_counts = {}
+            aggregated_estimated_probs = {str(v): 0.0 for v in group_support}
+            total_group_symbols = 0
+
+            for subgroup_idx in range(self.ans_effective_subgroup_count):
+                group_key = self.get_ans_group_key(attr_group, subgroup_idx)
+                symbols_list = group_data[group_key]
+
+                if symbols_list:
+                    symbols = torch.cat(symbols_list).detach().cpu().numpy().astype(np.int32)
+                    unique_vals, unique_counts = np.unique(symbols, return_counts=True)
+                    probabilities = unique_counts.astype(np.float64) / float(symbols.size)
+                    histogram_counts = {
+                        str(int(symbol)): int(count)
+                        for symbol, count in zip(unique_vals.tolist(), unique_counts.tolist())
+                    }
+                    empirical_probabilities = {
+                        str(int(symbol)): float(prob)
+                        for symbol, prob in zip(unique_vals.tolist(), probabilities.tolist())
+                    }
+                else:
+                    symbols = np.zeros((0,), dtype=np.int32)
+                    histogram_counts = {}
+                    empirical_probabilities = {}
+
+                eb = self.get_ans_entropy_model(group_key)
+                estimated_probabilities, support_mass = self.estimate_ans_distribution_from_model(
+                    eb,
+                    group_support,
+                )
+
+                subgroup_name = f"sg{subgroup_idx}"
+                diagnostics["groups"][attr_group][subgroup_name] = {
+                    "group_key": group_key,
+                    "subgroup_index": int(subgroup_idx),
+                    "dim_indices": [int(idx) for idx in dims],
+                    "bitwidths": dim_bitwidths,
+                    "support_min": int(group_support_min),
+                    "support_max": int(group_support_max),
+                    "support_values": [int(v) for v in group_support],
+                    "symbol_count": int(symbols.size),
+                    "histogram_counts": histogram_counts,
+                    "empirical_probabilities": empirical_probabilities,
+                    "estimated_probabilities": estimated_probabilities,
+                    "estimated_probability_mass_on_support": support_mass,
+                }
+
+                total_group_symbols += int(symbols.size)
+                for symbol, count in histogram_counts.items():
+                    aggregated_counts[symbol] = aggregated_counts.get(symbol, 0) + count
+
+                if symbols.size > 0:
+                    for symbol, prob in estimated_probabilities.items():
+                        aggregated_estimated_probs[symbol] = (
+                            aggregated_estimated_probs.get(symbol, 0.0) + prob * symbols.size
+                        )
+
+            if total_group_symbols > 0:
+                aggregated_empirical_probs = {
+                    symbol: float(count) / float(total_group_symbols)
+                    for symbol, count in aggregated_counts.items()
+                }
+                aggregated_estimated_probs = {
+                    symbol: float(prob) / float(total_group_symbols)
+                    for symbol, prob in aggregated_estimated_probs.items()
+                }
+            else:
+                aggregated_empirical_probs = {}
+                aggregated_estimated_probs = {symbol: 0.0 for symbol in aggregated_estimated_probs}
+
+            diagnostics["aggregated_groups"][attr_group] = {
+                "bitwidths": dim_bitwidths,
+                "dim_indices": [int(idx) for idx in dims],
+                "support_min": int(group_support_min),
+                "support_max": int(group_support_max),
+                "support_values": [int(v) for v in group_support],
+                "symbol_count": int(total_group_symbols),
+                "histogram_counts": aggregated_counts,
+                "empirical_probabilities": aggregated_empirical_probs,
+                "estimated_probabilities": aggregated_estimated_probs,
+            }
+
+        return diagnostics
+
+    def plot_ans_probability_distribution(self, info, title, save_path):
+        plt = self._get_matplotlib_pyplot()
+        x_values = np.asarray(info["support_values"], dtype=np.int32)
+        empirical = np.array(
+            [float(info["empirical_probabilities"].get(str(v), 0.0)) for v in x_values],
+            dtype=np.float64,
+        )
+        estimated = np.array(
+            [float(info["estimated_probabilities"].get(str(v), 0.0)) for v in x_values],
+            dtype=np.float64,
+        )
+
+        fig, axes = plt.subplots(
+            2,
+            1,
+            figsize=(12, 7),
+            gridspec_kw={"height_ratios": [3, 2]},
+            constrained_layout=True,
+        )
+
+        axes[0].bar(
+            x_values,
+            empirical,
+            width=0.9,
+            color="#5B8FF9",
+            alpha=0.55,
+            label="Empirical probability",
+            align="center",
+        )
+        axes[0].plot(
+            x_values,
+            estimated,
+            color="#D94841",
+            linewidth=1.8,
+            label="CompressAI estimated probability",
+        )
+        axes[0].set_ylabel("Probability")
+        axes[0].set_title(title)
+        axes[0].legend(loc="upper right")
+        axes[0].grid(alpha=0.2, linewidth=0.6)
+
+        counts = np.array(
+            [int(info["histogram_counts"].get(str(v), 0)) for v in x_values],
+            dtype=np.int64,
+        )
+        axes[1].bar(
+            x_values,
+            counts,
+            width=0.9,
+            color="#7FC8A9",
+            alpha=0.9,
+        )
+        axes[1].set_ylabel("Count")
+        axes[1].set_xlabel("Quantized symbol")
+        axes[1].grid(alpha=0.2, linewidth=0.6)
+
+        tick_positions = self._select_probability_tick_positions(x_values)
+        axes[0].set_xticks(tick_positions)
+        axes[1].set_xticks(tick_positions)
+        axes[0].tick_params(axis="x", labelrotation=45)
+        axes[1].tick_params(axis="x", labelrotation=45)
+
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        fig.savefig(save_path, dpi=180, bbox_inches="tight")
+        plt.close(fig)
+
+    def save_ans_probability_plots(self, qci, dim_bits, dim_ranges, output_dir):
+        diagnostics = self.build_ans_probability_diagnostics(qci, dim_bits, dim_ranges)
+        plots_root = os.path.join(output_dir, MACRO_ANS_PROBABILITY_PLOTS_DIRNAME)
+        aggregated_dir = os.path.join(plots_root, "aggregated")
+        subgroup_dir = os.path.join(plots_root, "subgroups")
+        manifest = {
+            "aggregated": {},
+            "subgroups": {},
+        }
+
+        for attr_group in ATTR_GROUP_ORDER:
+            aggregated_info = diagnostics["aggregated_groups"][attr_group]
+            aggregated_path = os.path.join(
+                aggregated_dir,
+                f"{self._sanitize_probability_plot_name(attr_group)}.png",
+            )
+            title = (
+                f"{attr_group} | empirical vs CompressAI estimated probability "
+                f"(symbols={aggregated_info['symbol_count']})"
+            )
+            self.plot_ans_probability_distribution(aggregated_info, title, aggregated_path)
+            manifest["aggregated"][attr_group] = os.path.abspath(aggregated_path)
+
+            manifest["subgroups"][attr_group] = {}
+            for subgroup_name, subgroup_info in diagnostics["groups"][attr_group].items():
+                if subgroup_info["symbol_count"] == 0:
+                    continue
+                subgroup_path = os.path.join(
+                    subgroup_dir,
+                    attr_group,
+                    f"{self._sanitize_probability_plot_name(subgroup_name)}.png",
+                )
+                subgroup_title = (
+                    f"{attr_group}/{subgroup_name} | empirical vs CompressAI estimated probability "
+                    f"(symbols={subgroup_info['symbol_count']})"
+                )
+                self.plot_ans_probability_distribution(subgroup_info, subgroup_title, subgroup_path)
+                manifest["subgroups"][attr_group][subgroup_name] = os.path.abspath(subgroup_path)
+
+        manifest_path = os.path.join(plots_root, MACRO_ANS_PROBABILITY_PLOT_MANIFEST)
+        os.makedirs(plots_root, exist_ok=True)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+
+        diagnostics_path = os.path.join(output_dir, MACRO_ANS_PROBABILITY_DIAGNOSTICS)
+        with open(diagnostics_path, "w", encoding="utf-8") as f:
+            json.dump(diagnostics, f, indent=2)
+
+        print(f"      概率分布图目录: {plots_root}")
+        print(f"      概率分布清单: {manifest_path}")
+        return diagnostics_path, manifest_path
+
+    def save_export_fit_progress_plots(self, diagnostics, output_dir, step):
+        plots_root = os.path.join(
+            output_dir,
+            MACRO_ANS_FIT_PROGRESS_PLOTS_DIRNAME,
+            f"step_{int(step):04d}",
+        )
+        aggregated_dir = os.path.join(plots_root, "aggregated")
+        manifest = {"aggregated": {}}
+
+        for attr_group in ATTR_GROUP_ORDER:
+            aggregated_info = diagnostics["aggregated_groups"][attr_group]
+            aggregated_path = os.path.join(
+                aggregated_dir,
+                f"{self._sanitize_probability_plot_name(attr_group)}.png",
+            )
+            title = (
+                f"{attr_group} | fitted step {int(step)} | empirical vs CompressAI estimated probability "
+                f"(symbols={aggregated_info['symbol_count']})"
+            )
+            self.plot_ans_probability_distribution(aggregated_info, title, aggregated_path)
+            manifest["aggregated"][attr_group] = os.path.abspath(aggregated_path)
+
+        manifest_path = os.path.join(plots_root, MACRO_ANS_PROBABILITY_PLOT_MANIFEST)
+        os.makedirs(plots_root, exist_ok=True)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        return manifest_path
+
     def decompress_ans_groups(self, npz_data, ac_len):
         q_raht_i = np.zeros((ac_len, 55), dtype=np.float32)
         effective_subgroups = int(npz_data['ans_subgroup_count'][0]) if 'ans_subgroup_count' in npz_data else 1
@@ -1091,7 +1562,7 @@ class GaussianModel:
                 if not name.endswith("quantiles")
             ]
             if ans_main_params:
-                l.append({'params': ans_main_params, 'lr': 1e-4, "name": "ans_models"})
+                l.append({'params': ans_main_params, 'lr': 1e-3, "name": "ans_models"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -1292,7 +1763,20 @@ class GaussianModel:
             print('final sum:', zip_file_size / 1024, 'KB')
             print('final sum:', zip_file_size / 1024 / 1024, 'MB')
             
-    def save_npz(self, exp_dir, pipe, per_channel_quant=False, per_block_quant=False, bit_packing=True):
+    def save_npz(
+        self,
+        exp_dir,
+        pipe,
+        per_channel_quant=False,
+        per_block_quant=False,
+        bit_packing=True,
+        save_probability_plots=False,
+        export_ans_offline_fit=False,
+        export_ans_offline_fit_steps=1000,
+        export_ans_offline_fit_main_lr=1e-3,
+        export_ans_offline_fit_aux_lr=1e-3,
+        export_ans_offline_fit_plot_interval=100,
+    ):
         
         os.makedirs(exp_dir, exist_ok=True)
         bin_dir = os.path.join(exp_dir, 'bins')
@@ -1478,6 +1962,7 @@ class GaussianModel:
                 split = split_length(ac_len, self.n_block) if per_block_quant else [ac_len]
                 qci = []
                 dim_bits = []
+                dim_ranges = []
                 qa_cnt = 0
 
                 for dim_idx in range(C.shape[-1]):
@@ -1486,15 +1971,51 @@ class GaussianModel:
                     qci.append(q_dim.reshape(-1, 1))
                     trans_array.extend(trans_dim)
                     dim_bits.append(qas_for_dim[0].bit)
+                    dim_ranges.append((int(qas_for_dim[0].thd_neg), int(qas_for_dim[0].thd_pos)))
                     qa_cnt += len(split)
 
                 qci = np.concatenate(qci, axis=-1).astype(np.float32)
                 ans_group_data = self.build_ans_group_tensors_from_qci(qci)
-                ans_save_dict, total_ans_bytes = self.compress_ans_groups(ans_group_data)
+                # === NEW: isolated export-time offline fitting branch ===
+                if export_ans_offline_fit:
+                    print(
+                        f"      ANS export offline fit enabled: "
+                        f"steps={int(export_ans_offline_fit_steps)}, "
+                        f"main_lr={float(export_ans_offline_fit_main_lr):.2e}, "
+                        f"aux_lr={float(export_ans_offline_fit_aux_lr):.2e}"
+                    )
+                    original_ans_state = self.clone_ans_entropy_bottleneck_state_to_cpu()
+                    try:
+                        self.offline_fit_ans_entropy_models_for_export(
+                            ans_group_data,
+                            qci,
+                            dim_bits,
+                            dim_ranges,
+                            output_dir=exp_dir,
+                            save_fit_progress_plots=(
+                                MACRO_ENABLE_ANS_PROBABILITY_PLOT_EXPORT and save_probability_plots
+                            ),
+                            steps=export_ans_offline_fit_steps,
+                            main_lr=export_ans_offline_fit_main_lr,
+                            aux_lr=export_ans_offline_fit_aux_lr,
+                            plot_interval=export_ans_offline_fit_plot_interval,
+                        )
+                        ans_save_dict, total_ans_bytes = self.compress_ans_groups(ans_group_data)
+                    finally:
+                        self.restore_ans_entropy_bottleneck_state(original_ans_state)
+                else:
+                    ans_save_dict, total_ans_bytes = self.compress_ans_groups(ans_group_data)
                 ans_save_dict['f'] = cf
                 ans_save_dict['bit_config'] = np.array(dim_bits, dtype=np.uint8)
                 np.savez(os.path.join(bin_dir, 'orgb.npz'), **ans_save_dict)
                 print(f"      ANS 字节流总大小: {total_ans_bytes / 1024:.2f} KB")
+                if MACRO_ENABLE_ANS_PROBABILITY_PLOT_EXPORT and save_probability_plots:
+                    self.save_ans_probability_plots(
+                        qci.astype(np.int32),
+                        dim_bits,
+                        dim_ranges,
+                        exp_dir,
+                    )
 
             if not is_ans:
                 if per_channel_quant:
@@ -1506,17 +2027,8 @@ class GaussianModel:
                         # 兼容不同量化器的属性名
                         qa = self.qas[i]
                         dim_bits.append(qa.bit)
-                        if hasattr(qa, 'scale'):
-                            # VanillaQuan
-                            i_scale = qa.scale
-                            i_zp = qa.zero_point
-                            i_signed = False
-                        elif hasattr(qa, 's'):
-                            # LsqQuan
-                            i_scale = qa.s
-                            i_zp = torch.tensor(0.0, device=qa.s.device)
-                             # all_positive=False 时使用有符号量化
-                            i_signed = not hasattr(qa, 'thd_neg') or qa.thd_neg < 0
+                        if hasattr(qa, 'get_quant_params'):
+                            i_scale, i_zp, i_signed = qa.get_quant_params()
                         else:
                             raise ValueError(f"Unsupported quantizer type: {type(qa)}")
                     
@@ -1564,8 +2076,8 @@ class GaussianModel:
                         dim_bits.append(current_bit)
 
                         # 判断是否有符号量化
-                        if hasattr(qa, 's'):
-                            is_signed = not hasattr(qa, 'thd_neg') or qa.thd_neg < 0
+                        if hasattr(qa, 'get_quant_params'):
+                            _, _, is_signed = qa.get_quant_params()
                         else:
                             is_signed = False
                         signed_flags.append(is_signed)
@@ -1587,16 +2099,8 @@ class GaussianModel:
                     print(f"    qci 形状: {qci.shape}")
                 else:
                     # 兼容不同量化器的属性名
-                    if hasattr(self.qa, 'scale'):
-                        # VanillaQuan
-                        i_scale = self.qa.scale
-                        i_zp = self.qa.zero_point
-                        i_signed = False
-                    elif hasattr(self.qa, 's'):
-                        # LsqQuan
-                        i_scale = self.qa.s
-                        i_zp = torch.tensor(0.0, device=self.qa.s.device)
-                        i_signed = not hasattr(self.qa, 'thd_neg') or self.qa.thd_neg < 0
+                    if hasattr(self.qa, 'get_quant_params'):
+                        i_scale, i_zp, i_signed = self.qa.get_quant_params()
                     else:
                         raise ValueError(f"Unsupported quantizer type: {type(self.qa)}")
                 
@@ -1814,7 +2318,17 @@ class GaussianModel:
                     self.qas.append(LsqQuan(bit=bit, init_yet=False, all_positive=False, encode=encode, shared_eb=None).cuda())
                 else:
                     # VanillaQuan (传统量化)
-                    self.qas.append(VanillaQuan(bit=bit, encode=encode, shared_eb=None).cuda())
+                    # Old code kept for reference:
+                    # self.qas.append(VanillaQuan(bit=bit, encode=encode, shared_eb=None).cuda())
+                    self.qas.append(
+                        VanillaQuan(
+                            bit=bit,
+                            all_positive=False,
+                            symmetric=False,
+                            encode=encode,
+                            shared_eb=None,
+                        ).cuda()
+                    )
 
         
         n_qs = len(self.qas)

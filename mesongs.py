@@ -28,6 +28,8 @@ from utils.general_utils import safe_state
 from utils.image_utils import psnr
 from utils.loss_utils import l1_loss, ssim
 
+MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_SAVE_HOOK = True
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -907,7 +909,21 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'ans_entropy_bottlenecks'):
             for eb in gaussians.ans_entropy_bottlenecks.values():
                 eb.update(force=True)
-        zip_size = scene.save_ft("0", pipe, per_channel_quant=dataset.per_channel_quant, per_block_quant=dataset.per_block_quant, bit_packing=dataset.bit_packing)
+        zip_size = scene.save_ft(
+            "0",
+            pipe,
+            per_channel_quant=dataset.per_channel_quant,
+            per_block_quant=dataset.per_block_quant,
+            bit_packing=dataset.bit_packing,
+            export_ans_offline_fit=getattr(dataset, 'export_ans_offline_fit', False),
+            export_ans_offline_fit_steps=getattr(dataset, 'export_ans_offline_fit_steps', 1000),
+            export_ans_offline_fit_main_lr=getattr(dataset, 'export_ans_offline_fit_main_lr', 1e-3),
+            export_ans_offline_fit_aux_lr=getattr(dataset, 'export_ans_offline_fit_aux_lr', 1e-3),
+            save_probability_plots=(
+                getattr(dataset, 'save_probability_plots', False)
+                if MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_SAVE_HOOK else False
+            ),
+        )
         zip_size = zip_size / 1024 / 1024 # to MB
         
         print("\n" + "-"*70)
@@ -1015,7 +1031,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             # torch.abs(raht_ac).sum() 计算所有|x_ij|的总和
             # 然后除以n_ch得到每个通道的平均L1范数
             loss_S = torch.abs(raht_ac).sum() / n_ch
-        print(f"迭代 {iteration}: AC_loss = {loss_S.item():.2e} (初始值)")
+        # print(f"迭代 {iteration}: AC_loss = {loss_S.item():.2e} (初始值)")
         # ==========================================
         # 提取概率并计算 Rate Loss (码率约束)
         # ==========================================
@@ -1033,8 +1049,9 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         # 组装最终 Loss
         # ==========================================
         if dataset.encode.lower() == "ans":
-            print(f"最终损失函数loss=loss = {(1.0 - dataset.lambda_rate):.1f} * {loss_D:.4f}+{dataset.lambda_rate:.1f} * {loss_R:.2f}")
-            loss = (1.0 - dataset.lambda_rate) * loss_D+dataset.lambda_rate * loss_R
+            #print(f"最终损失函数loss=loss = {(1.0 - dataset.lambda_rate):.1f} * {loss_D:.4f}+{dataset.lambda_rate:.1f} * {loss_R:.2f}")
+            #loss = (1.0 - dataset.lambda_rate) * loss_D+dataset.lambda_rate * loss_R
+            loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
         else:
             loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
             
@@ -1115,7 +1132,21 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'ans_entropy_bottlenecks'):
                     for eb in gaussians.ans_entropy_bottlenecks.values():
                         eb.update(force=True)
-                scene.save_ft('best', pipe, per_channel_quant=dataset.per_channel_quant, per_block_quant=dataset.per_block_quant, bit_packing=dataset.bit_packing)
+                scene.save_ft(
+                    'best',
+                    pipe,
+                    per_channel_quant=dataset.per_channel_quant,
+                    per_block_quant=dataset.per_block_quant,
+                    bit_packing=dataset.bit_packing,
+                    export_ans_offline_fit=getattr(dataset, 'export_ans_offline_fit', False),
+                    export_ans_offline_fit_steps=getattr(dataset, 'export_ans_offline_fit_steps', 1000),
+                    export_ans_offline_fit_main_lr=getattr(dataset, 'export_ans_offline_fit_main_lr', 1e-3),
+                    export_ans_offline_fit_aux_lr=getattr(dataset, 'export_ans_offline_fit_aux_lr', 1e-3),
+                    save_probability_plots=(
+                        getattr(dataset, 'save_probability_plots', False)
+                        if MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_SAVE_HOOK else False
+                    ),
+                )
  
             
             # Optimizer step
@@ -1228,7 +1259,21 @@ def training_report(
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
         
-        zip_size = scene.save_ft(iteration, pipe, per_channel_quant=dataset.per_channel_quant, per_block_quant=dataset.per_block_quant, bit_packing=dataset.bit_packing)
+        zip_size = scene.save_ft(
+            iteration,
+            pipe,
+            per_channel_quant=dataset.per_channel_quant,
+            per_block_quant=dataset.per_block_quant,
+            bit_packing=dataset.bit_packing,
+            export_ans_offline_fit=getattr(dataset, 'export_ans_offline_fit', False),
+            export_ans_offline_fit_steps=getattr(dataset, 'export_ans_offline_fit_steps', 1000),
+            export_ans_offline_fit_main_lr=getattr(dataset, 'export_ans_offline_fit_main_lr', 1e-3),
+            export_ans_offline_fit_aux_lr=getattr(dataset, 'export_ans_offline_fit_aux_lr', 1e-3),
+            save_probability_plots=(
+                getattr(dataset, 'save_probability_plots', False)
+                if MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_SAVE_HOOK else False
+            ),
+        )
         zip_size = zip_size / 1024 / 1024
         
         row = []

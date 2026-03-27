@@ -109,6 +109,9 @@ class Quantizer(nn.Module):
     def forward(self, x):
         raise NotImplementedError
 
+    def get_quant_params(self):
+        raise NotImplementedError
+
 
 class IdentityQuan(Quantizer):
     def __init__(self, bit=None, *args, **kwargs):
@@ -183,6 +186,9 @@ class LsqQuan(Quantizer):
         x_q = x_q * s_scale
         return x_q
 
+    def get_quant_params(self):
+        return self.s, torch.tensor(0.0, device=self.s.device), self.thd_neg < 0
+
 
 def calcScaleZeroPoint(min_val, max_val, num_bits=8):
     qmin = 0.
@@ -205,6 +211,8 @@ def calcScaleZeroPoint(min_val, max_val, num_bits=8):
 class VanillaQuan(Quantizer):
     def __init__(self, bit, all_positive=True, symmetric=False, encode="deflate", channels=1, shared_eb=None):
         super().__init__(bit)
+        self.all_positive = all_positive
+        self.symmetric = symmetric
         
         if all_positive:
             assert not symmetric, "Positive quantization cannot be symmetric"
@@ -223,7 +231,7 @@ class VanillaQuan(Quantizer):
 
         self.bit = bit
         self.register_buffer('scale', torch.tensor([], requires_grad=False))
-        self.register_buffer('zero_point', torch.tensor([], requires_grad=False))
+        self.register_buffer('zero_point', torch.zeros(1, requires_grad=False))
         self.register_buffer('min_val', torch.tensor([], requires_grad=False)) 
         self.register_buffer('max_val', torch.tensor([], requires_grad=False))
         
@@ -237,21 +245,50 @@ class VanillaQuan(Quantizer):
         self.last_clamped = None
         
     def update(self, x):
-        if self.max_val.nelement() == 0 or self.max_val.data < x.max().data:
-            self.max_val.data = x.max().data
-        self.max_val.clamp_(min=0)
-        
-        if self.min_val.nelement() == 0 or self.min_val.data > x.min().data:
-            self.min_val.data = x.min().data 
-        self.min_val.clamp_(max=0)    
-        
-        self.scale, self.zero_point = calcScaleZeroPoint(self.min_val, self.max_val, self.bit)
+        # Old affine min-max quantization kept for reference. It uses a
+        # block-specific zero_point and often creates multi-peak symbol
+        # distributions after grouping multiple blocks together.
+        #
+        # if self.max_val.nelement() == 0 or self.max_val.data < x.max().data:
+        #     self.max_val.data = x.max().data
+        # self.max_val.clamp_(min=0)
+        #
+        # if self.min_val.nelement() == 0 or self.min_val.data > x.min().data:
+        #     self.min_val.data = x.min().data
+        # self.min_val.clamp_(max=0)
+        #
+        # self.scale, self.zero_point = calcScaleZeroPoint(self.min_val, self.max_val, self.bit)
+
+        # Vanilla quantization now uses a fixed zero-centered symbol
+        # definition. The old affine min-max path is intentionally kept
+        # commented above for reference.
+        if self.all_positive:
+            current_max = x.detach().max()
+            if self.max_val.nelement() == 0 or self.max_val.data < current_max.data:
+                self.max_val.data = current_max.data
+            self.max_val.clamp_(min=0)
+            self.min_val.data = torch.zeros_like(self.max_val.data)
+            qmax = max(float(self.thd_pos), 1.0)
+            self.scale = torch.clamp(self.max_val / qmax, min=1e-8)
+            self.zero_point.data.zero_()
+            return
+
+        current_abs_max = x.detach().abs().max()
+        if self.max_val.nelement() == 0 or self.max_val.data < current_abs_max.data:
+            self.max_val.data = current_abs_max.data
+        self.max_val.clamp_(min=1e-8)
+        self.min_val.data = -self.max_val.data
+        qmax = max(float(self.thd_pos), 1.0)
+        self.scale = torch.clamp(self.max_val / qmax, min=1e-8)
+        self.zero_point.data.zero_()
     
     def forward(self, x):
         self.update(x)
         
         # 1. 归一化与截断
-        x_norm = self.zero_point + (x / self.scale)
+        # Old affine path kept for reference:
+        # x_norm = self.zero_point + (x / self.scale)
+        x_norm = x / self.scale
         x_clamped = torch.clamp(x_norm, self.thd_neg, self.thd_pos)
         
         # 2. 🌟 新增：缓存 clamped 值供外部批处理
@@ -262,5 +299,10 @@ class VanillaQuan(Quantizer):
             
         # 3. 离散化与反量化
         x_q = round_pass(x_clamped)
-        x_q = self.scale * (x_q - self.zero_point)
+        # Old affine path kept for reference:
+        # x_q = self.scale * (x_q - self.zero_point)
+        x_q = self.scale * x_q
         return x_q
+
+    def get_quant_params(self):
+        return self.scale, self.zero_point, self.thd_neg < 0

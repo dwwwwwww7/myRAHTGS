@@ -13,6 +13,9 @@ import os
 import sys
 from argparse import ArgumentParser, Namespace
 
+MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_ARG = True
+DEFAULT_SAVE_PROBABILITY_PLOTS = False
+
 
 class GroupParams:
     pass
@@ -78,6 +81,14 @@ class ModelParams(ParamGroup):
         self.encode="deflate" # 熵编码方式: "deflate" 或 "ANS"
         self.lambda_rate=0.001  # 使用ANS熵编码时的R权重
         self.ans_subgroup_count=4
+        self.export_ans_offline_fit=True
+        self.export_ans_offline_fit_steps=1000
+        self.export_ans_offline_fit_plot_interval=100
+        self.export_ans_offline_fit_main_lr=1e-3
+        self.export_ans_offline_fit_aux_lr=1e-3
+        self.save_probability_plots=(
+            DEFAULT_SAVE_PROBABILITY_PLOTS if MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_ARG else False
+        )
         super().__init__(parser, "Loading Parameters", sentinel)
 
     def extract(self, args):

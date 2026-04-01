@@ -20,6 +20,7 @@ from scene.gaussian_model import (
     split_length,
     transform_batched_torch,
 )
+from utils.quant_utils import quantizer_uses_zero_mean_laplace
 
 
 DEFAULT_BIT_CONFIG = {
@@ -62,6 +63,12 @@ def parse_args():
     parser.add_argument("--num-bits", type=int, default=8)
     parser.add_argument("--n-block", type=int, default=66)
     parser.add_argument("--quant-type", choices=["lsq", "vanilla"], default="vanilla")
+    parser.add_argument(
+        "--vanilla-withzeropoint",
+        action="store_true",
+        default=False,
+        help="Enable affine zero_point for VanillaQuan instead of zero-centered scaling only.",
+    )
     parser.add_argument("--oct-merge", choices=["mean", "imp", "rand"], default="mean")
     parser.add_argument(
         "--importance",
@@ -288,15 +295,16 @@ def sanitize_name(name):
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
 
 
-def laplace_cdf(x_values, scale):
+def laplace_cdf(x_values, scale, mean=0.0):
     safe_scale = max(float(scale), 1e-8)
     x_values = np.asarray(x_values, dtype=np.float64)
-    positive = 1.0 - 0.5 * np.exp(-x_values / safe_scale)
-    negative = 0.5 * np.exp(x_values / safe_scale)
-    return np.where(x_values >= 0.0, positive, negative)
+    centered = x_values - float(mean)
+    positive = 1.0 - 0.5 * np.exp(-centered / safe_scale)
+    negative = 0.5 * np.exp(centered / safe_scale)
+    return np.where(centered >= 0.0, positive, negative)
 
 
-def estimate_zero_mean_laplace_probability(info):
+def estimate_laplace_probability(info):
     support_values = np.asarray(info["support_values"], dtype=np.int32)
     counts = np.array(
         [int(info["histogram_counts"].get(str(v), 0)) for v in support_values],
@@ -304,11 +312,22 @@ def estimate_zero_mean_laplace_probability(info):
     )
     symbol_count = max(int(info["symbol_count"]), 0)
     if symbol_count == 0 or support_values.size == 0:
-        return {}, 0.0, 0.0
+        return {}, 0.0, 0.0, 0.0
 
-    scale = float(np.sum(np.abs(support_values.astype(np.float64)) * counts) / max(symbol_count, 1))
+    zero_mean_assumed = bool(info.get("laplace_zero_mean", False))
+    empirical_mean = float(
+        np.sum(support_values.astype(np.float64) * counts) / max(symbol_count, 1)
+    )
+    mean = 0.0 if zero_mean_assumed else empirical_mean
+    scale = float(
+        np.sum(np.abs(support_values.astype(np.float64) - mean) * counts) / max(symbol_count, 1)
+    )
     scale = max(scale, 1e-4)
-    probs = laplace_cdf(support_values + 0.5, scale) - laplace_cdf(support_values - 0.5, scale)
+    probs = laplace_cdf(support_values + 0.5, scale, mean=mean) - laplace_cdf(
+        support_values - 0.5,
+        scale,
+        mean=mean,
+    )
     probs = np.clip(probs, 1e-12, None)
     support_mass = float(probs.sum())
     normalized = probs / max(support_mass, 1e-12)
@@ -316,7 +335,7 @@ def estimate_zero_mean_laplace_probability(info):
         str(int(symbol)): float(prob)
         for symbol, prob in zip(support_values.tolist(), normalized.tolist())
     }
-    return probabilities, support_mass, scale
+    return probabilities, support_mass, mean, scale
 
 
 def compute_probability_fit_metrics(empirical, estimated):
@@ -515,9 +534,12 @@ def build_group_diagnostics(gaussians, qci, dim_bits, dim_ranges):
     empirical_entropy_sum = 0.0
 
     for block_info in diagnostics["blocks"].values():
-        laplace_probabilities, laplace_support_mass, laplace_scale = estimate_zero_mean_laplace_probability(block_info)
+        qa = gaussians.qas[int(block_info["qa_idx"])]
+        block_info["laplace_zero_mean"] = bool(quantizer_uses_zero_mean_laplace(qa))
+        laplace_probabilities, laplace_support_mass, laplace_mean, laplace_scale = estimate_laplace_probability(block_info)
         block_info["laplace_probabilities"] = laplace_probabilities
         block_info["laplace_probability_mass_on_support"] = float(laplace_support_mass)
+        block_info["laplace_mean"] = float(laplace_mean)
         block_info["laplace_scale"] = float(laplace_scale)
 
         _, empirical, estimated, laplace = prepare_probability_arrays(block_info)
@@ -594,6 +616,7 @@ def collect_symbol_diagnostics(args, ply_format, importance, bit_config, output_
         effective_n_block,
         bit_config=bit_config,
         quant_type=args.quant_type,
+        vanilla_withzeropoint=args.vanilla_withzeropoint,
         encode="ans",
         ans_subgroup_count=args.ans_subgroup_count,
     )
@@ -686,7 +709,10 @@ def plot_probability_distribution(info, title, save_path):
         color="#59A14F",
         linewidth=1.8,
         linestyle="--",
-        label=f"Zero-mean Laplace fit (b={info.get('laplace_scale', 0.0):.4f})",
+        label=(
+            f"Laplace fit (mu={info.get('laplace_mean', 0.0):.4f}, "
+            f"b={info.get('laplace_scale', 0.0):.4f})"
+        ),
     )
     axes[0].set_ylabel("Probability")
     axes[0].set_title(title)
@@ -901,6 +927,7 @@ def run_single_mode(args, mode, ply_format, importance, bit_config, output_dir, 
         effective_n_block,
         bit_config=bit_config,
         quant_type=args.quant_type,
+        vanilla_withzeropoint=args.vanilla_withzeropoint,
         encode=mode,
         ans_subgroup_count=args.ans_subgroup_count,
     )

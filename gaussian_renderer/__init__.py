@@ -23,7 +23,9 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.quant_utils import (
     batched_quantize_blocks,
-    estimate_zero_mean_laplace_block_scales,
+    estimate_laplace_block_params,
+    quantizer_uses_zero_point,
+    quantizer_uses_zero_mean_laplace,
     split_length,
 )
 
@@ -459,16 +461,35 @@ def ft_render(
             quantC[1:] = pc.qa(C[1:])
             if encode_mode == "ans" and getattr(pc.qa, "entropy_bottleneck", None) is not None:
                 if hasattr(pc.qa, "s"):
-                    x_clamped = torch.clamp(quantC[1:] / pc.qa.s, pc.qa.thd_neg, pc.qa.thd_pos)
+                    symbol_domain = quantC[1:] / pc.qa.s
+                elif quantizer_uses_zero_point(pc.qa):
+                    symbol_domain = pc.qa.zero_point + (quantC[1:] / pc.qa.scale)
                 else:
-                    x_clamped = torch.clamp(quantC[1:] / pc.qa.scale, pc.qa.thd_neg, pc.qa.thd_pos)
+                    symbol_domain = quantC[1:] / pc.qa.scale
+                x_clamped = torch.clamp(symbol_domain, pc.qa.thd_neg, pc.qa.thd_pos)
                 _, likelihoods = pc.qa.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
                 total_ans_bits = torch.clamp(-torch.log2(likelihoods.clamp(min=1e-6)), max=32.0).sum()
             elif encode_mode == "laplace":
                 from utils.quant_utils import _laplace_bits_with_tail_clip
-                block_scales = estimate_zero_mean_laplace_block_scales(quantC[1:], [quantC.shape[0] - 1])
+                if hasattr(pc.qa, "s"):
+                    symbol_domain = quantC[1:] / pc.qa.s
+                elif quantizer_uses_zero_point(pc.qa):
+                    symbol_domain = pc.qa.zero_point + (quantC[1:] / pc.qa.scale)
+                else:
+                    symbol_domain = quantC[1:] / pc.qa.scale
+                zero_mean_flags = [[quantizer_uses_zero_mean_laplace(pc.qa)]]
+                block_means, block_scales = estimate_laplace_block_params(
+                    symbol_domain,
+                    [quantC.shape[0] - 1],
+                    zero_mean_flags=zero_mean_flags,
+                )
+                safe_mean = block_means.reshape(1, -1)
                 safe_scale = block_scales.reshape(1, -1).clamp(min=1e-6)
-                total_ans_bits = _laplace_bits_with_tail_clip(quantC[1:], safe_scale).sum()
+                total_ans_bits = _laplace_bits_with_tail_clip(
+                    symbol_domain,
+                    safe_scale,
+                    block_mean=safe_mean,
+                ).sum()
 
         if PROFILE_TIME:
             torch.cuda.synchronize()

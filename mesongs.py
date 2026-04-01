@@ -988,6 +988,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             dataset.n_block,
             bit_config=bit_config,
             quant_type=dataset.quant_type,
+            vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
             encode=getattr(dataset, 'encode', 'deflate'),
             ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
         )
@@ -1007,6 +1008,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             dataset.n_block,
             bit_config=bit_config,
             quant_type=dataset.quant_type,
+            vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
             encode=getattr(dataset, 'encode', 'deflate'),
             ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
         )
@@ -1205,9 +1207,9 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         # ==========================================
         loss = loss_D
         if dataset.lambda_sparsity > 0:
-            loss = loss + dataset.lambda_sparsity * loss_S
+            loss = (1-dataset.lambda_sparsity) * loss + dataset.lambda_sparsity * loss_S
         if uses_rate_model and dataset.lambda_rate > 0:
-            loss = loss + dataset.lambda_rate * loss_R
+            loss = (1-dataset.lambda_rate) * loss + dataset.lambda_rate * loss_R
         if PROFILE_TIME:
             t_loss_end.record()
 

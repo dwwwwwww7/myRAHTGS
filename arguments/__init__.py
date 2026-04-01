@@ -78,6 +78,7 @@ class ModelParams(ParamGroup):
         self.num_bits=8
         self.lambda_sparsity=5e-7  # PCS25的稀疏性损失权重
         self.quant_type="lsq"  # 量化器类型: "lsq" 或 "vanilla"
+        self.vanilla_withzeropoint=True  # VanillaQuan 是否启用 affine zero_point
         self.encode="deflate" # 熵编码方式: "deflate"、"ans" 或 "laplace"
         self.lambda_rate=0.001  # 使用ANS熵编码时的R权重
         self.rate_grad_diag=False

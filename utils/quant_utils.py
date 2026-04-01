@@ -32,7 +32,7 @@ def _build_block_index_tensors(split, device):
     return split_tensor, block_ids, local_ids
 
 
-def _laplace_cdf(x, scale):
+def _laplace_cdf(x, scale, mean=None):
     """Numerically stable Laplace CDF.
 
     Uses exp(-|x|/scale) in both branches to avoid the classic
@@ -41,6 +41,8 @@ def _laplace_cdf(x, scale):
     ``0 * Inf = NaN``.  Using ``exp(-|x|/scale)`` (exponent always ≤ 0)
     guarantees no overflow while remaining mathematically equivalent.
     """
+    if mean is not None:
+        x = x - mean
     safe_scale = scale.clamp(min=1e-6)
     abs_x = x.abs()
     exp_term = torch.exp(-abs_x / safe_scale)
@@ -49,7 +51,48 @@ def _laplace_cdf(x, scale):
     return torch.where(x >= 0, 1.0 - 0.5 * exp_term, 0.5 * exp_term)
 
 
-def _estimate_zero_mean_laplace_bits(symbols, split_tensor):
+def _get_quantizer_zero_point_value(qa):
+    zero_point = getattr(qa, "zero_point", None)
+    if zero_point is None:
+        return 0.0
+    if torch.is_tensor(zero_point):
+        if zero_point.numel() == 0:
+            return 0.0
+        return float(zero_point.detach().reshape(-1)[0].item())
+    return float(zero_point)
+
+
+def quantizer_uses_zero_point(qa):
+    return bool(getattr(qa, "withzeropoint", False))
+
+
+def quantizer_uses_zero_mean_laplace(qa):
+    if quantizer_uses_zero_point(qa):
+        return False
+    return float(getattr(qa, "thd_neg", 0.0)) < 0.0 < float(getattr(qa, "thd_pos", 0.0))
+
+
+def build_laplace_zero_mean_mask(qas, n_dims, n_blocks, device):
+    flat_qas = list(qas)
+    expected_qas = n_dims * n_blocks
+    if len(flat_qas) != expected_qas:
+        raise ValueError(f"Expected {expected_qas} quantizers, got {len(flat_qas)}")
+    zero_mean_flags = [quantizer_uses_zero_mean_laplace(qa) for qa in flat_qas]
+    return torch.tensor(zero_mean_flags, device=device, dtype=torch.bool).view(n_dims, n_blocks, 1)
+
+
+def _reshape_zero_mean_mask(zero_mean_mask, n_dims, n_blocks, device):
+    if zero_mean_mask is None:
+        return None
+    zero_mean_mask = torch.as_tensor(zero_mean_mask, device=device, dtype=torch.bool)
+    if zero_mean_mask.numel() != n_dims * n_blocks:
+        raise ValueError(
+            f"Expected {n_dims * n_blocks} zero-mean flags, got {int(zero_mean_mask.numel())}"
+        )
+    return zero_mean_mask.view(n_dims, n_blocks, 1)
+
+
+def _estimate_laplace_block_params_from_packed(symbols, split_tensor, zero_mean_mask=None):
     block_lengths = split_tensor.to(dtype=symbols.dtype).view(1, -1, 1)
     max_block_len = symbols.shape[-1]
     valid_mask = (
@@ -59,36 +102,54 @@ def _estimate_zero_mean_laplace_bits(symbols, split_tensor):
     )
     valid_mask_f = valid_mask.to(dtype=symbols.dtype)
 
-    # Zero-mean Laplace MLE: b = E[|x|], detached.
-    # raw_scale: 仅做数值安全下界（1e-6），供压缩路径使用，不影响实际分布。
-    # train_scale: 训练专用，加 0.01 下界防止分布极尖导致梯度爆炸。
+    empirical_mean = (
+        (symbols.detach() * valid_mask_f).sum(dim=-1)
+        / block_lengths.squeeze(-1).clamp(min=1.0)
+    ).unsqueeze(-1)
+    if zero_mean_mask is None:
+        block_mean = empirical_mean
+    else:
+        block_mean = torch.where(zero_mean_mask, torch.zeros_like(empirical_mean), empirical_mean)
+
     raw_scale = (
-        (symbols.detach().abs() * valid_mask_f).sum(dim=-1)
+        ((symbols.detach() - block_mean).abs() * valid_mask_f).sum(dim=-1)
         / block_lengths.squeeze(-1).clamp(min=1.0)
     ).clamp(min=1e-6)
+    return block_mean.squeeze(-1), raw_scale
 
-    # 【保护1（仅训练）】scale 下界 0.01：只用于 bits 估计，不返回给压缩路径
+
+def _estimate_laplace_bits(symbols, split_tensor, zero_mean_mask=None):
+    max_block_len = symbols.shape[-1]
+    valid_mask = (
+        torch.arange(max_block_len, device=symbols.device, dtype=torch.long)
+        .view(1, 1, -1)
+        < split_tensor.view(1, -1, 1)
+    )
+    valid_mask_f = valid_mask.to(dtype=symbols.dtype)
+
+    block_mean, raw_scale = _estimate_laplace_block_params_from_packed(
+        symbols,
+        split_tensor,
+        zero_mean_mask=zero_mean_mask,
+    )
+
+    block_mean_expanded = block_mean.unsqueeze(-1)
     train_scale = raw_scale.clamp(min=0.01).unsqueeze(-1)  # [n_ch, n_blocks, 1]
 
-    # 直接使用符号计算 CDF。由于 _laplace_cdf 已使用 exp(-|x|) 不会溢出，
-    # 我们可以安全地计算真实概率，不会产生 NaN。
-    upper = _laplace_cdf(symbols + 0.5, train_scale)
-    lower = _laplace_cdf(symbols - 0.5, train_scale)
+    upper = _laplace_cdf(symbols + 0.5, train_scale, mean=block_mean_expanded)
+    lower = _laplace_cdf(symbols - 0.5, train_scale, mean=block_mean_expanded)
 
-    # 【保护2】likelihood 下界 1e-9：最大单元素罚项 -log2(1e-9) ≈ 29.9 bits
-    # 既防止 log2(0) 产生 NaN，又保留了足够的 bits 空间评估长尾（如 x=100）。
     probs = (upper - lower).clamp(min=1e-9)
     per_element_bits = -torch.log2(probs)
     total_bits = (per_element_bits * valid_mask_f).sum()
-    # 返回原始 MLE scale（无 0.01 截断），供 estimate_zero_mean_laplace_block_scales 复用
-    return total_bits, raw_scale
+    return total_bits, block_mean, raw_scale
 
 
-def _laplace_bits_with_tail_clip(quantized_symbols, block_scale, sigma=3.0):
+def _laplace_bits_with_tail_clip(quantized_symbols, block_scale, block_mean=None, sigma=3.0):
     """Compute -log2(prob) per symbol using input-clamp + probability-floor.
 
     Numerics follow the same three-layer protection as
-    ``_estimate_zero_mean_laplace_bits``:
+    ``_estimate_laplace_bits``:
 
     1. ``block_scale`` lower-bounded at 0.01 (caller's responsibility, but
        also re-applied here for safety) → prevents an extremely peaked
@@ -116,20 +177,16 @@ def _laplace_bits_with_tail_clip(quantized_symbols, block_scale, sigma=3.0):
     # 【保护1】scale 下界 0.01
     safe_scale = block_scale.clamp(min=0.01)
 
-    upper = _laplace_cdf(quantized_symbols + 0.5, safe_scale)
-    lower = _laplace_cdf(quantized_symbols - 0.5, safe_scale)
+    mean = None if block_mean is None else block_mean
+    upper = _laplace_cdf(quantized_symbols + 0.5, safe_scale, mean=mean)
+    lower = _laplace_cdf(quantized_symbols - 0.5, safe_scale, mean=mean)
 
     # 【保护2】likelihood 下界 1e-9 (最大罚 ~29.9 bits)
     probs = (upper - lower).clamp(min=1e-9)
     return -torch.log2(probs)
 
 
-def estimate_zero_mean_laplace_block_scales(symbols, split):
-    """压缩路径专用：计算零均值 Laplace MLE 尺度参数 b = E[|x|]。
-
-    下界仅为数值安全的 1e-6，完全不受训练保护（0.01下界/3σ截断/1e-5 floor）影响，
-    保证熵编码 CDF 忠实反映真实数据分布，不影响实际压缩效率。
-    """
+def estimate_laplace_block_params(symbols, split, qas=None, zero_mean_flags=None):
     squeeze_output = False
     if symbols.dim() == 1:
         symbols = symbols.reshape(-1, 1)
@@ -143,20 +200,40 @@ def estimate_zero_mean_laplace_block_scales(symbols, split):
     packed = xt.new_zeros((symbols.shape[1], len(split), max_block_len))
     packed[:, block_ids, local_ids] = xt
 
-    # 独立计算 MLE scale，不经过任何训练保护逻辑
-    block_lengths = split_tensor.to(dtype=symbols.dtype).view(1, -1, 1)
-    valid_mask_f = (
-        torch.arange(max_block_len, device=symbols.device, dtype=torch.long)
-        .view(1, 1, -1)
-        < split_tensor.view(1, -1, 1)
-    ).to(dtype=symbols.dtype)
-    block_scales = (
-        (packed.detach().abs() * valid_mask_f).sum(dim=-1)
-        / block_lengths.squeeze(-1).clamp(min=1.0)
-    ).clamp(min=1e-6)  # 仅数值安全，不影响分布形状
+    zero_mean_mask = None
+    if qas is not None:
+        zero_mean_mask = build_laplace_zero_mean_mask(
+            qas,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+        )
+    elif zero_mean_flags is not None:
+        zero_mean_mask = _reshape_zero_mean_mask(
+            zero_mean_flags,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+        )
+
+    block_means, block_scales = _estimate_laplace_block_params_from_packed(
+        packed,
+        split_tensor,
+        zero_mean_mask=zero_mean_mask,
+    )
 
     if squeeze_output:
-        return block_scales.reshape(-1)
+        return block_means.reshape(-1), block_scales.reshape(-1)
+    return block_means, block_scales
+
+
+def estimate_zero_mean_laplace_block_scales(symbols, split):
+    zero_mean_flags = torch.ones((symbols.shape[1] if symbols.dim() == 2 else 1, len(split)), dtype=torch.bool)
+    _, block_scales = estimate_laplace_block_params(
+        symbols,
+        split,
+        zero_mean_flags=zero_mean_flags,
+    )
     return block_scales
 
 
@@ -188,12 +265,18 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
     packed = xt.new_zeros((n_dims, n_blocks, max_block_len))
     packed[:, block_ids, local_ids] = xt
 
+    valid_mask = (
+        torch.arange(max_block_len, device=x.device, dtype=torch.long)
+        .view(1, 1, -1)
+        < split_tensor.view(1, n_blocks, 1)
+    )
+    valid_mask_f = valid_mask.to(dtype=x.dtype)
     abs_packed = packed.abs()
     block_lengths = split_tensor.to(dtype=x.dtype).view(1, n_blocks)
 
     first_qa = flat_qas[0]
     if hasattr(first_qa, "init_yet"):
-        block_abs_mean = abs_packed.sum(dim=-1) / block_lengths
+        block_abs_mean = (abs_packed * valid_mask_f).sum(dim=-1) / block_lengths
         for dim_idx in range(n_dims):
             base = dim_idx * n_blocks
             for block_idx in range(n_blocks):
@@ -204,21 +287,50 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
                         qa.s.data.fill_(init_scale.item())
                     qa.init_yet = True
     elif hasattr(first_qa, "scale"):
-        block_abs_max = abs_packed.amax(dim=-1)
-        block_max = packed.amax(dim=-1)
+        neg_fill = torch.full_like(packed, torch.finfo(packed.dtype).min)
+        pos_fill = torch.full_like(packed, torch.finfo(packed.dtype).max)
+        block_abs_max = torch.where(valid_mask, abs_packed, abs_packed.new_zeros(1)).amax(dim=-1)
+        block_max = torch.where(valid_mask, packed, neg_fill).amax(dim=-1)
+        block_min = torch.where(valid_mask, packed, pos_fill).amin(dim=-1)
         for dim_idx in range(n_dims):
             base = dim_idx * n_blocks
             for block_idx in range(n_blocks):
                 qa = flat_qas[base + block_idx]
                 with torch.no_grad():
-                    if qa.all_positive:
+                    if getattr(qa, "withzeropoint", False):
+                        current_max = block_max[dim_idx, block_idx].detach()
+                        current_min = block_min[dim_idx, block_idx].detach()
+                        if qa.max_val.nelement() == 0 or qa.max_val.data < current_max.data:
+                            qa.max_val.data = current_max.data
+                        if qa.min_val.nelement() == 0 or qa.min_val.data > current_min.data:
+                            qa.min_val.data = current_min.data
+                        if qa.all_positive:
+                            qa.max_val.clamp_(min=0)
+                            qa.min_val.clamp_(max=0)
+                        qa.max_val.data = torch.maximum(
+                            qa.max_val.data,
+                            qa.min_val.data + qa.max_val.new_tensor(1e-8),
+                        )
+                        scale, zero_point = calcScaleZeroPoint(
+                            qa.min_val,
+                            qa.max_val,
+                            qa.bit,
+                            qmin=float(qa.thd_neg),
+                            qmax=float(qa.thd_pos),
+                        )
+                        qa.scale = torch.clamp(scale, min=1e-8)
+                        qa.zero_point.data.copy_(
+                            zero_point.to(device=qa.zero_point.device, dtype=qa.zero_point.dtype).reshape_as(qa.zero_point)
+                        )
+                    elif qa.all_positive:
                         current_max = block_max[dim_idx, block_idx].detach()
                         if qa.max_val.nelement() == 0 or qa.max_val.data < current_max.data:
                             qa.max_val.data = current_max.data
-                        qa.max_val.clamp_(min=0)
-                        qa.min_val.data = torch.zeros_like(qa.max_val.data)
+                        qa.max_val.clamp_(min=1e-8)
+                        qa.min_val.data.zero_()
                         qmax = max(float(qa.thd_pos), 1.0)
                         qa.scale = torch.clamp(qa.max_val / qmax, min=1e-8)
+                        qa.zero_point.data.zero_()
                     else:
                         current_abs_max = block_abs_max[dim_idx, block_idx].detach()
                         if qa.max_val.nelement() == 0 or qa.max_val.data < current_abs_max.data:
@@ -227,11 +339,12 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
                         qa.min_val.data = -qa.max_val.data
                         qmax = max(float(qa.thd_pos), 1.0)
                         qa.scale = torch.clamp(qa.max_val / qmax, min=1e-8)
-                    qa.zero_point.data.zero_()
+                        qa.zero_point.data.zero_()
     else:
         raise ValueError(f"Unsupported quantizer type: {type(first_qa)}")
 
     scale_entries = []
+    zero_entries = []
     neg_entries = []
     pos_entries = []
     for qa in flat_qas:
@@ -239,10 +352,15 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
             scale_entries.append(qa.s.reshape(1))
         else:
             scale_entries.append(qa.scale.reshape(1))
+        if hasattr(qa, "zero_point"):
+            zero_entries.append(qa.zero_point.reshape(1).to(dtype=scale_entries[-1].dtype))
+        else:
+            zero_entries.append(scale_entries[-1].new_zeros(1))
         neg_entries.append(scale_entries[-1].new_tensor(float(qa.thd_neg)))
         pos_entries.append(scale_entries[-1].new_tensor(float(qa.thd_pos)))
 
     scales = torch.stack(scale_entries, dim=0).view(n_dims, n_blocks, 1)
+    zero_points = torch.stack(zero_entries, dim=0).view(n_dims, n_blocks, 1)
     thd_neg = torch.stack(neg_entries, dim=0).view(n_dims, n_blocks, 1)
     thd_pos = torch.stack(pos_entries, dim=0).view(n_dims, n_blocks, 1)
 
@@ -250,9 +368,16 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
         grad_factors = 1.0 / torch.sqrt(thd_pos.clamp(min=1.0) * block_lengths.view(1, n_blocks, 1))
         scales = grad_scale(scales, grad_factors)
 
-    x_clamped = torch.clamp(packed / scales, thd_neg, thd_pos)
+    if getattr(first_qa, "withzeropoint", False):
+        x_norm = zero_points + (packed / scales)
+    else:
+        x_norm = packed / scales
+    x_clamped = torch.clamp(x_norm, thd_neg, thd_pos)
     x_q = round_pass(x_clamped)
-    dequantized = x_q * scales
+    if getattr(first_qa, "withzeropoint", False):
+        dequantized = (x_q - zero_points) * scales
+    else:
+        dequantized = x_q * scales
 
     flat_clamped = x_clamped[:, block_ids, local_ids]
     flat_symbols = x_q[:, block_ids, local_ids].transpose(0, 1).contiguous()
@@ -263,7 +388,17 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
     encode_mode = getattr(first_qa, "encode", "deflate").lower()
     needs_clamped_cache = any(getattr(qa, "encode", "deflate").lower() == "ans" for qa in flat_qas)
     if return_ans_bits and encode_mode == "laplace":
-        ans_bits, entropy_scales = _estimate_zero_mean_laplace_bits(x_q, split_tensor)
+        zero_mean_mask = build_laplace_zero_mean_mask(
+            flat_qas,
+            n_dims=n_dims,
+            n_blocks=n_blocks,
+            device=x_q.device,
+        )
+        ans_bits, entropy_means, entropy_scales = _estimate_laplace_bits(
+            x_q,
+            split_tensor,
+            zero_mean_mask=zero_mean_mask,
+        )
     if return_ans_bits or needs_clamped_cache:
         for dim_idx in range(n_dims):
             base = dim_idx * n_blocks
@@ -485,10 +620,13 @@ class LsqQuan(Quantizer):
         return self.s, torch.tensor(0.0, device=self.s.device), self.thd_neg < 0
 
 
-def calcScaleZeroPoint(min_val, max_val, num_bits=8):
-    qmin = 0.
-    qmax = 2. ** num_bits - 1.
-    scale = (max_val - min_val) / (qmax - qmin)
+def calcScaleZeroPoint(min_val, max_val, num_bits=8, qmin=None, qmax=None):
+    if qmin is None:
+        qmin = 0.0
+    if qmax is None:
+        qmax = 2. ** num_bits - 1.
+    scale = (max_val - min_val) / max(float(qmax - qmin), 1.0)
+    scale = torch.clamp(scale, min=1e-8)
 
     zero_point = qmax - max_val / scale
 
@@ -504,10 +642,20 @@ def calcScaleZeroPoint(min_val, max_val, num_bits=8):
 
 
 class VanillaQuan(Quantizer):
-    def __init__(self, bit, all_positive=True, symmetric=False, encode="deflate", channels=1, shared_eb=None):
+    def __init__(
+        self,
+        bit,
+        all_positive=True,
+        symmetric=False,
+        withzeropoint=None,
+        encode="deflate",
+        channels=1,
+        shared_eb=None,
+    ):
         super().__init__(bit)
         self.all_positive = all_positive
         self.symmetric = symmetric
+        self.withzeropoint = all_positive if withzeropoint is None else bool(withzeropoint)
         
         if all_positive:
             assert not symmetric, "Positive quantization cannot be symmetric"
@@ -540,29 +688,39 @@ class VanillaQuan(Quantizer):
         self.last_clamped = None
         
     def update(self, x):
-        # Old affine min-max quantization kept for reference. It uses a
-        # block-specific zero_point and often creates multi-peak symbol
-        # distributions after grouping multiple blocks together.
-        #
-        # if self.max_val.nelement() == 0 or self.max_val.data < x.max().data:
-        #     self.max_val.data = x.max().data
-        # self.max_val.clamp_(min=0)
-        #
-        # if self.min_val.nelement() == 0 or self.min_val.data > x.min().data:
-        #     self.min_val.data = x.min().data
-        # self.min_val.clamp_(max=0)
-        #
-        # self.scale, self.zero_point = calcScaleZeroPoint(self.min_val, self.max_val, self.bit)
+        if self.withzeropoint:
+            current_max = x.detach().max()
+            current_min = x.detach().min()
+            if self.max_val.nelement() == 0 or self.max_val.data < current_max.data:
+                self.max_val.data = current_max.data
+            if self.min_val.nelement() == 0 or self.min_val.data > current_min.data:
+                self.min_val.data = current_min.data
+            if self.all_positive:
+                self.max_val.clamp_(min=0)
+                self.min_val.clamp_(max=0)
+            self.max_val.data = torch.maximum(
+                self.max_val.data,
+                self.min_val.data + self.max_val.new_tensor(1e-8),
+            )
+            scale, zero_point = calcScaleZeroPoint(
+                self.min_val,
+                self.max_val,
+                self.bit,
+                qmin=float(self.thd_neg),
+                qmax=float(self.thd_pos),
+            )
+            self.scale = torch.clamp(scale, min=1e-8)
+            self.zero_point.data.copy_(
+                zero_point.to(device=self.zero_point.device, dtype=self.zero_point.dtype).reshape_as(self.zero_point)
+            )
+            return
 
-        # Vanilla quantization now uses a fixed zero-centered symbol
-        # definition. The old affine min-max path is intentionally kept
-        # commented above for reference.
         if self.all_positive:
             current_max = x.detach().max()
             if self.max_val.nelement() == 0 or self.max_val.data < current_max.data:
                 self.max_val.data = current_max.data
-            self.max_val.clamp_(min=0)
-            self.min_val.data = torch.zeros_like(self.max_val.data)
+            self.max_val.clamp_(min=1e-8)
+            self.min_val.data.zero_()
             qmax = max(float(self.thd_pos), 1.0)
             self.scale = torch.clamp(self.max_val / qmax, min=1e-8)
             self.zero_point.data.zero_()
@@ -580,10 +738,10 @@ class VanillaQuan(Quantizer):
     def forward(self, x):
         self.update(x)
         
-        # 1. 归一化与截断
-        # Old affine path kept for reference:
-        # x_norm = self.zero_point + (x / self.scale)
-        x_norm = x / self.scale
+        if self.withzeropoint:
+            x_norm = self.zero_point + (x / self.scale)
+        else:
+            x_norm = x / self.scale
         x_clamped = torch.clamp(x_norm, self.thd_neg, self.thd_pos)
         
         # 2. 🌟 新增：缓存 clamped 值供外部批处理
@@ -594,9 +752,10 @@ class VanillaQuan(Quantizer):
             
         # 3. 离散化与反量化
         x_q = round_pass(x_clamped)
-        # Old affine path kept for reference:
-        # x_q = self.scale * (x_q - self.zero_point)
-        x_q = self.scale * x_q
+        if self.withzeropoint:
+            x_q = self.scale * (x_q - self.zero_point)
+        else:
+            x_q = self.scale * x_q
         return x_q
 
     def get_quant_params(self):

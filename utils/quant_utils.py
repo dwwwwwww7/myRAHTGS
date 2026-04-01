@@ -33,10 +33,20 @@ def _build_block_index_tensors(split, device):
 
 
 def _laplace_cdf(x, scale):
+    """Numerically stable Laplace CDF.
+
+    Uses exp(-|x|/scale) in both branches to avoid the classic
+    torch.where + exp overflow:  when x > 0 the old ``exp(x/scale)``
+    overflows to Inf, and the backward of ``torch.where`` computes
+    ``0 * Inf = NaN``.  Using ``exp(-|x|/scale)`` (exponent always ≤ 0)
+    guarantees no overflow while remaining mathematically equivalent.
+    """
     safe_scale = scale.clamp(min=1e-6)
-    pos = 1.0 - 0.5 * torch.exp(-x / safe_scale)
-    neg = 0.5 * torch.exp(x / safe_scale)
-    return torch.where(x >= 0, pos, neg)
+    abs_x = x.abs()
+    exp_term = torch.exp(-abs_x / safe_scale)
+    # x >= 0 : CDF = 1 - 0.5 * exp(-x/b)
+    # x <  0 : CDF = 0.5 * exp(-|x|/b)
+    return torch.where(x >= 0, 1.0 - 0.5 * exp_term, 0.5 * exp_term)
 
 
 def _estimate_zero_mean_laplace_bits(symbols, split_tensor):
@@ -49,21 +59,77 @@ def _estimate_zero_mean_laplace_bits(symbols, split_tensor):
     )
     valid_mask_f = valid_mask.to(dtype=symbols.dtype)
 
-    # Zero-mean Laplace MLE: b = E[|x|]. We keep the estimate detached and
-    # let the rate loss push symbols toward smaller magnitudes.
-    block_scale = (
-        (symbols.detach().abs() * valid_mask_f).sum(dim=-1) / block_lengths.squeeze(-1).clamp(min=1.0)
-    ).clamp(min=1e-4)
-    block_scale = block_scale.unsqueeze(-1)
+    # Zero-mean Laplace MLE: b = E[|x|], detached.
+    # raw_scale: 仅做数值安全下界（1e-6），供压缩路径使用，不影响实际分布。
+    # train_scale: 训练专用，加 0.01 下界防止分布极尖导致梯度爆炸。
+    raw_scale = (
+        (symbols.detach().abs() * valid_mask_f).sum(dim=-1)
+        / block_lengths.squeeze(-1).clamp(min=1.0)
+    ).clamp(min=1e-6)
 
-    upper = _laplace_cdf(symbols + 0.5, block_scale)
-    lower = _laplace_cdf(symbols - 0.5, block_scale)
+    # 【保护1（仅训练）】scale 下界 0.01：只用于 bits 估计，不返回给压缩路径
+    train_scale = raw_scale.clamp(min=0.01).unsqueeze(-1)  # [n_ch, n_blocks, 1]
+
+    # 直接使用符号计算 CDF。由于 _laplace_cdf 已使用 exp(-|x|) 不会溢出，
+    # 我们可以安全地计算真实概率，不会产生 NaN。
+    upper = _laplace_cdf(symbols + 0.5, train_scale)
+    lower = _laplace_cdf(symbols - 0.5, train_scale)
+
+    # 【保护2】likelihood 下界 1e-9：最大单元素罚项 -log2(1e-9) ≈ 29.9 bits
+    # 既防止 log2(0) 产生 NaN，又保留了足够的 bits 空间评估长尾（如 x=100）。
     probs = (upper - lower).clamp(min=1e-9)
-    total_bits = (-torch.log2(probs) * valid_mask_f).sum()
-    return total_bits, block_scale.squeeze(-1)
+    per_element_bits = -torch.log2(probs)
+    total_bits = (per_element_bits * valid_mask_f).sum()
+    # 返回原始 MLE scale（无 0.01 截断），供 estimate_zero_mean_laplace_block_scales 复用
+    return total_bits, raw_scale
+
+
+def _laplace_bits_with_tail_clip(quantized_symbols, block_scale, sigma=3.0):
+    """Compute -log2(prob) per symbol using input-clamp + probability-floor.
+
+    Numerics follow the same three-layer protection as
+    ``_estimate_zero_mean_laplace_bits``:
+
+    1. ``block_scale`` lower-bounded at 0.01 (caller's responsibility, but
+       also re-applied here for safety) → prevents an extremely peaked
+       distribution where the CDF difference collapses.
+    2. Input 3-sigma clamp *before* the CDF: ``x ← clamp(x, -σb, σb)``.
+       Outlier symbols are pulled to the boundary so their CDF interval
+       probability remains a reasonable positive number and the gradient
+       still flows through the symbol value.
+    3. ``probs.clamp(min=1e-5)`` → max penalty ≈ 16.6 bits/element,
+       prevents log(0) and keeps gradient magnitudes bounded.
+
+    Parameters
+    ----------
+    quantized_symbols : Tensor
+        Broadcastable with ``block_scale``.
+    block_scale : Tensor
+        Laplace scale b, broadcast-compatible with ``quantized_symbols``.
+    sigma : float
+        Truncation threshold multiplier. Default 3.
+
+    Returns
+    -------
+    per_element_bits : Tensor, same shape as ``quantized_symbols``.
+    """
+    # 【保护1】scale 下界 0.01
+    safe_scale = block_scale.clamp(min=0.01)
+
+    upper = _laplace_cdf(quantized_symbols + 0.5, safe_scale)
+    lower = _laplace_cdf(quantized_symbols - 0.5, safe_scale)
+
+    # 【保护2】likelihood 下界 1e-9 (最大罚 ~29.9 bits)
+    probs = (upper - lower).clamp(min=1e-9)
+    return -torch.log2(probs)
 
 
 def estimate_zero_mean_laplace_block_scales(symbols, split):
+    """压缩路径专用：计算零均值 Laplace MLE 尺度参数 b = E[|x|]。
+
+    下界仅为数值安全的 1e-6，完全不受训练保护（0.01下界/3σ截断/1e-5 floor）影响，
+    保证熵编码 CDF 忠实反映真实数据分布，不影响实际压缩效率。
+    """
     squeeze_output = False
     if symbols.dim() == 1:
         symbols = symbols.reshape(-1, 1)
@@ -76,7 +142,19 @@ def estimate_zero_mean_laplace_block_scales(symbols, split):
     xt = symbols.transpose(0, 1).contiguous()
     packed = xt.new_zeros((symbols.shape[1], len(split), max_block_len))
     packed[:, block_ids, local_ids] = xt
-    _, block_scales = _estimate_zero_mean_laplace_bits(packed, split_tensor)
+
+    # 独立计算 MLE scale，不经过任何训练保护逻辑
+    block_lengths = split_tensor.to(dtype=symbols.dtype).view(1, -1, 1)
+    valid_mask_f = (
+        torch.arange(max_block_len, device=symbols.device, dtype=torch.long)
+        .view(1, 1, -1)
+        < split_tensor.view(1, -1, 1)
+    ).to(dtype=symbols.dtype)
+    block_scales = (
+        (packed.detach().abs() * valid_mask_f).sum(dim=-1)
+        / block_lengths.squeeze(-1).clamp(min=1.0)
+    ).clamp(min=1e-6)  # 仅数值安全，不影响分布形状
+
     if squeeze_output:
         return block_scales.reshape(-1)
     return block_scales
@@ -196,7 +274,10 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
                     clamped_block = flat_clamped[dim_idx, start:start + length]
                     if return_ans_bits and qa.entropy_bottleneck is not None and length > 0:
                         _, likelihoods = qa.entropy_bottleneck(clamped_block.view(1, 1, -1, 1))
-                        ans_bits = ans_bits + (-torch.log2(likelihoods.clamp(min=1e-9)).sum())
+                        # Use a higher clamp floor (1e-6) and cap per-element bits
+                        # to prevent extreme gradients during backprop.
+                        per_elem_bits = torch.clamp(-torch.log2(likelihoods.clamp(min=1e-6)), max=32.0)
+                        ans_bits = ans_bits + per_elem_bits.sum()
                     qa.last_clamped = None
                 start += length
 

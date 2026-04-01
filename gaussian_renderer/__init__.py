@@ -463,21 +463,12 @@ def ft_render(
                 else:
                     x_clamped = torch.clamp(quantC[1:] / pc.qa.scale, pc.qa.thd_neg, pc.qa.thd_pos)
                 _, likelihoods = pc.qa.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
-                total_ans_bits = -torch.log2(likelihoods.clamp(min=1e-9)).sum()
+                total_ans_bits = torch.clamp(-torch.log2(likelihoods.clamp(min=1e-6)), max=32.0).sum()
             elif encode_mode == "laplace":
+                from utils.quant_utils import _laplace_bits_with_tail_clip
                 block_scales = estimate_zero_mean_laplace_block_scales(quantC[1:], [quantC.shape[0] - 1])
                 safe_scale = block_scales.reshape(1, -1).clamp(min=1e-6)
-                upper = torch.where(
-                    quantC[1:] + 0.5 >= 0,
-                    1.0 - 0.5 * torch.exp(-(quantC[1:] + 0.5) / safe_scale),
-                    0.5 * torch.exp((quantC[1:] + 0.5) / safe_scale),
-                )
-                lower = torch.where(
-                    quantC[1:] - 0.5 >= 0,
-                    1.0 - 0.5 * torch.exp(-(quantC[1:] - 0.5) / safe_scale),
-                    0.5 * torch.exp((quantC[1:] - 0.5) / safe_scale),
-                )
-                total_ans_bits = -torch.log2((upper - lower).clamp(min=1e-9)).sum()
+                total_ans_bits = _laplace_bits_with_tail_clip(quantC[1:], safe_scale).sum()
 
         if PROFILE_TIME:
             torch.cuda.synchronize()

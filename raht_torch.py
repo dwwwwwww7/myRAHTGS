@@ -891,16 +891,6 @@ def get_RAHT_tree(inV, depth):
     return res    
     
     
-    
-
-
-
-
-
-
-
-
-
         
 def inv_haar3D(inV, inCT, depth):
     '''

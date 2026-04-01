@@ -14,6 +14,7 @@ import os
 import sys
 import uuid
 from argparse import ArgumentParser, Namespace
+from pathlib import Path
 from random import randint
 
 import torch
@@ -21,7 +22,7 @@ import torchvision
 from tqdm import tqdm
 
 from arguments import ModelParams, OptimizationParams, PipelineParams
-from gaussian_renderer import ft_render, render
+from gaussian_renderer import PROFILE_TIME, ft_render, render
 from lpipsPyTorch import lpips
 from scene import GaussianModel, Scene
 from utils.general_utils import safe_state
@@ -35,6 +36,129 @@ try:
     TENSORBOARD_FOUND = True
 except ImportError:
     TENSORBOARD_FOUND = False
+
+
+def get_time_csv_path(csv_path):
+    path = Path(csv_path)
+    return str(path.with_name(path.stem + "_time" + path.suffix))
+
+
+def get_time_detail_csv_path(csv_path):
+    path = Path(csv_path)
+    return str(path.with_name(path.stem + "_time_detail" + path.suffix))
+
+
+def get_rate_diag_param_groups(gaussians):
+    groups = [
+        ("opacity", [gaussians._opacity]),
+        ("f_dc", [gaussians._features_dc]),
+        ("f_rest", [gaussians._features_rest]),
+        ("scaling", [gaussians._scaling]),
+        ("rotation", [gaussians._rotation]),
+    ]
+    quantizer_params = gaussians.get_quantizer_trainable_params() if hasattr(gaussians, "get_quantizer_trainable_params") else []
+    if quantizer_params:
+        groups.append(("quantizers", quantizer_params))
+    if hasattr(gaussians, "ans_entropy_bottlenecks") and len(gaussians.ans_entropy_bottlenecks) > 0:
+        ans_main_params = [
+            param for name, param in gaussians.ans_entropy_bottlenecks.named_parameters()
+            if not name.endswith("quantiles")
+        ]
+        if ans_main_params:
+            groups.append(("ans_models", ans_main_params))
+    return groups
+
+
+def run_rate_gradient_diagnostic(
+    iteration,
+    loss_R,
+    current_total_bits,
+    num_points,
+    viewpoint_cam,
+    gaussians,
+    pipe,
+    background,
+    dataset,
+):
+    if not isinstance(loss_R, torch.Tensor) or not loss_R.requires_grad:
+        return
+
+    group_specs = get_rate_diag_param_groups(gaussians)
+    flat_params = []
+    flat_meta = []
+    for group_name, params in group_specs:
+        for param in params:
+            if param.requires_grad:
+                flat_params.append(param)
+                flat_meta.append(group_name)
+
+    if not flat_params:
+        return
+
+    grads = torch.autograd.grad(
+        loss_R,
+        flat_params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+
+    group_norm_sq = {}
+    originals = []
+    for param, grad, group_name in zip(flat_params, grads, flat_meta):
+        if grad is None:
+            continue
+        group_norm_sq[group_name] = group_norm_sq.get(group_name, 0.0) + float((grad.detach() ** 2).sum().item())
+        originals.append((param, param.detach().clone(), grad.detach()))
+
+    grad_norms = {
+        group_name: value ** 0.5
+        for group_name, value in group_norm_sq.items()
+    }
+
+    step_size = float(getattr(dataset, "rate_grad_diag_step", 1e-4))
+    bits_before = float(current_total_bits.detach().item()) if isinstance(current_total_bits, torch.Tensor) else float(current_total_bits)
+    bits_after = bits_before
+
+    try:
+        with torch.no_grad():
+            for param, _, grad in originals:
+                param.add_(grad, alpha=-step_size)
+
+            diag_render_pkg = ft_render(
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                background,
+                training=True,
+                raht=dataset.raht,
+                debug=False,
+                per_channel_quant=dataset.per_channel_quant,
+                per_block_quant=dataset.per_block_quant,
+                clamp_color=dataset.clamp_color,
+            )
+            diag_total_bits = diag_render_pkg.get("total_bits", None)
+            if isinstance(diag_total_bits, torch.Tensor):
+                bits_after = float(diag_total_bits.detach().item())
+    finally:
+        with torch.no_grad():
+            for param, original, _ in originals:
+                param.copy_(original)
+
+    bpp_before = bits_before / max(int(num_points), 1)
+    bpp_after = bits_after / max(int(num_points), 1)
+    grad_summary = ", ".join(
+        f"{name}={grad_norms.get(name, 0.0):.3e}"
+        for name, _ in group_specs
+    )
+    print(
+        f"[RATE-DIAG][ITER {iteration}] grad_norms: {grad_summary}"
+    )
+    print(
+        f"[RATE-DIAG][ITER {iteration}] virtual_step={step_size:.1e} | "
+        f"bits: {bits_before:.2f} -> {bits_after:.2f} "
+        f"(delta={bits_after - bits_before:+.2f}) | "
+        f"bpp: {bpp_before:.6f} -> {bpp_after:.6f}"
+    )
 
 def cal_sens(
         gaussians,
@@ -865,7 +989,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             bit_config=bit_config,
             quant_type=dataset.quant_type,
             encode=getattr(dataset, 'encode', 'deflate'),
-            ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 4),
+            ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
         )
         print(f"  通道量化: 启用")
     elif dataset.per_block_quant:
@@ -884,7 +1008,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             bit_config=bit_config,
             quant_type=dataset.quant_type,
             encode=getattr(dataset, 'encode', 'deflate'),
-            ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 4),
+            ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
         )
     else:
         print(f"未知的量化模式")
@@ -950,17 +1074,38 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
     print(f"学习率缩放: {opt.finetune_lr_scale}")
     print(f"测试迭代: {testing_iterations}")
     print(f"稀疏性损失权重 (λ_s): {dataset.lambda_sparsity}")
+    print(f"码率损失权重 (λ_r): {dataset.lambda_rate}")
+    encode_mode = getattr(dataset, 'encode', 'deflate').lower()
+    uses_rate_model = encode_mode in ("ans", "laplace")
     if dataset.lambda_sparsity > 0:
         print(f"  启用稀疏性正则化，促进RAHT系数稀疏化")
+    if encode_mode == "ans" and dataset.lambda_rate > 0:
+        print(f"  启用ANS码率约束，直接优化量化块的熵估计")
+    if encode_mode == "laplace" and dataset.lambda_rate > 0:
+        print(f"  启用拉普拉斯码率约束，按块估计零均值分布尺度")
+    if getattr(dataset, 'rate_grad_diag', False):
+        print(
+            f"  启用loss_R梯度诊断: interval={int(getattr(dataset, 'rate_grad_diag_interval', 200))}, "
+            f"virtual_step={float(getattr(dataset, 'rate_grad_diag_step', 1e-4)):.1e}"
+        )
+    if uses_rate_model:
+        if dataset.lambda_rate > 0 and dataset.lambda_sparsity > 0:
+            print("  当前损失模式: hybrid (loss_D + λ_r * loss_R + λ_s * loss_S)")
+        elif dataset.lambda_rate > 0:
+            print("  当前损失模式: rate-only (loss_D + λ_r * loss_R)")
+        elif dataset.lambda_sparsity > 0:
+            print("  当前损失模式: sparsity-only (loss_D + λ_s * loss_S)")
+        else:
+            print("  当前损失模式: distortion-only (loss_D)")
     print("="*70 + "\n")
     
     gaussians.finetuning_setup(opt) #微调，需要固定位置，只对外观微调
 
     # ==========================================
-    # 初始化 ECSQ/ANS 的辅助优化器 (拟合 CDF 曲线)
+    # 初始化 ANS 的辅助优化器 (拟合 CDF 曲线)
     # ==========================================
     aux_optimizer = None
-    if getattr(dataset, 'encode', 'deflate').lower() == "ans" and hasattr(gaussians, 'ans_entropy_bottlenecks'):
+    if encode_mode == "ans" and hasattr(gaussians, 'ans_entropy_bottlenecks'):
         aux_quantiles = [eb.quantiles for eb in gaussians.ans_entropy_bottlenecks.values()]
         if aux_quantiles:
             aux_optimizer = torch.optim.Adam(aux_quantiles, lr=1e-3)
@@ -1004,8 +1149,14 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             per_block_quant=dataset.per_block_quant,
             clamp_color=dataset.clamp_color)
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        current_profile = render_pkg.get("profile") if PROFILE_TIME else None
 
         # Loss
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_loss_start = torch.cuda.Event(enable_timing=True)
+            t_loss_end = torch.cuda.Event(enable_timing=True)
+            t_loss_start.record()
         gt_image = viewpoint_cam.original_image.cuda()
         Ll1 = l1_loss(image, gt_image)
         
@@ -1047,24 +1198,61 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         
         # ==========================================
         # 组装最终 Loss
+        # λ_s 和 λ_r 直接控制两类约束强度：
+        #   λ_s > 0, λ_r = 0 -> sparsity-only
+        #   λ_s = 0, λ_r > 0 -> rate-only
+        #   λ_s > 0, λ_r > 0 -> hybrid
         # ==========================================
-        if dataset.encode.lower() == "ans":
-            #print(f"最终损失函数loss=loss = {(1.0 - dataset.lambda_rate):.1f} * {loss_D:.4f}+{dataset.lambda_rate:.1f} * {loss_R:.2f}")
-            #loss = (1.0 - dataset.lambda_rate) * loss_D+dataset.lambda_rate * loss_R
-            loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
-        else:
-            loss = (1.0 - dataset.lambda_sparsity) * loss_D + dataset.lambda_sparsity * loss_S
+        loss = loss_D
+        if dataset.lambda_sparsity > 0:
+            loss = loss + dataset.lambda_sparsity * loss_S
+        if uses_rate_model and dataset.lambda_rate > 0:
+            loss = loss + dataset.lambda_rate * loss_R
+        if PROFILE_TIME:
+            t_loss_end.record()
+
+        should_run_rate_diag = (
+            getattr(dataset, 'rate_grad_diag', False)
+            and uses_rate_model
+            and dataset.lambda_rate > 0
+            and iteration % max(int(getattr(dataset, 'rate_grad_diag_interval', 200)), 1) == 0
+            and "total_bits" in render_pkg
+        )
+        if should_run_rate_diag:
+            run_rate_gradient_diagnostic(
+                iteration,
+                loss_R,
+                render_pkg["total_bits"],
+                gaussians.get_xyz.shape[0],
+                viewpoint_cam,
+                gaussians,
+                pipe,
+                background,
+                dataset,
+            )
             
         # 清空梯度
         # if aux_optimizer is not None:
         #     aux_optimizer.zero_grad(set_to_none=True)
-            
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_main_backward_start = torch.cuda.Event(enable_timing=True)
+            t_main_backward_end = torch.cuda.Event(enable_timing=True)
+            t_main_backward_start.record()
         loss.backward()
+        if PROFILE_TIME:
+            t_main_backward_end.record()
 
         # ==========================================
         # ANS 辅助参数的反向传播
         # ==========================================
+        aux_backward_ms = 0.0
         if aux_optimizer is not None:
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_aux_backward_start = torch.cuda.Event(enable_timing=True)
+                t_aux_backward_end = torch.cuda.Event(enable_timing=True)
+                t_aux_backward_start.record()
             aux_optimizer.zero_grad(set_to_none=True)
             aux_loss = torch.tensor(0.0, device="cuda")
             for eb in gaussians.ans_entropy_bottlenecks.values():
@@ -1072,8 +1260,11 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             if isinstance(aux_loss, torch.Tensor) and aux_loss.requires_grad:
                 aux_loss.backward()
                 aux_optimizer.step()
+            if PROFILE_TIME:
+                t_aux_backward_end.record()
 
-        iter_end.record()
+        if PROFILE_TIME:
+            iter_end.record()
 
         with torch.no_grad():
             # Progress bar
@@ -1086,7 +1277,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 # 如果使用稀疏性损失，显示它
                 if dataset.lambda_sparsity > 0 and isinstance(loss_S, torch.Tensor):
                     postfix_dict["稀疏"] = f"{loss_S.item():.2e}"
-                if dataset.encode.lower() == "ans" and isinstance(loss_R, torch.Tensor):
+                if uses_rate_model and isinstance(loss_R, torch.Tensor):
                     postfix_dict["码率loss"] = f"{loss_R.item():.2e}"
                 progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
@@ -1109,19 +1300,23 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             # gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
 
             # Log and save
+            elapsed_ms = iter_start.elapsed_time(iter_end) if PROFILE_TIME else None
             cur_psnr, _, _ = training_report(
                 tb_writer, 
                 iteration, 
                 Ll1, 
                 loss, 
                 l1_loss, 
-                iter_start.elapsed_time(iter_end), 
+                elapsed_ms,
                 testing_iterations, 
                 scene, 
                 ft_render, 
                 pipe.scene_imp, 
                 dataset.csv_path, 
+                get_time_csv_path(dataset.csv_path),
+                get_time_detail_csv_path(dataset.csv_path),
                 dataset.model_path, 
+                current_profile,
                 (pipe, background, False, 1.0, None, 
                  dataset.raht, dataset.per_channel_quant, 
                  dataset.per_block_quant, False, True))
@@ -1150,10 +1345,57 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
  
             
             # Optimizer step
+            optimizer_step_ms = 0.0
             if iteration < opt.iterations:
+                if PROFILE_TIME:
+                    torch.cuda.synchronize()
+                    t_opt_start = torch.cuda.Event(enable_timing=True)
+                    t_opt_end = torch.cuda.Event(enable_timing=True)
+                    t_opt_start.record()
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians.update_learning_rate(iteration+30000)
+                if PROFILE_TIME:
+                    t_opt_end.record()
+                    torch.cuda.synchronize()
+                    optimizer_step_ms = t_opt_start.elapsed_time(t_opt_end)
+
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                detailed_profile = dict(current_profile or {})
+                detailed_profile["loss_compute"] = t_loss_start.elapsed_time(t_loss_end)
+                detailed_profile["main_backward"] = t_main_backward_start.elapsed_time(t_main_backward_end)
+                if aux_optimizer is not None:
+                    aux_backward_ms = t_aux_backward_start.elapsed_time(t_aux_backward_end)
+                detailed_profile["aux_backward"] = aux_backward_ms
+                detailed_profile["optimizer_step"] = optimizer_step_ms
+                current_profile = detailed_profile
+                if iteration in testing_iterations:
+                    step_total_ms = (elapsed_ms or 0.0) + optimizer_step_ms
+                    detail_profile_ms = current_profile or {}
+                    detail_row = [
+                        pipe.scene_imp,
+                        iteration,
+                        step_total_ms,
+                        float(detail_profile_ms.get("feature_prep", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("raht_forward", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("quant", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("entropy_collect", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("entropy_model", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("entropy", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("raht_inverse", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("covariance", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("sh_eval", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("rasterize_forward", 0.0)) * 1000.0,
+                        float(detail_profile_ms.get("loss_compute", 0.0)),
+                        float(detail_profile_ms.get("main_backward", 0.0)),
+                        float(detail_profile_ms.get("aux_backward", 0.0)),
+                        float(detail_profile_ms.get("optimizer_step", 0.0)),
+                    ]
+                    f = open(get_time_detail_csv_path(dataset.csv_path), 'a+')
+                    wtr = csv.writer(f)
+                    wtr.writerow(detail_row)
+                    f.close()
         # except Exception as e:
         #     print('error but go')
 
@@ -1191,12 +1433,16 @@ def training_report(
         renderFunc, 
         scene_name, 
         csv_path, 
+        time_csv_path,
+        time_detail_csv_path,
         model_path, 
+        profile,
         renderArgs):
     if tb_writer:
         tb_writer.add_scalar('train_loss_patches/l1_loss', Ll1.item(), iteration)
         tb_writer.add_scalar('train_loss_patches/total_loss', loss.item(), iteration)
-        tb_writer.add_scalar('iter_time', elapsed, iteration)
+        if PROFILE_TIME and elapsed is not None:
+            tb_writer.add_scalar('iter_time', elapsed, iteration)
     psnr_val, ssim_val, lpips_val = 0, 0, 0
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -1283,6 +1529,22 @@ def training_report(
         wtr = csv.writer(f)
         wtr.writerow(row)
         f.close()
+
+        if PROFILE_TIME and elapsed is not None:
+            profile_ms = profile or {}
+            time_row = [
+                scene_name,
+                iteration,
+                elapsed,
+                float(profile_ms.get("raht_forward", 0.0)) * 1000.0,
+                float(profile_ms.get("quant", 0.0)) * 1000.0,
+                float(profile_ms.get("entropy", 0.0)) * 1000.0,
+                float(profile_ms.get("raht_inverse", 0.0)) * 1000.0,
+            ]
+            f = open(time_csv_path, 'a+')
+            wtr = csv.writer(f)
+            wtr.writerow(time_row)
+            f.close()
         print("Testset Evaluating {}. PSNR: {}, SSIM: {}, LIPIS: {}".format(iteration, psnr_val, ssim_val, lpips_val, zip_size))
 
     return psnr_val, ssim_val, lpips_val
@@ -1360,6 +1622,53 @@ if __name__ == "__main__":
         wtr = csv.writer(f)
         wtr.writerow(['name', 'iteration', 'psnr', 'ssim', 'lpips', 'size'])
         f.close()
+
+    if PROFILE_TIME:
+        time_csv_path = get_time_csv_path(dataset.csv_path)
+        if not os.path.exists(time_csv_path):
+            csv_dir = os.path.dirname(time_csv_path)
+            os.makedirs(csv_dir, exist_ok=True)
+
+            f = open(time_csv_path, 'a+')
+            wtr = csv.writer(f)
+            wtr.writerow([
+                'name',
+                'iteration',
+                'iter_time_ms',
+                'raht_forward_ms',
+                'quant_ms',
+                'entropy_ms',
+                'raht_inverse_ms',
+            ])
+            f.close()
+
+        time_detail_csv_path = get_time_detail_csv_path(dataset.csv_path)
+        if not os.path.exists(time_detail_csv_path):
+            csv_dir = os.path.dirname(time_detail_csv_path)
+            os.makedirs(csv_dir, exist_ok=True)
+
+            f = open(time_detail_csv_path, 'a+')
+            wtr = csv.writer(f)
+            wtr.writerow([
+                'name',
+                'iteration',
+                'train_step_total_ms',
+                'feature_prep_ms',
+                'raht_forward_ms',
+                'quant_ms',
+                'entropy_collect_ms',
+                'entropy_model_ms',
+                'entropy_total_ms',
+                'raht_inverse_ms',
+                'covariance_ms',
+                'sh_eval_ms',
+                'rasterize_forward_ms',
+                'loss_compute_ms',
+                'main_backward_ms',
+                'aux_backward_ms',
+                'optimizer_step_ms',
+            ])
+            f.close()
         
     training(dataset, op.extract(args), pipe, args.test_iterations, args.given_ply_path)
 

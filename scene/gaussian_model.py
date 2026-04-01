@@ -21,6 +21,8 @@ from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
 from compressai.entropy_models import EntropyBottleneck
+from compressai.entropy_models.entropy_models import pmf_to_quantized_cdf
+from compressai import ans as compressai_ans
 
 from raht_torch import (copyAsort, get_RAHT_tree, haar3D_param,
                         inv_haar3D_param, inv_haar3D_torch,
@@ -29,7 +31,14 @@ from utils.general_utils import (build_rotation, build_scaling_rotation,
                                  get_expon_lr_func, inverse_sigmoid,
                                  strip_symmetric)
 from utils.graphics_utils import BasicPointCloud
-from utils.quant_utils import VanillaQuan, split_length, LsqQuan,LSQPlusActivationQuantizer
+from utils.quant_utils import (
+    LSQPlusActivationQuantizer,
+    LsqQuan,
+    VanillaQuan,
+    batched_quantize_blocks,
+    estimate_zero_mean_laplace_block_scales,
+    split_length,
+)
 from utils.sh_utils import RGB2SH
 from utils.system_utils import mkdir_p
 from vq import vq_features
@@ -66,6 +75,22 @@ def get_attr_group_name(dim_idx):
 
 def make_ans_group_key(attr_group, subgroup_idx):
     return f"{attr_group}__sg{subgroup_idx}"
+
+
+def zero_mean_laplace_cdf(x_values, scale):
+    safe_scale = max(float(scale), 1e-8)
+    x_values = np.asarray(x_values, dtype=np.float64)
+    positive = 1.0 - 0.5 * np.exp(-x_values / safe_scale)
+    negative = 0.5 * np.exp(x_values / safe_scale)
+    return np.where(x_values >= 0.0, positive, negative)
+
+
+def build_zero_mean_laplace_pmf(scale, support_min, support_max):
+    support_values = np.arange(int(support_min), int(support_max) + 1, dtype=np.int32)
+    pmf = zero_mean_laplace_cdf(support_values + 0.5, scale) - zero_mean_laplace_cdf(support_values - 0.5, scale)
+    pmf = np.clip(pmf, 1e-12, None)
+    pmf = pmf / max(float(pmf.sum()), 1e-12)
+    return support_values, pmf
 
 
 def split_raht_levels_to_subgroups(level_ids, total_levels, subgroup_count):
@@ -463,56 +488,15 @@ def torch_seg_quant(x, lseg, qas):
     return np.concatenate(outs, axis=0), trans
 
 def torch_vanilla_quant(x, lseg, qas):
-    lx = x.shape[0]
-    cnt = 0
-    outs = []
-    trans = []
-    for i in range(0, lx, lseg):
-        if i + lseg < lx:
-            r = i + lseg 
-        else:
-            r = lx
-        
-        # Unified quantizer parameter path for both Vanilla and LSQ.
-        if hasattr(qas[cnt], 'get_quant_params'):
-            i_scale, i_zp, i_signed = qas[cnt].get_quant_params()
-        else:
-            raise ValueError(f"Unsupported quantizer type: {type(qas[cnt])}")
-        
-        i_bit = qas[cnt].bit
-        outs.append(quantize_tensor(
-            x[i:r],
-            scale=i_scale,
-            zero_point=i_zp,
-            num_bits=i_bit,
-            signed=i_signed).detach().cpu().numpy())
-        trans.extend([i_scale.item(), i_zp.item()])
-        cnt+=1
-    return np.concatenate(outs, axis=0), trans
+    split = [lseg] * (x.shape[0] // lseg)
+    if x.shape[0] % lseg:
+        split.append(x.shape[0] % lseg)
+    _, symbols, trans = batched_quantize_blocks(x, split, qas, return_symbols=True, return_trans=True)
+    return symbols.detach().cpu().numpy(), trans
 
 def torch_vanilla_quant_ave(x, split, qas):
-    start = 0
-    cnt = 0
-    outs = []
-    trans = []
-    for length in split:
-        # Unified quantizer parameter path for both Vanilla and LSQ.
-        if hasattr(qas[cnt], 'get_quant_params'):
-            i_scale, i_zp, i_signed = qas[cnt].get_quant_params()
-        else:
-            raise ValueError(f"Unsupported quantizer type: {type(qas[cnt])}")
-        
-        i_bit = qas[cnt].bit
-        outs.append(quantize_tensor(
-            x[start:start+length], 
-            scale=i_scale,
-            zero_point=i_zp,
-            num_bits=i_bit,
-            signed=i_signed).detach().cpu().numpy())  
-        trans.extend([i_scale.item(), i_zp.item()])
-        cnt += 1
-        start += length
-    return np.concatenate(outs, axis=0), trans
+    _, symbols, trans = batched_quantize_blocks(x, split, qas, return_symbols=True, return_trans=True)
+    return symbols.detach().cpu().numpy(), trans
 
 def torch_vanilla_dequant(x, lseg, sz):
     lx = x.shape[0]
@@ -700,26 +684,49 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
 
+    def get_quantizer_trainable_params(self):
+        params = []
+        if not hasattr(self, "qas"):
+            return params
+        # Only keep parameters owned by the quantizer itself (for example LSQ scale).
+        # This avoids re-adding shared entropy-model parameters through recursive traversal.
+        for qa in self.qas:
+            params.extend(list(qa.parameters(recurse=False)))
+        return params
+
     @property
     def ans_effective_subgroup_count(self):
         total_levels = max(int(self.depth) * 3, 1)
         return max(1, min(int(self.ans_subgroup_count), total_levels))
+
+    def get_ans_block_key(self, qa_idx):
+        return f"qa_{int(qa_idx):04d}"
+
+    def iter_ans_block_specs(self, ac_len):
+        split = split_length(ac_len, self.n_block) if int(self.n_block) > 1 else [int(ac_len)]
+        qa_idx = 0
+        total_dims = len(getattr(self, "dim_to_bit", [])) or 55
+        for dim_idx in range(total_dims):
+            start = 0
+            for block_idx, block_len in enumerate(split):
+                end = start + int(block_len)
+                yield {
+                    "qa_idx": int(qa_idx),
+                    "qa_key": self.get_ans_block_key(qa_idx),
+                    "dim_idx": int(dim_idx),
+                    "block_idx": int(block_idx),
+                    "start": int(start),
+                    "end": int(end),
+                    "length": int(block_len),
+                }
+                qa_idx += 1
+                start = end
 
     def get_attr_group_name(self, dim_idx):
         return get_attr_group_name(dim_idx)
 
     def get_attr_group_dims(self, attr_group):
         return ATTR_GROUP_SLICES[attr_group]
-
-    def get_all_ans_group_keys(self):
-        return [
-            make_ans_group_key(attr_group, subgroup_idx)
-            for attr_group in ATTR_GROUP_ORDER
-            for subgroup_idx in range(self.ans_effective_subgroup_count)
-        ]
-
-    def get_ans_group_key(self, attr_group, subgroup_idx):
-        return make_ans_group_key(attr_group, subgroup_idx)
 
     def update_raht_subgroups(self):
         if not hasattr(self, 'res') or self.res is None:
@@ -741,44 +748,28 @@ class GaussianModel:
         )
 
     def build_empty_ans_group_data(self):
-        return {key: [] for key in self.get_all_ans_group_keys()}
+        return {self.get_ans_block_key(idx): None for idx in range(len(getattr(self, "qas", [])))}
 
-    def collect_ans_symbols_for_dim(self, group_data, dim_idx, symbols, row_subgroups):
-        attr_group = self.get_attr_group_name(dim_idx)
-        symbols = symbols.reshape(-1)
-        row_subgroups = np.asarray(row_subgroups, dtype=np.int64)
-        if symbols.numel() == 0 or row_subgroups.size == 0:
-            return
+    def get_ans_entropy_model(self, qa_key):
+        if isinstance(qa_key, int):
+            qa_key = self.get_ans_block_key(qa_key)
+        return self.ans_entropy_bottlenecks[qa_key]
 
-        assert symbols.numel() == row_subgroups.size, (
-            f"Symbol count mismatch for dim {dim_idx}: {symbols.numel()} vs {row_subgroups.size}"
-        )
-
-        subgroup_tensor = torch.as_tensor(row_subgroups, device=symbols.device)
-        for subgroup_idx in range(self.ans_effective_subgroup_count):
-            mask = subgroup_tensor == subgroup_idx
-            if torch.any(mask):
-                group_key = self.get_ans_group_key(attr_group, subgroup_idx)
-                group_data[group_key].append(symbols[mask])
-
-    def get_ans_entropy_model(self, group_key):
-        return self.ans_entropy_bottlenecks[group_key]
-
-    def export_ans_entropy_state(self, group_key):
-        eb = self.get_ans_entropy_model(group_key)
+    def export_ans_entropy_state(self, qa_key):
+        eb = self.get_ans_entropy_model(qa_key)
         return {
-            f'quantiles_{group_key}': eb.quantiles.detach().cpu().numpy(),
-            f'cdf_{group_key}': eb._quantized_cdf.detach().cpu().numpy(),
-            f'cdf_length_{group_key}': eb._cdf_length.detach().cpu().numpy(),
-            f'offset_{group_key}': eb._offset.detach().cpu().numpy(),
+            f'quantiles_{qa_key}': eb.quantiles.detach().cpu().numpy(),
+            f'cdf_{qa_key}': eb._quantized_cdf.detach().cpu().numpy(),
+            f'cdf_length_{qa_key}': eb._cdf_length.detach().cpu().numpy(),
+            f'offset_{qa_key}': eb._offset.detach().cpu().numpy(),
         }
 
-    def restore_ans_entropy_model(self, group_key, npz_data):
+    def restore_ans_entropy_model(self, qa_key, npz_data):
         eb = EntropyBottleneck(1)
-        quantiles = torch.tensor(npz_data[f'quantiles_{group_key}'], dtype=torch.float32)
-        quantized_cdf = torch.tensor(npz_data[f'cdf_{group_key}'], dtype=torch.int32)
-        cdf_length = torch.tensor(npz_data[f'cdf_length_{group_key}'], dtype=torch.int32)
-        offset = torch.tensor(npz_data[f'offset_{group_key}'], dtype=torch.int32)
+        quantiles = torch.tensor(npz_data[f'quantiles_{qa_key}'], dtype=torch.float32)
+        quantized_cdf = torch.tensor(npz_data[f'cdf_{qa_key}'], dtype=torch.int32)
+        cdf_length = torch.tensor(npz_data[f'cdf_length_{qa_key}'], dtype=torch.int32)
+        offset = torch.tensor(npz_data[f'offset_{qa_key}'], dtype=torch.int32)
 
         with torch.no_grad():
             eb.quantiles.copy_(quantiles)
@@ -792,47 +783,108 @@ class GaussianModel:
         q_dim, trans = torch_vanilla_quant_ave(x, split, qas)
         return q_dim.reshape(-1), trans
 
+    def get_dim_range_from_bit(self, bit):
+        support_min = -int(2 ** (int(bit) - 1))
+        support_max = int(2 ** (int(bit) - 1) - 1)
+        return support_min, support_max
+
+    def build_laplace_cdf_info(self, scale, support_min, support_max):
+        _, pmf = build_zero_mean_laplace_pmf(scale, support_min, support_max)
+        cdf = pmf_to_quantized_cdf(torch.tensor(pmf, dtype=torch.float32), precision=16)
+        cdf_list = cdf.to(torch.int32).tolist()
+        return {
+            "cdf": [cdf_list],
+            "cdf_lengths": [len(cdf_list)],
+            "offsets": [int(support_min)],
+        }
+
+    def build_entropy_bottleneck_cdf_info(self, eb):
+        cdf = eb._quantized_cdf.detach().cpu().to(torch.int32).tolist()
+        cdf_lengths = eb._cdf_length.detach().cpu().reshape(-1).to(torch.int32).tolist()
+        offsets = eb._offset.detach().cpu().reshape(-1).to(torch.int32).tolist()
+        medians = eb._get_medians().detach().cpu().reshape(-1).to(torch.float32).tolist()
+        return {
+            "cdf": cdf,
+            "cdf_lengths": cdf_lengths,
+            "offsets": offsets,
+            "medians": medians,
+        }
+
     def build_ans_group_tensors_from_qci(self, qci):
         if isinstance(qci, np.ndarray):
             qci = torch.from_numpy(qci)
 
+        ac_len = int(qci.shape[0])
         group_data = self.build_empty_ans_group_data()
-        row_subgroups = getattr(self, 'raht_subgroup_ids', np.zeros((0,), dtype=np.int64))
-        for dim_idx in range(qci.shape[1]):
-            self.collect_ans_symbols_for_dim(
-                group_data,
-                dim_idx,
-                qci[:, dim_idx].reshape(-1).to(torch.float32),
-                row_subgroups,
-            )
+        for spec in self.iter_ans_block_specs(ac_len):
+            group_data[spec["qa_key"]] = qci[spec["start"]:spec["end"], spec["dim_idx"]].reshape(-1).to(torch.float32)
         return group_data
 
     def compress_ans_groups(self, group_data):
         ans_save_dict = {
             'packed': np.array([2], dtype=np.uint8),
-            'ans_subgroup_count': np.array([self.ans_effective_subgroup_count], dtype=np.int16),
+            'ans_block_count': np.array([len(self.qas)], dtype=np.int32),
         }
 
-        for group_key in self.get_all_ans_group_keys():
-            eb = self.get_ans_entropy_model(group_key)
+        for eb in self.ans_entropy_bottlenecks.values():
             eb.update(force=True)
 
+        encoder = compressai_ans.RansEncoder()
         total_ans_bytes = 0
-        for group_key, symbols_list in group_data.items():
-            if not symbols_list:
+        for qa_key, symbols in group_data.items():
+            if symbols is None or symbols.numel() == 0:
                 continue
 
-            eb = self.get_ans_entropy_model(group_key)
-            stacked = torch.cat(symbols_list).view(1, 1, -1, 1)
-            bitstream = eb.cpu().compress(stacked.cpu())[0]
-            eb.cuda()
+            eb = self.get_ans_entropy_model(qa_key)
+            cdf_info = self.build_entropy_bottleneck_cdf_info(eb)
+            median = float(cdf_info["medians"][0]) if cdf_info["medians"] else 0.0
+            encoded_symbols = torch.round(symbols.reshape(-1).to(torch.float32) - median).to(torch.int32).cpu().tolist()
+            bitstream = encoder.encode_with_indexes(
+                encoded_symbols,
+                [0] * len(encoded_symbols),
+                cdf_info["cdf"],
+                cdf_info["cdf_lengths"],
+                cdf_info["offsets"],
+            )
 
-            ans_save_dict[f'ans_{group_key}'] = np.frombuffer(bitstream, dtype=np.uint8)
-            ans_save_dict[f'shape_{group_key}'] = np.array(stacked.shape, dtype=np.int32)
-            ans_save_dict.update(self.export_ans_entropy_state(group_key))
+            ans_save_dict[f'ans_{qa_key}'] = np.frombuffer(bitstream, dtype=np.uint8)
+            ans_save_dict.update(self.export_ans_entropy_state(qa_key))
             total_ans_bytes += len(bitstream)
 
         return ans_save_dict, total_ans_bytes
+
+    def compress_laplace_groups(self, group_data, dim_bits, laplace_scales, ac_len):
+        save_dict = {
+            'packed': np.array([3], dtype=np.uint8),
+            'laplace_block_count': np.array([len(self.qas)], dtype=np.int32),
+        }
+
+        encoder = compressai_ans.RansEncoder()
+        total_bytes = 0
+
+        for spec in self.iter_ans_block_specs(ac_len):
+            qa_key = spec["qa_key"]
+            symbols = group_data.get(qa_key, None)
+            if symbols is None or symbols.numel() == 0:
+                continue
+
+            support_min, support_max = self.get_dim_range_from_bit(dim_bits[spec["dim_idx"]])
+            cdf_info = self.build_laplace_cdf_info(
+                laplace_scales[spec["qa_idx"]],
+                support_min,
+                support_max,
+            )
+            bitstream = encoder.encode_with_indexes(
+                symbols.reshape(-1).to(torch.int32).cpu().tolist(),
+                [0] * int(symbols.numel()),
+                cdf_info["cdf"],
+                cdf_info["cdf_lengths"],
+                cdf_info["offsets"],
+            )
+            save_dict[f'laplace_{qa_key}'] = np.frombuffer(bitstream, dtype=np.uint8)
+            total_bytes += len(bitstream)
+
+        return save_dict, total_bytes
 
     # === NEW: export-time ANS offline fitting helpers ===
     # This block is intentionally isolated from the original ANS export path.
@@ -858,34 +910,30 @@ class GaussianModel:
         fit_targets = {}
         total_symbols = 0
 
-        for attr_group in ATTR_GROUP_ORDER:
-            dims = self.get_attr_group_dims(attr_group)
-            group_support_min = min(dim_ranges[idx][0] for idx in dims)
-            group_support_max = max(dim_ranges[idx][1] for idx in dims)
-            support_values = list(range(group_support_min, group_support_max + 1))
-            support_size = len(support_values)
+        for qa_idx, qa_key in enumerate(group_data.keys()):
+            symbols = group_data[qa_key]
+            dim_idx = qa_idx // max(int(self.n_block), 1)
+            support_min, support_max = dim_ranges[dim_idx]
+            support_values = list(range(int(support_min), int(support_max) + 1))
+            counts = np.zeros((len(support_values),), dtype=np.float32)
+            symbol_count = 0
 
-            for subgroup_idx in range(self.ans_effective_subgroup_count):
-                group_key = self.get_ans_group_key(attr_group, subgroup_idx)
-                symbols_list = group_data[group_key]
-                counts = np.zeros((support_size,), dtype=np.float32)
-                symbol_count = 0
+            if symbols is not None and symbols.numel() > 0:
+                symbols_np = symbols.detach().cpu().numpy().astype(np.int32)
+                symbol_count = int(symbols_np.size)
+                unique_vals, unique_counts = np.unique(symbols_np, return_counts=True)
+                indices = unique_vals - int(support_min)
+                valid_mask = (indices >= 0) & (indices < len(support_values))
+                counts[indices[valid_mask]] = unique_counts[valid_mask].astype(np.float32)
 
-                if symbols_list:
-                    symbols = torch.cat(symbols_list).detach().cpu().numpy().astype(np.int32)
-                    symbol_count = int(symbols.size)
-                    if symbol_count > 0:
-                        unique_vals, unique_counts = np.unique(symbols, return_counts=True)
-                        indices = unique_vals - group_support_min
-                        valid_mask = (indices >= 0) & (indices < support_size)
-                        counts[indices[valid_mask]] = unique_counts[valid_mask].astype(np.float32)
-
-                fit_targets[group_key] = {
-                    "support_values": support_values,
-                    "counts": counts,
-                    "symbol_count": symbol_count,
-                }
-                total_symbols += symbol_count
+            fit_targets[qa_key] = {
+                "support_values": support_values,
+                "counts": counts,
+                "symbol_count": symbol_count,
+                "dim_idx": int(dim_idx),
+                "qa_idx": int(qa_idx),
+            }
+            total_symbols += symbol_count
 
         return fit_targets, total_symbols
 
@@ -1073,99 +1121,54 @@ class GaussianModel:
             group_data = self.build_ans_group_tensors_from_qci(qci.to(torch.float32))
 
         diagnostics = {
-            "effective_subgroup_count": int(self.ans_effective_subgroup_count),
-            "groups": {},
-            "aggregated_groups": {},
+            "block_count": int(len(group_data)),
+            "blocks": {},
         }
 
-        for attr_group in ATTR_GROUP_ORDER:
-            dims = self.get_attr_group_dims(attr_group)
-            dim_bitwidths = [int(dim_bits[idx]) for idx in dims]
-            group_support_min = min(dim_ranges[idx][0] for idx in dims)
-            group_support_max = max(dim_ranges[idx][1] for idx in dims)
-            group_support = list(range(group_support_min, group_support_max + 1))
-            diagnostics["groups"][attr_group] = {}
+        ac_len = int(qci.shape[0])
+        for spec in self.iter_ans_block_specs(ac_len):
+            qa_key = spec["qa_key"]
+            symbols = group_data[qa_key]
+            support_min, support_max = dim_ranges[spec["dim_idx"]]
+            support_values = list(range(int(support_min), int(support_max) + 1))
 
-            aggregated_counts = {}
-            aggregated_estimated_probs = {str(v): 0.0 for v in group_support}
-            total_group_symbols = 0
-
-            for subgroup_idx in range(self.ans_effective_subgroup_count):
-                group_key = self.get_ans_group_key(attr_group, subgroup_idx)
-                symbols_list = group_data[group_key]
-
-                if symbols_list:
-                    symbols = torch.cat(symbols_list).detach().cpu().numpy().astype(np.int32)
-                    unique_vals, unique_counts = np.unique(symbols, return_counts=True)
-                    probabilities = unique_counts.astype(np.float64) / float(symbols.size)
-                    histogram_counts = {
-                        str(int(symbol)): int(count)
-                        for symbol, count in zip(unique_vals.tolist(), unique_counts.tolist())
-                    }
-                    empirical_probabilities = {
-                        str(int(symbol)): float(prob)
-                        for symbol, prob in zip(unique_vals.tolist(), probabilities.tolist())
-                    }
-                else:
-                    symbols = np.zeros((0,), dtype=np.int32)
-                    histogram_counts = {}
-                    empirical_probabilities = {}
-
-                eb = self.get_ans_entropy_model(group_key)
-                estimated_probabilities, support_mass = self.estimate_ans_distribution_from_model(
-                    eb,
-                    group_support,
-                )
-
-                subgroup_name = f"sg{subgroup_idx}"
-                diagnostics["groups"][attr_group][subgroup_name] = {
-                    "group_key": group_key,
-                    "subgroup_index": int(subgroup_idx),
-                    "dim_indices": [int(idx) for idx in dims],
-                    "bitwidths": dim_bitwidths,
-                    "support_min": int(group_support_min),
-                    "support_max": int(group_support_max),
-                    "support_values": [int(v) for v in group_support],
-                    "symbol_count": int(symbols.size),
-                    "histogram_counts": histogram_counts,
-                    "empirical_probabilities": empirical_probabilities,
-                    "estimated_probabilities": estimated_probabilities,
-                    "estimated_probability_mass_on_support": support_mass,
+            if symbols is not None and symbols.numel() > 0:
+                symbols_np = symbols.detach().cpu().numpy().astype(np.int32)
+                unique_vals, unique_counts = np.unique(symbols_np, return_counts=True)
+                probabilities = unique_counts.astype(np.float64) / float(symbols_np.size)
+                histogram_counts = {
+                    str(int(symbol)): int(count)
+                    for symbol, count in zip(unique_vals.tolist(), unique_counts.tolist())
                 }
-
-                total_group_symbols += int(symbols.size)
-                for symbol, count in histogram_counts.items():
-                    aggregated_counts[symbol] = aggregated_counts.get(symbol, 0) + count
-
-                if symbols.size > 0:
-                    for symbol, prob in estimated_probabilities.items():
-                        aggregated_estimated_probs[symbol] = (
-                            aggregated_estimated_probs.get(symbol, 0.0) + prob * symbols.size
-                        )
-
-            if total_group_symbols > 0:
-                aggregated_empirical_probs = {
-                    symbol: float(count) / float(total_group_symbols)
-                    for symbol, count in aggregated_counts.items()
-                }
-                aggregated_estimated_probs = {
-                    symbol: float(prob) / float(total_group_symbols)
-                    for symbol, prob in aggregated_estimated_probs.items()
+                empirical_probabilities = {
+                    str(int(symbol)): float(prob)
+                    for symbol, prob in zip(unique_vals.tolist(), probabilities.tolist())
                 }
             else:
-                aggregated_empirical_probs = {}
-                aggregated_estimated_probs = {symbol: 0.0 for symbol in aggregated_estimated_probs}
+                symbols_np = np.zeros((0,), dtype=np.int32)
+                histogram_counts = {}
+                empirical_probabilities = {}
 
-            diagnostics["aggregated_groups"][attr_group] = {
-                "bitwidths": dim_bitwidths,
-                "dim_indices": [int(idx) for idx in dims],
-                "support_min": int(group_support_min),
-                "support_max": int(group_support_max),
-                "support_values": [int(v) for v in group_support],
-                "symbol_count": int(total_group_symbols),
-                "histogram_counts": aggregated_counts,
-                "empirical_probabilities": aggregated_empirical_probs,
-                "estimated_probabilities": aggregated_estimated_probs,
+            eb = self.get_ans_entropy_model(qa_key)
+            estimated_probabilities, support_mass = self.estimate_ans_distribution_from_model(
+                eb,
+                support_values,
+            )
+
+            diagnostics["blocks"][qa_key] = {
+                "qa_idx": int(spec["qa_idx"]),
+                "dim_idx": int(spec["dim_idx"]),
+                "block_idx": int(spec["block_idx"]),
+                "attr_group": self.get_attr_group_name(spec["dim_idx"]),
+                "bitwidth": int(dim_bits[spec["dim_idx"]]),
+                "support_min": int(support_min),
+                "support_max": int(support_max),
+                "support_values": [int(v) for v in support_values],
+                "symbol_count": int(symbols_np.size),
+                "histogram_counts": histogram_counts,
+                "empirical_probabilities": empirical_probabilities,
+                "estimated_probabilities": estimated_probabilities,
+                "estimated_probability_mass_on_support": support_mass,
             }
 
         return diagnostics
@@ -1239,41 +1242,23 @@ class GaussianModel:
     def save_ans_probability_plots(self, qci, dim_bits, dim_ranges, output_dir):
         diagnostics = self.build_ans_probability_diagnostics(qci, dim_bits, dim_ranges)
         plots_root = os.path.join(output_dir, MACRO_ANS_PROBABILITY_PLOTS_DIRNAME)
-        aggregated_dir = os.path.join(plots_root, "aggregated")
-        subgroup_dir = os.path.join(plots_root, "subgroups")
-        manifest = {
-            "aggregated": {},
-            "subgroups": {},
-        }
+        blocks_dir = os.path.join(plots_root, "blocks")
+        manifest = {"blocks": {}}
 
-        for attr_group in ATTR_GROUP_ORDER:
-            aggregated_info = diagnostics["aggregated_groups"][attr_group]
-            aggregated_path = os.path.join(
-                aggregated_dir,
-                f"{self._sanitize_probability_plot_name(attr_group)}.png",
+        for qa_key, block_info in diagnostics["blocks"].items():
+            if block_info["symbol_count"] == 0:
+                continue
+            block_path = os.path.join(
+                blocks_dir,
+                block_info["attr_group"],
+                f"{self._sanitize_probability_plot_name(qa_key)}.png",
             )
             title = (
-                f"{attr_group} | empirical vs CompressAI estimated probability "
-                f"(symbols={aggregated_info['symbol_count']})"
+                f"{block_info['attr_group']} | dim {block_info['dim_idx']} | "
+                f"block {block_info['block_idx']} | symbols={block_info['symbol_count']}"
             )
-            self.plot_ans_probability_distribution(aggregated_info, title, aggregated_path)
-            manifest["aggregated"][attr_group] = os.path.abspath(aggregated_path)
-
-            manifest["subgroups"][attr_group] = {}
-            for subgroup_name, subgroup_info in diagnostics["groups"][attr_group].items():
-                if subgroup_info["symbol_count"] == 0:
-                    continue
-                subgroup_path = os.path.join(
-                    subgroup_dir,
-                    attr_group,
-                    f"{self._sanitize_probability_plot_name(subgroup_name)}.png",
-                )
-                subgroup_title = (
-                    f"{attr_group}/{subgroup_name} | empirical vs CompressAI estimated probability "
-                    f"(symbols={subgroup_info['symbol_count']})"
-                )
-                self.plot_ans_probability_distribution(subgroup_info, subgroup_title, subgroup_path)
-                manifest["subgroups"][attr_group][subgroup_name] = os.path.abspath(subgroup_path)
+            self.plot_ans_probability_distribution(block_info, title, block_path)
+            manifest["blocks"][qa_key] = os.path.abspath(block_path)
 
         manifest_path = os.path.join(plots_root, MACRO_ANS_PROBABILITY_PLOT_MANIFEST)
         os.makedirs(plots_root, exist_ok=True)
@@ -1294,21 +1279,23 @@ class GaussianModel:
             MACRO_ANS_FIT_PROGRESS_PLOTS_DIRNAME,
             f"step_{int(step):04d}",
         )
-        aggregated_dir = os.path.join(plots_root, "aggregated")
-        manifest = {"aggregated": {}}
+        blocks_dir = os.path.join(plots_root, "blocks")
+        manifest = {"blocks": {}}
 
-        for attr_group in ATTR_GROUP_ORDER:
-            aggregated_info = diagnostics["aggregated_groups"][attr_group]
-            aggregated_path = os.path.join(
-                aggregated_dir,
-                f"{self._sanitize_probability_plot_name(attr_group)}.png",
+        for qa_key, block_info in diagnostics["blocks"].items():
+            if block_info["symbol_count"] == 0:
+                continue
+            block_path = os.path.join(
+                blocks_dir,
+                block_info["attr_group"],
+                f"{self._sanitize_probability_plot_name(qa_key)}.png",
             )
             title = (
-                f"{attr_group} | fitted step {int(step)} | empirical vs CompressAI estimated probability "
-                f"(symbols={aggregated_info['symbol_count']})"
+                f"{block_info['attr_group']} | dim {block_info['dim_idx']} | "
+                f"block {block_info['block_idx']} | fitted step {int(step)}"
             )
-            self.plot_ans_probability_distribution(aggregated_info, title, aggregated_path)
-            manifest["aggregated"][attr_group] = os.path.abspath(aggregated_path)
+            self.plot_ans_probability_distribution(block_info, title, block_path)
+            manifest["blocks"][qa_key] = os.path.abspath(block_path)
 
         manifest_path = os.path.join(plots_root, MACRO_ANS_PROBABILITY_PLOT_MANIFEST)
         os.makedirs(plots_root, exist_ok=True)
@@ -1318,38 +1305,55 @@ class GaussianModel:
 
     def decompress_ans_groups(self, npz_data, ac_len):
         q_raht_i = np.zeros((ac_len, 55), dtype=np.float32)
-        effective_subgroups = int(npz_data['ans_subgroup_count'][0]) if 'ans_subgroup_count' in npz_data else 1
-        self.ans_subgroup_count = max(1, effective_subgroups)
-        self.raht_subgroup_ids = split_raht_levels_to_subgroups(
-            self.raht_level_ids,
-            self.depth * 3,
-            self.ans_subgroup_count,
-        )
+        decoder = compressai_ans.RansDecoder()
+        for spec in self.iter_ans_block_specs(ac_len):
+            qa_key = spec["qa_key"]
+            ans_key = f'ans_{qa_key}'
+            if ans_key not in npz_data:
+                continue
 
-        row_subgroups = self.raht_subgroup_ids
-        for attr_group in ATTR_GROUP_ORDER:
-            dims = self.get_attr_group_dims(attr_group)
-            for subgroup_idx in range(self.ans_effective_subgroup_count):
-                group_key = self.get_ans_group_key(attr_group, subgroup_idx)
-                ans_key = f'ans_{group_key}'
-                shape_key = f'shape_{group_key}'
-                if ans_key not in npz_data or shape_key not in npz_data:
-                    continue
+            eb = self.restore_ans_entropy_model(qa_key, npz_data)
+            cdf_info = self.build_entropy_bottleneck_cdf_info(eb)
+            median = float(cdf_info["medians"][0]) if cdf_info["medians"] else 0.0
+            bitstream = bytes(npz_data[ans_key].tolist())
+            decoded = decoder.decode_with_indexes(
+                bitstream,
+                [0] * int(spec["length"]),
+                cdf_info["cdf"],
+                cdf_info["cdf_lengths"],
+                cdf_info["offsets"],
+            )
+            decoded = np.asarray(decoded, dtype=np.float32) + median
+            q_raht_i[spec["start"]:spec["end"], spec["dim_idx"]] = decoded[:spec["length"]]
 
-                eb = self.restore_ans_entropy_model(group_key, npz_data)
-                bitstream = bytes(npz_data[ans_key].tolist())
-                shape = tuple(int(v) for v in npz_data[shape_key].tolist())
-                decoded = eb.decompress([bitstream], shape[2:]).reshape(-1).cpu().numpy()
+        return q_raht_i
 
-                cursor = 0
-                mask = row_subgroups == subgroup_idx
-                count = int(mask.sum())
-                if count == 0:
-                    continue
+    def decompress_laplace_groups(self, npz_data, ac_len, dim_bits):
+        q_raht_i = np.zeros((ac_len, 55), dtype=np.float32)
+        scales = np.asarray(npz_data["laplace_scale"], dtype=np.float32).reshape(-1)
+        decoder = compressai_ans.RansDecoder()
 
-                for dim_idx in dims:
-                    q_raht_i[mask, dim_idx] = decoded[cursor:cursor + count]
-                    cursor += count
+        for spec in self.iter_ans_block_specs(ac_len):
+            qa_key = spec["qa_key"]
+            key = f'laplace_{qa_key}'
+            if key not in npz_data:
+                continue
+
+            support_min, support_max = self.get_dim_range_from_bit(dim_bits[spec["dim_idx"]])
+            cdf_info = self.build_laplace_cdf_info(
+                scales[spec["qa_idx"]],
+                support_min,
+                support_max,
+            )
+            bitstream = bytes(npz_data[key].tolist())
+            decoded = decoder.decode_with_indexes(
+                bitstream,
+                [0] * int(spec["length"]),
+                cdf_info["cdf"],
+                cdf_info["cdf_lengths"],
+                cdf_info["offsets"],
+            )
+            q_raht_i[spec["start"]:spec["end"], spec["dim_idx"]] = np.asarray(decoded, dtype=np.float32)[:spec["length"]]
 
         return q_raht_i
 
@@ -1516,8 +1520,9 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
-        if hasattr(self, 'qas'):
-            l.append({'params': self.qas.parameters(), 'lr': 0.005, "name": "quantizers"})
+        quantizer_params = self.get_quantizer_trainable_params()
+        if quantizer_params:
+            l.append({'params': quantizer_params, 'lr': 0.005, "name": "quantizers"})
         if hasattr(self, 'ans_entropy_bottlenecks') and len(self.ans_entropy_bottlenecks) > 0:
             ans_main_params = [
                 param for name, param in self.ans_entropy_bottlenecks.named_parameters()
@@ -1554,8 +1559,9 @@ class GaussianModel:
         ]
         
         # 添加量化器的学习参数到优化器
-        if hasattr(self, 'qas'):
-            l.append({'params': self.qas.parameters(), 'lr': 0.005, "name": "quantizers"})
+        quantizer_params = self.get_quantizer_trainable_params()
+        if quantizer_params:
+            l.append({'params': quantizer_params, 'lr': 0.005, "name": "quantizers"})
         if hasattr(self, 'ans_entropy_bottlenecks') and len(self.ans_entropy_bottlenecks) > 0:
             ans_main_params = [
                 param for name, param in self.ans_entropy_bottlenecks.named_parameters()
@@ -1852,112 +1858,11 @@ class GaussianModel:
 
             cf = C[0].cpu().numpy()
 
-            is_ans = False
-            if hasattr(self, 'qas') and len(self.qas) > 0:
-                is_ans = getattr(self.qas[0], 'encode', 'deflate').lower() == 'ans'
+            encode_mode = getattr(self.qas[0], 'encode', 'deflate').lower() if hasattr(self, 'qas') and len(self.qas) > 0 else "deflate"
+            is_ans = encode_mode == 'ans'
+            is_laplace = encode_mode == 'laplace'
 
-            if False and is_ans:
-                # 按 7 个大类重新组织数据，进行统一共享编码
-                qci = []
-                group_data = {
-                    'opacity': [],
-                    'euler': [],
-                    'f_dc': [],
-                    'f_rest_0': [],
-                    'f_rest_1': [],
-                    'f_rest_2': [],
-                    'scale': []
-                }
-                
-                # 1. 归一化、截断取整，并将特征分拣装入各自的大类容器中
-                qa_cnt = 0
-                for i in range(C.shape[-1]):
-                    qa = self.qas[qa_cnt]
-                    
-                    # 让量化器自己在 eval() 模式下吐出反量化后的绝对安全值
-                    x_q = qa(C[1:, i])
-                    
-                    if hasattr(qa, 's'):
-                        # 除回步长，得到绝对干净的离散整数 y_hat (例如 -2.0, -1.0, 0.0, 1.0, 2.0)
-                        y_hat = x_q / qa.s
-                        trans_array.extend([qa.s.item(), 0.0])
-                    else:
-                        y_hat = (x_q / qa.scale) + qa.zero_point
-                        trans_array.extend([qa.scale.item(), qa.zero_point.item()])
-                        
-                    # 兜底截断保护（由于量化器内部已经截断过了，这里其实是冗余的，但保留以防万一）
-                    y_clamped = torch.clamp(y_hat, qa.thd_neg, qa.thd_pos).round()
-
-
-                    if i == 0:
-                        group_key = 'opacity'
-                    elif 1 <= i <= 3:
-                        group_key = 'euler'
-                    elif 4 <= i <= 6:
-                        group_key = 'f_dc'
-                    elif 7 <= i <= 15:
-                        group_key = 'f_rest_0'
-                    elif 16 <= i <= 30:
-                        group_key = 'f_rest_1'
-                    elif 31 <= i <= 51:
-                        group_key = 'f_rest_2'
-                    else:
-                        group_key = 'scale'
-                        
-                    group_data[group_key].append(y_clamped.view(1, 1, -1, 1))
-                    qa_cnt += self.n_block if per_block_quant else 1
-
-                 # 2. 对每个大类执行算术编码
-                group_order = ['opacity', 'euler', 'f_dc', 'f_rest_0', 'f_rest_1', 'f_rest_2', 'scale']
-                eb_state_dicts = {}  # 🌟 新增：保存熵模型状态
-
-               # ----------------- 修复代码 -----------------
-                ans_save_dict = {
-                    'f': cf,
-                    'packed': np.array([2], dtype=np.uint8) # 2代表 ANS 格式
-                }
-                
-                # 首先更新 CDF (你原来的逻辑非常好)
-                seen_ebs = {}
-                for g_key in group_order:
-                    if not group_data[g_key]: continue
-                    eb_idx_map = {'opacity': 0, 'euler': 1, 'f_dc': 4, 'f_rest_0': 7, 'f_rest_1': 16, 'f_rest_2': 31, 'scale': 52}
-                    eb = self.qas[eb_idx_map[g_key]].entropy_bottleneck
-                    if eb not in seen_ebs:
-                        eb.update() 
-                        seen_ebs[eb] = g_key
-
-                total_ans_bytes = 0
-                for g_key in group_order:
-                    if not group_data[g_key]: continue
-                        
-                    stacked_features = torch.cat(group_data[g_key], dim=1)
-                    B, C_dim, N_pts, D_dim = stacked_features.shape
-                    stacked_features_flat = stacked_features.contiguous().view(B, 1, C_dim * N_pts, D_dim)
-                    
-                    eb_idx_map = {'opacity': 0, 'euler': 1, 'f_dc': 4, 'f_rest_0': 7, 'f_rest_1': 16, 'f_rest_2': 31, 'scale': 52}
-                    eb = self.qas[eb_idx_map[g_key]].entropy_bottleneck
-                    
-                    eb_cpu = eb.cpu()
-                    stacked_features_cpu = stacked_features_flat.cpu()
-                    
-                    # 压缩
-                    bitstream = eb_cpu.compress(stacked_features_cpu)[0]
-                    bitstream_bytes = np.frombuffer(bitstream, dtype=np.uint8)
-                    
-                    eb.cuda()
-                    
-                    # 【核心修改】：直接把每个大类的二进制流作为独立的 key 存入字典
-                    ans_save_dict[f'ans_{g_key}'] = bitstream_bytes
-                    # 同时必须把原来的 shape 存下来，否则解压时无法 decompress!
-                    ans_save_dict[f'shape_{g_key}'] = np.array(stacked_features_flat.shape, dtype=np.int32)
-                    
-                    total_ans_bytes += len(bitstream_bytes)
-
-                np.savez(os.path.join(bin_dir,'orgb.npz'), **ans_save_dict)
-                print(f"      ANS 字节流总大小: {total_ans_bytes / 1024:.2f} KB")
-
-            if is_ans:
+            if is_ans or is_laplace:
                 ac_len = C.shape[0] - 1
                 split = split_length(ac_len, self.n_block) if per_block_quant else [ac_len]
                 qci = []
@@ -1975,49 +1880,64 @@ class GaussianModel:
                     qa_cnt += len(split)
 
                 qci = np.concatenate(qci, axis=-1).astype(np.float32)
-                ans_group_data = self.build_ans_group_tensors_from_qci(qci)
-                # === NEW: isolated export-time offline fitting branch ===
-                if export_ans_offline_fit:
-                    print(
-                        f"      ANS export offline fit enabled: "
-                        f"steps={int(export_ans_offline_fit_steps)}, "
-                        f"main_lr={float(export_ans_offline_fit_main_lr):.2e}, "
-                        f"aux_lr={float(export_ans_offline_fit_aux_lr):.2e}"
-                    )
-                    original_ans_state = self.clone_ans_entropy_bottleneck_state_to_cpu()
-                    try:
-                        self.offline_fit_ans_entropy_models_for_export(
-                            ans_group_data,
-                            qci,
+                group_data = self.build_ans_group_tensors_from_qci(qci)
+                if is_ans:
+                    if export_ans_offline_fit:
+                        print(
+                            f"      ANS export offline fit enabled: "
+                            f"steps={int(export_ans_offline_fit_steps)}, "
+                            f"main_lr={float(export_ans_offline_fit_main_lr):.2e}, "
+                            f"aux_lr={float(export_ans_offline_fit_aux_lr):.2e}"
+                        )
+                        original_ans_state = self.clone_ans_entropy_bottleneck_state_to_cpu()
+                        try:
+                            self.offline_fit_ans_entropy_models_for_export(
+                                group_data,
+                                qci,
+                                dim_bits,
+                                dim_ranges,
+                                output_dir=exp_dir,
+                                save_fit_progress_plots=(
+                                    MACRO_ENABLE_ANS_PROBABILITY_PLOT_EXPORT and save_probability_plots
+                                ),
+                                steps=export_ans_offline_fit_steps,
+                                main_lr=export_ans_offline_fit_main_lr,
+                                aux_lr=export_ans_offline_fit_aux_lr,
+                                plot_interval=export_ans_offline_fit_plot_interval,
+                            )
+                            save_dict, total_bytes = self.compress_ans_groups(group_data)
+                        finally:
+                            self.restore_ans_entropy_bottleneck_state(original_ans_state)
+                    else:
+                        save_dict, total_bytes = self.compress_ans_groups(group_data)
+                    print(f"      ANS 字节流总大小: {total_bytes / 1024:.2f} KB")
+                    if MACRO_ENABLE_ANS_PROBABILITY_PLOT_EXPORT and save_probability_plots:
+                        self.save_ans_probability_plots(
+                            qci.astype(np.int32),
                             dim_bits,
                             dim_ranges,
-                            output_dir=exp_dir,
-                            save_fit_progress_plots=(
-                                MACRO_ENABLE_ANS_PROBABILITY_PLOT_EXPORT and save_probability_plots
-                            ),
-                            steps=export_ans_offline_fit_steps,
-                            main_lr=export_ans_offline_fit_main_lr,
-                            aux_lr=export_ans_offline_fit_aux_lr,
-                            plot_interval=export_ans_offline_fit_plot_interval,
+                            exp_dir,
                         )
-                        ans_save_dict, total_ans_bytes = self.compress_ans_groups(ans_group_data)
-                    finally:
-                        self.restore_ans_entropy_bottleneck_state(original_ans_state)
                 else:
-                    ans_save_dict, total_ans_bytes = self.compress_ans_groups(ans_group_data)
-                ans_save_dict['f'] = cf
-                ans_save_dict['bit_config'] = np.array(dim_bits, dtype=np.uint8)
-                np.savez(os.path.join(bin_dir, 'orgb.npz'), **ans_save_dict)
-                print(f"      ANS 字节流总大小: {total_ans_bytes / 1024:.2f} KB")
-                if MACRO_ENABLE_ANS_PROBABILITY_PLOT_EXPORT and save_probability_plots:
-                    self.save_ans_probability_plots(
-                        qci.astype(np.int32),
+                    laplace_scales = estimate_zero_mean_laplace_block_scales(
+                        torch.from_numpy(qci.astype(np.float32)),
+                        split,
+                    ).reshape(-1).cpu().numpy().astype(np.float32)
+                    save_dict, total_bytes = self.compress_laplace_groups(
+                        group_data,
                         dim_bits,
-                        dim_ranges,
-                        exp_dir,
+                        laplace_scales,
+                        ac_len,
                     )
+                    save_dict['laplace_scale'] = laplace_scales
+                    print(f"      Laplace 字节流总大小: {total_bytes / 1024:.2f} KB")
 
-            if not is_ans:
+                save_dict['f'] = cf
+                save_dict['bit_config'] = np.array(dim_bits, dtype=np.uint8)
+                np.savez(os.path.join(bin_dir, 'orgb.npz'), **save_dict)
+
+            if not is_ans and not is_laplace:
+                laplace_scales = None
                 if per_channel_quant:
                     qci = []
                     dqci = []
@@ -2055,6 +1975,11 @@ class GaussianModel:
 
                     qci = np.concatenate(qci, axis=-1)
                     dqci = np.concatenate(dqci, axis=-1)
+                    if encode_mode == "laplace":
+                        laplace_scales = estimate_zero_mean_laplace_block_scales(
+                            torch.from_numpy(qci.astype(np.float32)),
+                            [qci.shape[0]],
+                        ).cpu().numpy().astype(np.float32)
                 elif per_block_quant:
                     qa_cnt = 0
                     lc1 = C.shape[0] - 1
@@ -2094,6 +2019,11 @@ class GaussianModel:
                     trans_array.extend(dim_bits)  # 添加55个维度的bit信息
                 
                     qci = np.concatenate(qci, axis=-1)  # 现在形状是 (N, 55)
+                    if encode_mode == "laplace":
+                        laplace_scales = estimate_zero_mean_laplace_block_scales(
+                            torch.from_numpy(qci.astype(np.float32)),
+                            split,
+                        ).cpu().numpy().astype(np.float32)
                 
                     # 调试：打印 qci 的形状
                     print(f"    qci 形状: {qci.shape}")
@@ -2114,6 +2044,11 @@ class GaussianModel:
                     trans_array.append(i_scale.item())
                     trans_array.append(i_zp.item())
                     dim_bits = [self.qa.bit] * 55  # 所有维度使用相同的位数
+                    if encode_mode == "laplace":
+                        laplace_scales = estimate_zero_mean_laplace_block_scales(
+                            torch.from_numpy(qci.astype(np.float32)),
+                            [qci.shape[0]],
+                        ).cpu().numpy().astype(np.float32)
                 
                 print(f"\n  保存 RAHT 系数 (包含 scale)...")
             
@@ -2144,6 +2079,8 @@ class GaussianModel:
                             'bit_config': np.array(dim_bits, dtype=np.uint8),  # 位宽配置
                             'signed_config': np.array(signed_flags, dtype=np.uint8)  # 有符号标记
                         }
+                        if laplace_scales is not None:
+                            save_dict['laplace_scale'] = laplace_scales
                     
                         print(f"      原始大小: {qci.nbytes / 1024:.2f} KB")
                         print(f"      打包后大小: {bitstream_size:.2f} KB")
@@ -2175,6 +2112,8 @@ class GaussianModel:
                             key = f'i_{bit}bit'
                             save_dict[key] = group_data
                             save_dict[f'dims_{bit}bit'] = np.array(dims, dtype=np.uint8)
+                        if laplace_scales is not None:
+                            save_dict['laplace_scale'] = laplace_scales
                         
                             print(f"      {bit:2d}-bit: {len(dims):2d} 维度, {dtype.__name__:6s}, {group_size:8.2f} KB")
                     
@@ -2188,7 +2127,10 @@ class GaussianModel:
                     # 单一位宽模式（向后兼容）
                     print(f"    使用 uint8 存储（单一位宽模式）")
                     ##np.savez_compressed(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
-                    np.savez(os.path.join(bin_dir,'orgb.npz'), f=cf, i=qci.astype(np.uint8))
+                    save_dict = {'f': cf, 'i': qci.astype(np.uint8)}
+                    if laplace_scales is not None:
+                        save_dict['laplace_scale'] = laplace_scales
+                    np.savez(os.path.join(bin_dir,'orgb.npz'), **save_dict)
                     print(f"    orgb.npz: 形状 {qci.shape}, 大小 {qci.nbytes / 1024:.2f} KB")
             
             # Scale is now included in RAHT features, no separate ct.npz needed
@@ -2209,7 +2151,7 @@ class GaussianModel:
             print(f"  文件大小: {zip_file_size / 1024 / 1024:.2f} MB")
 
 
-    def init_qas(self, n_block, bit_config=None, quant_type="vanilla", encode="deflate", ans_subgroup_count=4):
+    def init_qas(self, n_block, bit_config=None, quant_type="vanilla", encode="deflate", ans_subgroup_count=1):
         """
         初始化量化器，支持不同属性使用不同的量化位数
         
@@ -2283,50 +2225,37 @@ class GaussianModel:
         
         self.dim_to_bit = dim_to_bit
         
-        # 🌟 新增：按 7 个属性大类创建共享的 CDF 网络
         self.ans_entropy_bottlenecks = nn.ModuleDict()
-        if encode.lower() == "ans":
-            for ans_group_key in self.get_all_ans_group_keys():
-                self.ans_entropy_bottlenecks[ans_group_key] = EntropyBottleneck(1).cuda()
         
         # 创建量化器
         self.qas = nn.ModuleList([])
         for dim_idx in range(55):
             bit = dim_to_bit[dim_idx]
-            
-            # 分配它属于哪一个共享大类
-            if dim_idx == 0:
-                group_key = 'opacity'
-            elif 1 <= dim_idx <= 3:
-                group_key = 'euler'
-            elif 4 <= dim_idx <= 6:
-                group_key = 'f_dc'
-            elif 7 <= dim_idx <= 15:
-                group_key = 'f_rest_0'
-            elif 16 <= dim_idx <= 30:
-                group_key = 'f_rest_1'
-            elif 31 <= dim_idx <= 51:
-                group_key = 'f_rest_2'
-            else:
-                group_key = 'scale'
-                
-            eb = None
 
             for _ in range(n_block):
+                eb = None
+                if encode.lower() == "ans":
+                    qa_key = self.get_ans_block_key(len(self.qas))
+                    eb = EntropyBottleneck(1).cuda()
+                    self.ans_entropy_bottlenecks[qa_key] = eb
                 if quant_type.lower() == "lsq":
-                    # LSQ (学习步长量化)
-                    self.qas.append(LsqQuan(bit=bit, init_yet=False, all_positive=False, encode=encode, shared_eb=None).cuda())
+                    self.qas.append(
+                        LsqQuan(
+                            bit=bit,
+                            init_yet=False,
+                            all_positive=False,
+                            encode=encode,
+                            shared_eb=eb,
+                        ).cuda()
+                    )
                 else:
-                    # VanillaQuan (传统量化)
-                    # Old code kept for reference:
-                    # self.qas.append(VanillaQuan(bit=bit, encode=encode, shared_eb=None).cuda())
                     self.qas.append(
                         VanillaQuan(
                             bit=bit,
                             all_positive=False,
                             symmetric=False,
                             encode=encode,
-                            shared_eb=None,
+                            shared_eb=eb,
                         ).cuda()
                     )
 
@@ -2795,6 +2724,7 @@ class GaussianModel:
         # 检查存储格式
         is_packed = 'packed' in oef_vals and oef_vals['packed'][0] == 1
         is_ans_packed = 'packed' in oef_vals and oef_vals['packed'][0] == 2
+        is_laplace_packed = 'packed' in oef_vals and oef_vals['packed'][0] == 3
         is_grouped = any(key.startswith('i_') and key.endswith('bit') for key in oef_vals.keys())
         
         # 重要修复：AC 系数的数量应该基于原始八叉树点数，而不是解码后的点数
@@ -2802,8 +2732,8 @@ class GaussianModel:
         ac_len = self.og_number_points - 1
         print(f'  AC 系数数量: {ac_len} (基于原始八叉树点数 {self.og_number_points})')
         
-        if is_ans_packed:
-            print(f'  检测到 ANS 分组存储格式')
+        if is_ans_packed or is_laplace_packed:
+            print(f"  检测到 {'Laplace' if is_laplace_packed else 'ANS'} 分组存储格式")
 
             w, val, reorder = copyAsort(V)
             self.reorder = reorder
@@ -2811,15 +2741,21 @@ class GaussianModel:
             self.res_inv = inv_haar3D_param(V, depth)
             self.update_raht_subgroups()
 
-            q_raht_i = self.decompress_ans_groups(oef_vals, ac_len)
-            q_raht_i = torch.tensor(q_raht_i, dtype=torch.float, device="cuda")
-
             if 'bit_config' in oef_vals:
                 dim_bits = oef_vals['bit_config'].astype(int).tolist()
                 self.dim_to_bit = dim_bits
-                print(f'    ANS 位宽配置: {set(dim_bits)} bits')
+                print(f"    {'Laplace' if is_laplace_packed else 'ANS'} 位宽配置: {set(dim_bits)} bits")
+            else:
+                dim_bits = [8] * 55
+                self.dim_to_bit = dim_bits
 
-            print(f'  ANS 解码后 AC 系数: {q_raht_i.shape}')
+            if is_laplace_packed:
+                q_raht_i = self.decompress_laplace_groups(oef_vals, ac_len, dim_bits)
+            else:
+                q_raht_i = self.decompress_ans_groups(oef_vals, ac_len)
+            q_raht_i = torch.tensor(q_raht_i, dtype=torch.float, device="cuda")
+
+            print(f"  {'Laplace' if is_laplace_packed else 'ANS'} 解码后 AC 系数: {q_raht_i.shape}")
 
         elif is_packed:
             # 位打包存储格式

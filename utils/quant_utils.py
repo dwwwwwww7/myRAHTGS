@@ -13,6 +13,220 @@ def split_length(length, n):
     result = [floor_length + 1] * remainder + [floor_length] * (n - remainder)
     return result
 
+
+def _build_block_index_tensors(split, device):
+    split_tensor = torch.as_tensor(split, device=device, dtype=torch.long)
+    if split_tensor.numel() == 0:
+        raise ValueError("split must contain at least one block")
+
+    block_ids = torch.repeat_interleave(
+        torch.arange(split_tensor.numel(), device=device, dtype=torch.long),
+        split_tensor,
+    )
+    block_starts = torch.cumsum(
+        torch.cat([split_tensor.new_zeros(1), split_tensor[:-1]]),
+        dim=0,
+    )
+    local_ids = torch.arange(int(split_tensor.sum().item()), device=device, dtype=torch.long)
+    local_ids = local_ids - torch.repeat_interleave(block_starts, split_tensor)
+    return split_tensor, block_ids, local_ids
+
+
+def _laplace_cdf(x, scale):
+    safe_scale = scale.clamp(min=1e-6)
+    pos = 1.0 - 0.5 * torch.exp(-x / safe_scale)
+    neg = 0.5 * torch.exp(x / safe_scale)
+    return torch.where(x >= 0, pos, neg)
+
+
+def _estimate_zero_mean_laplace_bits(symbols, split_tensor):
+    block_lengths = split_tensor.to(dtype=symbols.dtype).view(1, -1, 1)
+    max_block_len = symbols.shape[-1]
+    valid_mask = (
+        torch.arange(max_block_len, device=symbols.device, dtype=torch.long)
+        .view(1, 1, -1)
+        < split_tensor.view(1, -1, 1)
+    )
+    valid_mask_f = valid_mask.to(dtype=symbols.dtype)
+
+    # Zero-mean Laplace MLE: b = E[|x|]. We keep the estimate detached and
+    # let the rate loss push symbols toward smaller magnitudes.
+    block_scale = (
+        (symbols.detach().abs() * valid_mask_f).sum(dim=-1) / block_lengths.squeeze(-1).clamp(min=1.0)
+    ).clamp(min=1e-4)
+    block_scale = block_scale.unsqueeze(-1)
+
+    upper = _laplace_cdf(symbols + 0.5, block_scale)
+    lower = _laplace_cdf(symbols - 0.5, block_scale)
+    probs = (upper - lower).clamp(min=1e-9)
+    total_bits = (-torch.log2(probs) * valid_mask_f).sum()
+    return total_bits, block_scale.squeeze(-1)
+
+
+def estimate_zero_mean_laplace_block_scales(symbols, split):
+    squeeze_output = False
+    if symbols.dim() == 1:
+        symbols = symbols.reshape(-1, 1)
+        squeeze_output = True
+    if symbols.dim() != 2:
+        raise ValueError(f"Expected symbols to be 1D or 2D, got shape {tuple(symbols.shape)}")
+
+    split_tensor, block_ids, local_ids = _build_block_index_tensors(split, symbols.device)
+    max_block_len = int(split_tensor.max().item())
+    xt = symbols.transpose(0, 1).contiguous()
+    packed = xt.new_zeros((symbols.shape[1], len(split), max_block_len))
+    packed[:, block_ids, local_ids] = xt
+    _, block_scales = _estimate_zero_mean_laplace_bits(packed, split_tensor)
+    if squeeze_output:
+        return block_scales.reshape(-1)
+    return block_scales
+
+
+def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=False, return_ans_bits=False):
+    """
+    Quantize all attribute/block pairs in a single batched tensor path.
+    x can be [N] or [N, D], while qas are arranged in dim-major block order.
+    """
+    squeeze_output = False
+    if x.dim() == 1:
+        x = x.reshape(-1, 1)
+        squeeze_output = True
+    elif x.dim() != 2:
+        raise ValueError(f"Expected x to be 1D or 2D, got shape {tuple(x.shape)}")
+
+    flat_qas = list(qas)
+    n_points, n_dims = x.shape
+    n_blocks = len(split)
+    expected_qas = n_dims * n_blocks
+    if len(flat_qas) != expected_qas:
+        raise ValueError(f"Expected {expected_qas} quantizers, got {len(flat_qas)}")
+
+    split_tensor, block_ids, local_ids = _build_block_index_tensors(split, x.device)
+    if int(split_tensor.sum().item()) != n_points:
+        raise ValueError(f"Split sum {int(split_tensor.sum().item())} does not match input length {n_points}")
+
+    max_block_len = int(split_tensor.max().item())
+    xt = x.transpose(0, 1).contiguous()
+    packed = xt.new_zeros((n_dims, n_blocks, max_block_len))
+    packed[:, block_ids, local_ids] = xt
+
+    abs_packed = packed.abs()
+    block_lengths = split_tensor.to(dtype=x.dtype).view(1, n_blocks)
+
+    first_qa = flat_qas[0]
+    if hasattr(first_qa, "init_yet"):
+        block_abs_mean = abs_packed.sum(dim=-1) / block_lengths
+        for dim_idx in range(n_dims):
+            base = dim_idx * n_blocks
+            for block_idx in range(n_blocks):
+                qa = flat_qas[base + block_idx]
+                if not qa.init_yet:
+                    init_scale = block_abs_mean[dim_idx, block_idx] * 2 / (float(qa.thd_pos) ** 0.5)
+                    with torch.no_grad():
+                        qa.s.data.fill_(init_scale.item())
+                    qa.init_yet = True
+    elif hasattr(first_qa, "scale"):
+        block_abs_max = abs_packed.amax(dim=-1)
+        block_max = packed.amax(dim=-1)
+        for dim_idx in range(n_dims):
+            base = dim_idx * n_blocks
+            for block_idx in range(n_blocks):
+                qa = flat_qas[base + block_idx]
+                with torch.no_grad():
+                    if qa.all_positive:
+                        current_max = block_max[dim_idx, block_idx].detach()
+                        if qa.max_val.nelement() == 0 or qa.max_val.data < current_max.data:
+                            qa.max_val.data = current_max.data
+                        qa.max_val.clamp_(min=0)
+                        qa.min_val.data = torch.zeros_like(qa.max_val.data)
+                        qmax = max(float(qa.thd_pos), 1.0)
+                        qa.scale = torch.clamp(qa.max_val / qmax, min=1e-8)
+                    else:
+                        current_abs_max = block_abs_max[dim_idx, block_idx].detach()
+                        if qa.max_val.nelement() == 0 or qa.max_val.data < current_abs_max.data:
+                            qa.max_val.data = current_abs_max.data
+                        qa.max_val.clamp_(min=1e-8)
+                        qa.min_val.data = -qa.max_val.data
+                        qmax = max(float(qa.thd_pos), 1.0)
+                        qa.scale = torch.clamp(qa.max_val / qmax, min=1e-8)
+                    qa.zero_point.data.zero_()
+    else:
+        raise ValueError(f"Unsupported quantizer type: {type(first_qa)}")
+
+    scale_entries = []
+    neg_entries = []
+    pos_entries = []
+    for qa in flat_qas:
+        if hasattr(qa, "s"):
+            scale_entries.append(qa.s.reshape(1))
+        else:
+            scale_entries.append(qa.scale.reshape(1))
+        neg_entries.append(scale_entries[-1].new_tensor(float(qa.thd_neg)))
+        pos_entries.append(scale_entries[-1].new_tensor(float(qa.thd_pos)))
+
+    scales = torch.stack(scale_entries, dim=0).view(n_dims, n_blocks, 1)
+    thd_neg = torch.stack(neg_entries, dim=0).view(n_dims, n_blocks, 1)
+    thd_pos = torch.stack(pos_entries, dim=0).view(n_dims, n_blocks, 1)
+
+    if hasattr(first_qa, "s"):
+        grad_factors = 1.0 / torch.sqrt(thd_pos.clamp(min=1.0) * block_lengths.view(1, n_blocks, 1))
+        scales = grad_scale(scales, grad_factors)
+
+    x_clamped = torch.clamp(packed / scales, thd_neg, thd_pos)
+    x_q = round_pass(x_clamped)
+    dequantized = x_q * scales
+
+    flat_clamped = x_clamped[:, block_ids, local_ids]
+    flat_symbols = x_q[:, block_ids, local_ids].transpose(0, 1).contiguous()
+    flat_dequantized = dequantized[:, block_ids, local_ids].transpose(0, 1).contiguous()
+
+    ans_bits = x.new_zeros(())
+    entropy_scales = None
+    encode_mode = getattr(first_qa, "encode", "deflate").lower()
+    needs_clamped_cache = any(getattr(qa, "encode", "deflate").lower() == "ans" for qa in flat_qas)
+    if return_ans_bits and encode_mode == "laplace":
+        ans_bits, entropy_scales = _estimate_zero_mean_laplace_bits(x_q, split_tensor)
+    if return_ans_bits or needs_clamped_cache:
+        for dim_idx in range(n_dims):
+            base = dim_idx * n_blocks
+            start = 0
+            for block_idx, length in enumerate(split):
+                qa = flat_qas[base + block_idx]
+                if getattr(qa, "encode", "deflate").lower() == "ans":
+                    clamped_block = flat_clamped[dim_idx, start:start + length]
+                    if return_ans_bits and qa.entropy_bottleneck is not None and length > 0:
+                        _, likelihoods = qa.entropy_bottleneck(clamped_block.view(1, 1, -1, 1))
+                        ans_bits = ans_bits + (-torch.log2(likelihoods.clamp(min=1e-9)).sum())
+                    qa.last_clamped = None
+                start += length
+
+    trans = None
+    if return_trans:
+        trans = []
+        for qa in flat_qas:
+            i_scale, i_zp, _ = qa.get_quant_params()
+            trans.extend([i_scale.item(), i_zp.item()])
+
+    if squeeze_output:
+        flat_dequantized = flat_dequantized.reshape(-1)
+        flat_symbols = flat_symbols.reshape(-1)
+
+    if return_symbols and return_trans and return_ans_bits:
+        return flat_dequantized, flat_symbols, trans, ans_bits
+    if return_symbols and return_trans:
+        return flat_dequantized, flat_symbols, trans
+    if return_symbols and return_ans_bits:
+        return flat_dequantized, flat_symbols, ans_bits
+    if return_symbols:
+        return flat_dequantized, flat_symbols
+    if return_trans and return_ans_bits:
+        return flat_dequantized, trans, ans_bits
+    if return_trans:
+        return flat_dequantized, trans
+    if return_ans_bits:
+        return flat_dequantized, ans_bits
+    return flat_dequantized
+
 class Round(Function):
     @staticmethod
     def forward(self, input):

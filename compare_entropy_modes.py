@@ -53,7 +53,7 @@ def parse_args():
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=["deflate", "ans"],
+        choices=["deflate", "ans", "laplace"],
         default=["deflate", "ans"],
         help="Entropy coding modes to run.",
     )
@@ -270,7 +270,11 @@ def prepare_probability_arrays(info):
         [float(info["estimated_probabilities"].get(str(v), 0.0)) for v in support_values],
         dtype=np.float64,
     )
-    return np.asarray(support_values, dtype=np.int32), empirical, estimated
+    laplace = np.array(
+        [float(info.get("laplace_probabilities", {}).get(str(v), 0.0)) for v in support_values],
+        dtype=np.float64,
+    )
+    return np.asarray(support_values, dtype=np.int32), empirical, estimated, laplace
 
 
 def select_tick_positions(x_values, max_ticks=17):
@@ -282,6 +286,65 @@ def select_tick_positions(x_values, max_ticks=17):
 
 def sanitize_name(name):
     return "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
+
+
+def laplace_cdf(x_values, scale):
+    safe_scale = max(float(scale), 1e-8)
+    x_values = np.asarray(x_values, dtype=np.float64)
+    positive = 1.0 - 0.5 * np.exp(-x_values / safe_scale)
+    negative = 0.5 * np.exp(x_values / safe_scale)
+    return np.where(x_values >= 0.0, positive, negative)
+
+
+def estimate_zero_mean_laplace_probability(info):
+    support_values = np.asarray(info["support_values"], dtype=np.int32)
+    counts = np.array(
+        [int(info["histogram_counts"].get(str(v), 0)) for v in support_values],
+        dtype=np.float64,
+    )
+    symbol_count = max(int(info["symbol_count"]), 0)
+    if symbol_count == 0 or support_values.size == 0:
+        return {}, 0.0, 0.0
+
+    scale = float(np.sum(np.abs(support_values.astype(np.float64)) * counts) / max(symbol_count, 1))
+    scale = max(scale, 1e-4)
+    probs = laplace_cdf(support_values + 0.5, scale) - laplace_cdf(support_values - 0.5, scale)
+    probs = np.clip(probs, 1e-12, None)
+    support_mass = float(probs.sum())
+    normalized = probs / max(support_mass, 1e-12)
+    probabilities = {
+        str(int(symbol)): float(prob)
+        for symbol, prob in zip(support_values.tolist(), normalized.tolist())
+    }
+    return probabilities, support_mass, scale
+
+
+def compute_probability_fit_metrics(empirical, estimated):
+    empirical = np.asarray(empirical, dtype=np.float64)
+    estimated = np.asarray(estimated, dtype=np.float64)
+    if empirical.size == 0:
+        return {
+            "mae": None,
+            "l1": None,
+            "entropy_bits": None,
+            "cross_entropy_bits": None,
+            "kl_empirical_to_model_bits": None,
+        }
+
+    mae = float(np.mean(np.abs(empirical - estimated)))
+    l1 = float(np.sum(np.abs(empirical - estimated)))
+    empirical_safe = np.clip(empirical, 1e-12, None)
+    estimated_safe = np.clip(estimated, 1e-12, None)
+    entropy_bits = float(-np.sum(empirical_safe * np.log2(empirical_safe)))
+    cross_entropy_bits = float(-np.sum(empirical_safe * np.log2(estimated_safe)))
+    kl_bits = float(cross_entropy_bits - entropy_bits)
+    return {
+        "mae": mae,
+        "l1": l1,
+        "entropy_bits": entropy_bits,
+        "cross_entropy_bits": cross_entropy_bits,
+        "kl_empirical_to_model_bits": kl_bits,
+    }
 
 
 def clone_module_state_to_cpu(module):
@@ -437,217 +500,85 @@ def quantize_raht_ac(gaussians, C, per_block_quant):
 
 def build_group_fit_targets(gaussians, qci, dim_bits, dim_ranges):
     group_data = gaussians.build_ans_group_tensors_from_qci(qci.astype(np.float32))
-    targets = {}
-
-    total_symbols = 0
-    for attr_group in ATTR_GROUP_ORDER:
-        dims = gaussians.get_attr_group_dims(attr_group)
-        group_support_min = min(dim_ranges[idx][0] for idx in dims)
-        group_support_max = max(dim_ranges[idx][1] for idx in dims)
-        support_values = list(range(group_support_min, group_support_max + 1))
-        support_size = len(support_values)
-
-        for subgroup_idx in range(gaussians.ans_effective_subgroup_count):
-            group_key = gaussians.get_ans_group_key(attr_group, subgroup_idx)
-            symbols_list = group_data[group_key]
-            counts = np.zeros((support_size,), dtype=np.float32)
-            symbol_count = 0
-
-            if symbols_list:
-                symbols = torch.cat(symbols_list).detach().cpu().numpy().astype(np.int32)
-                symbol_count = int(symbols.size)
-                if symbol_count > 0:
-                    unique_vals, unique_counts = np.unique(symbols, return_counts=True)
-                    indices = unique_vals - group_support_min
-                    valid_mask = (indices >= 0) & (indices < support_size)
-                    counts[indices[valid_mask]] = unique_counts[valid_mask].astype(np.float32)
-
-            targets[group_key] = {
-                "support_values": support_values,
-                "support_min": int(group_support_min),
-                "support_max": int(group_support_max),
-                "counts": counts,
-                "symbol_count": symbol_count,
-            }
-            total_symbols += symbol_count
-
-    return targets, total_symbols
+    return gaussians.build_export_ans_fit_targets(group_data, dim_ranges)
 
 
 def build_group_diagnostics(gaussians, qci, dim_bits, dim_ranges):
-    group_data = gaussians.build_ans_group_tensors_from_qci(qci.astype(np.float32))
-    row_subgroups = np.asarray(getattr(gaussians, "raht_subgroup_ids", np.zeros((0,), dtype=np.int64)))
+    diagnostics = gaussians.build_ans_probability_diagnostics(qci.astype(np.float32), dim_bits, dim_ranges)
+    diagnostics["total_ac_rows"] = int(qci.shape[0])
+    diagnostics["total_ac_symbols"] = int(qci.size)
+    compressai_maes = []
+    laplace_maes = []
+    total_symbol_count = 0
+    compressai_cross_entropy_sum = 0.0
+    laplace_cross_entropy_sum = 0.0
+    empirical_entropy_sum = 0.0
 
-    diagnostics = {
-        "effective_subgroup_count": int(gaussians.ans_effective_subgroup_count),
-        "total_ac_rows": int(qci.shape[0]),
-        "total_ac_symbols": int(qci.size),
-        "groups": {},
-        "aggregated_groups": {},
-        "totals": {
-            "fixed_length_bits": 0,
-            "empirical_entropy_bits": 0.0,
-            "ans_theoretical_gain_upper_bound_bits": 0.0,
-        },
+    for block_info in diagnostics["blocks"].values():
+        laplace_probabilities, laplace_support_mass, laplace_scale = estimate_zero_mean_laplace_probability(block_info)
+        block_info["laplace_probabilities"] = laplace_probabilities
+        block_info["laplace_probability_mass_on_support"] = float(laplace_support_mass)
+        block_info["laplace_scale"] = float(laplace_scale)
+
+        _, empirical, estimated, laplace = prepare_probability_arrays(block_info)
+        compressai_metrics = compute_probability_fit_metrics(empirical, estimated)
+        laplace_metrics = compute_probability_fit_metrics(empirical, laplace)
+        block_info["compressai_fit"] = compressai_metrics
+        block_info["laplace_fit"] = laplace_metrics
+
+        if compressai_metrics["mae"] is not None:
+            compressai_maes.append(float(compressai_metrics["mae"]))
+        if laplace_metrics["mae"] is not None:
+            laplace_maes.append(float(laplace_metrics["mae"]))
+        symbol_count = int(block_info["symbol_count"])
+        if symbol_count > 0:
+            total_symbol_count += symbol_count
+            empirical_entropy_sum += float(compressai_metrics["entropy_bits"]) * symbol_count
+            compressai_cross_entropy_sum += float(compressai_metrics["cross_entropy_bits"]) * symbol_count
+            laplace_cross_entropy_sum += float(laplace_metrics["cross_entropy_bits"]) * symbol_count
+
+    diagnostics["fit_summary"] = {
+        "compressai_mean_mae": float(np.mean(compressai_maes)) if compressai_maes else None,
+        "laplace_mean_mae": float(np.mean(laplace_maes)) if laplace_maes else None,
+        "block_count_with_symbols": int(len(compressai_maes)),
+        "symbol_count_with_fit": int(total_symbol_count),
+        "empirical_entropy_bits_per_symbol": (
+            float(empirical_entropy_sum / total_symbol_count) if total_symbol_count > 0 else None
+        ),
+        "compressai_cross_entropy_bits_per_symbol": (
+            float(compressai_cross_entropy_sum / total_symbol_count) if total_symbol_count > 0 else None
+        ),
+        "laplace_cross_entropy_bits_per_symbol": (
+            float(laplace_cross_entropy_sum / total_symbol_count) if total_symbol_count > 0 else None
+        ),
+        "compressai_minus_laplace_cross_entropy_bits_per_symbol": (
+            float((compressai_cross_entropy_sum - laplace_cross_entropy_sum) / total_symbol_count)
+            if total_symbol_count > 0
+            else None
+        ),
     }
-
-    for attr_group in ATTR_GROUP_ORDER:
-        dims = gaussians.get_attr_group_dims(attr_group)
-        dim_bitwidths = [int(dim_bits[idx]) for idx in dims]
-        group_support_min = min(dim_ranges[idx][0] for idx in dims)
-        group_support_max = max(dim_ranges[idx][1] for idx in dims)
-        group_support = list(range(group_support_min, group_support_max + 1))
-        diagnostics["groups"][attr_group] = {}
-
-        for subgroup_idx in range(gaussians.ans_effective_subgroup_count):
-            group_key = gaussians.get_ans_group_key(attr_group, subgroup_idx)
-            row_mask = row_subgroups == subgroup_idx
-            row_count = int(row_mask.sum())
-            symbols_list = group_data[group_key]
-
-            if symbols_list:
-                symbols = torch.cat(symbols_list).detach().cpu().numpy().astype(np.int32)
-                unique_vals, unique_counts = np.unique(symbols, return_counts=True)
-                probabilities = unique_counts.astype(np.float64) / float(symbols.size)
-                empirical_entropy = float(-(probabilities * np.log2(probabilities)).sum())
-                histogram_counts = {
-                    str(int(symbol)): int(count)
-                    for symbol, count in zip(unique_vals.tolist(), unique_counts.tolist())
-                }
-                empirical_probabilities = {
-                    str(int(symbol)): float(prob)
-                    for symbol, prob in zip(unique_vals.tolist(), probabilities.tolist())
-                }
-            else:
-                symbols = np.zeros((0,), dtype=np.int32)
-                empirical_entropy = 0.0
-                histogram_counts = {}
-                empirical_probabilities = {}
-
-            eb = gaussians.get_ans_entropy_model(group_key)
-            estimated_probabilities, support_mass = estimate_distribution_from_entropy_model(
-                eb,
-                group_support,
-            )
-
-            fixed_length_bits = int(row_count * sum(dim_bitwidths))
-            empirical_total_bits = float(empirical_entropy * symbols.size)
-            ans_gain_upper_bound_bits = max(0.0, fixed_length_bits - empirical_total_bits)
-
-            diagnostics["groups"][attr_group][f"sg{subgroup_idx}"] = {
-                "group_key": group_key,
-                "subgroup_index": int(subgroup_idx),
-                "row_count": row_count,
-                "dim_count": int(len(dims)),
-                "dim_indices": [int(idx) for idx in dims],
-                "bitwidths": dim_bitwidths,
-                "support_min": int(group_support_min),
-                "support_max": int(group_support_max),
-                "support_values": [int(v) for v in group_support],
-                "symbol_count": int(symbols.size),
-                "histogram_counts": histogram_counts,
-                "empirical_probabilities": empirical_probabilities,
-                "estimated_probabilities": estimated_probabilities,
-                "estimated_probability_mass_on_support": support_mass,
-                "empirical_entropy_bits_per_symbol": empirical_entropy,
-                "empirical_entropy_bits_total": empirical_total_bits,
-                "fixed_length_bits_total": fixed_length_bits,
-                "fixed_length_bits_per_symbol": (
-                    float(fixed_length_bits) / float(symbols.size) if symbols.size else 0.0
-                ),
-                "ans_theoretical_size_bits": empirical_total_bits,
-                "ans_theoretical_gain_upper_bound_bits": ans_gain_upper_bound_bits,
-                "ans_theoretical_gain_upper_bound_bytes": ans_gain_upper_bound_bits / 8.0,
-            }
-
-            diagnostics["totals"]["fixed_length_bits"] += fixed_length_bits
-            diagnostics["totals"]["empirical_entropy_bits"] += empirical_total_bits
-            diagnostics["totals"]["ans_theoretical_gain_upper_bound_bits"] += (
-                ans_gain_upper_bound_bits
-            )
-
-        aggregated_counts = {}
-        aggregated_empirical_probs = {}
-        aggregated_estimated_probs = {str(v): 0.0 for v in group_support}
-        total_group_symbols = 0
-
-        for subgroup_name, subgroup_info in diagnostics["groups"][attr_group].items():
-            total_group_symbols += subgroup_info["symbol_count"]
-
-            for symbol, count in subgroup_info["histogram_counts"].items():
-                aggregated_counts[symbol] = aggregated_counts.get(symbol, 0) + count
-
-            weight = subgroup_info["symbol_count"]
-            if weight > 0:
-                for symbol, prob in subgroup_info["estimated_probabilities"].items():
-                    aggregated_estimated_probs[symbol] = (
-                        aggregated_estimated_probs.get(symbol, 0.0)
-                        + prob * weight
-                    )
-
-        if total_group_symbols > 0:
-            aggregated_empirical_probs = {
-                symbol: float(count) / float(total_group_symbols)
-                for symbol, count in aggregated_counts.items()
-            }
-            aggregated_estimated_probs = {
-                symbol: float(prob) / float(total_group_symbols)
-                for symbol, prob in aggregated_estimated_probs.items()
-            }
-        else:
-            aggregated_estimated_probs = {symbol: 0.0 for symbol in aggregated_estimated_probs}
-
-        diagnostics["aggregated_groups"][attr_group] = {
-            "bitwidths": dim_bitwidths,
-            "dim_indices": [int(idx) for idx in dims],
-            "support_min": int(group_support_min),
-            "support_max": int(group_support_max),
-            "support_values": [int(v) for v in group_support],
-            "symbol_count": int(total_group_symbols),
-            "histogram_counts": aggregated_counts,
-            "empirical_probabilities": aggregated_empirical_probs,
-            "estimated_probabilities": aggregated_estimated_probs,
-        }
-
-    diagnostics["totals"]["fixed_length_bytes"] = diagnostics["totals"]["fixed_length_bits"] / 8.0
-    diagnostics["totals"]["empirical_entropy_bytes"] = diagnostics["totals"]["empirical_entropy_bits"] / 8.0
-    diagnostics["totals"]["ans_theoretical_gain_upper_bound_bytes"] = (
-        diagnostics["totals"]["ans_theoretical_gain_upper_bound_bits"] / 8.0
-    )
+    diagnostics["totals"] = {
+        "block_count": int(diagnostics.get("block_count", len(diagnostics.get("blocks", {})))),
+        "total_ac_rows": int(diagnostics["total_ac_rows"]),
+        "total_ac_symbols": int(diagnostics["total_ac_symbols"]),
+        "block_count_with_symbols": int(len(compressai_maes)),
+        "symbol_count_with_fit": int(total_symbol_count),
+    }
     return diagnostics
 
 
 def print_group_diagnostics(diagnostics):
     print("\n===== Symbol Diagnostics =====")
-    print(
-        "Group/Subgroup | Symbols | H(bits/sym) | Fixed(bits/sym) | "
-        "Fixed(MB) | H(MB) | ANS Gain Max(MB)"
-    )
-
-    for attr_group in ATTR_GROUP_ORDER:
-        for subgroup_name, info in diagnostics["groups"][attr_group].items():
-            if info["symbol_count"] == 0:
-                continue
-            print(
-                f"{attr_group:9s}/{subgroup_name:4s} | "
-                f"{info['symbol_count']:8d} | "
-                f"{info['empirical_entropy_bits_per_symbol']:11.4f} | "
-                f"{info['fixed_length_bits_per_symbol']:15.4f} | "
-                f"{info['fixed_length_bits_total'] / 8.0 / 1024 / 1024:9.4f} | "
-                f"{info['empirical_entropy_bits_total'] / 8.0 / 1024 / 1024:6.4f} | "
-                f"{info['ans_theoretical_gain_upper_bound_bits'] / 8.0 / 1024 / 1024:15.4f}"
-            )
-
-    totals = diagnostics["totals"]
-    print(
-        "TOTAL          | "
-        f"{diagnostics['total_ac_symbols']:8d} | "
-        f"{(totals['empirical_entropy_bits'] / max(diagnostics['total_ac_symbols'], 1)):11.4f} | "
-        f"{(totals['fixed_length_bits'] / max(diagnostics['total_ac_symbols'], 1)):15.4f} | "
-        f"{totals['fixed_length_bytes'] / 1024 / 1024:9.4f} | "
-        f"{totals['empirical_entropy_bytes'] / 1024 / 1024:6.4f} | "
-        f"{totals['ans_theoretical_gain_upper_bound_bytes'] / 1024 / 1024:15.4f}"
-    )
+    print("QA Block    | Symbols | Support | Attr/Dim/Block")
+    for qa_key, info in diagnostics["blocks"].items():
+        if info["symbol_count"] == 0:
+            continue
+        print(
+            f"{qa_key:10s} | "
+            f"{info['symbol_count']:8d} | "
+            f"[{info['support_min']:4d}, {info['support_max']:4d}] | "
+            f"{info['attr_group']}/d{info['dim_idx']:02d}/b{info['block_idx']:02d}"
+        )
 
 
 def collect_symbol_diagnostics(args, ply_format, importance, bit_config, output_dir):
@@ -695,18 +626,35 @@ def collect_symbol_diagnostics(args, ply_format, importance, bit_config, output_
 
 def print_probability_distribution_summary(diagnostics):
     print("\n===== Probability Distributions =====")
-    for attr_group in ATTR_GROUP_ORDER:
-        info = diagnostics["aggregated_groups"][attr_group]
+    fit_summary = diagnostics.get("fit_summary", {})
+    if fit_summary:
         print(
-            f"{attr_group:9s} | symbols={info['symbol_count']:8d} | "
+            "Global fit | "
+            f"CompressAI mean MAE={fit_summary.get('compressai_mean_mae')} | "
+            f"Laplace mean MAE={fit_summary.get('laplace_mean_mae')}"
+        )
+        print(
+            "Cross entropy (bits/sym) | "
+            f"empirical={fit_summary.get('empirical_entropy_bits_per_symbol')} | "
+            f"CompressAI={fit_summary.get('compressai_cross_entropy_bits_per_symbol')} | "
+            f"Laplace={fit_summary.get('laplace_cross_entropy_bits_per_symbol')} | "
+            f"delta(C-L)={fit_summary.get('compressai_minus_laplace_cross_entropy_bits_per_symbol')}"
+        )
+    for qa_key, info in diagnostics["blocks"].items():
+        print(
+            f"{qa_key:9s} | symbols={info['symbol_count']:8d} | "
             f"support=[{info['support_min']}, {info['support_max']}] | "
-            f"hist_bins={len(info['histogram_counts'])}"
+            f"hist_bins={len(info['histogram_counts'])} | "
+            f"cmp_mae={info['compressai_fit']['mae']} | "
+            f"lap_mae={info['laplace_fit']['mae']} | "
+            f"cmp_ce={info['compressai_fit']['cross_entropy_bits']} | "
+            f"lap_ce={info['laplace_fit']['cross_entropy_bits']}"
         )
 
 
 def plot_probability_distribution(info, title, save_path):
     plt = get_matplotlib_pyplot()
-    x_values, empirical, estimated = prepare_probability_arrays(info)
+    x_values, empirical, estimated, laplace = prepare_probability_arrays(info)
 
     fig, axes = plt.subplots(
         2,
@@ -731,6 +679,14 @@ def plot_probability_distribution(info, title, save_path):
         color="#D94841",
         linewidth=1.8,
         label="CompressAI estimated probability",
+    )
+    axes[0].plot(
+        x_values,
+        laplace,
+        color="#59A14F",
+        linewidth=1.8,
+        linestyle="--",
+        label=f"Zero-mean Laplace fit (b={info.get('laplace_scale', 0.0):.4f})",
     )
     axes[0].set_ylabel("Probability")
     axes[0].set_title(title)
@@ -765,34 +721,20 @@ def plot_probability_distribution(info, title, save_path):
 
 def create_probability_plots(diagnostics, output_dir):
     plots_root = output_dir / "probability_plots"
-    aggregated_dir = plots_root / "aggregated"
-    subgroup_dir = plots_root / "subgroups"
-    manifest = {
-        "aggregated": {},
-        "subgroups": {},
-    }
+    blocks_dir = plots_root / "blocks"
+    manifest = {"blocks": {}}
 
-    for attr_group in ATTR_GROUP_ORDER:
-        aggregated_info = diagnostics["aggregated_groups"][attr_group]
-        aggregated_path = aggregated_dir / f"{sanitize_name(attr_group)}.png"
+    for qa_key, block_info in diagnostics["blocks"].items():
+        if block_info["symbol_count"] == 0:
+            continue
+        block_path = blocks_dir / block_info["attr_group"] / f"{sanitize_name(qa_key)}.png"
         title = (
-            f"{attr_group} | empirical vs CompressAI estimated probability "
-            f"(symbols={aggregated_info['symbol_count']})"
+            f"{block_info['attr_group']} | dim {block_info['dim_idx']} | "
+            f"block {block_info['block_idx']} | empirical vs CompressAI/Laplace "
+            f"(symbols={block_info['symbol_count']})"
         )
-        plot_probability_distribution(aggregated_info, title, aggregated_path)
-        manifest["aggregated"][attr_group] = str(aggregated_path.resolve())
-
-        manifest["subgroups"][attr_group] = {}
-        for subgroup_name, subgroup_info in diagnostics["groups"][attr_group].items():
-            if subgroup_info["symbol_count"] == 0:
-                continue
-            subgroup_path = subgroup_dir / attr_group / f"{sanitize_name(subgroup_name)}.png"
-            subgroup_title = (
-                f"{attr_group}/{subgroup_name} | empirical vs CompressAI estimated probability "
-                f"(symbols={subgroup_info['symbol_count']})"
-            )
-            plot_probability_distribution(subgroup_info, subgroup_title, subgroup_path)
-            manifest["subgroups"][attr_group][subgroup_name] = str(subgroup_path.resolve())
+        plot_probability_distribution(block_info, title, block_path)
+        manifest["blocks"][qa_key] = str(block_path.resolve())
 
     manifest_path = plots_root / "plot_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -801,18 +743,20 @@ def create_probability_plots(diagnostics, output_dir):
 
 def create_fit_progress_plots(diagnostics, output_dir, step):
     plots_root = output_dir / "probability_plots_fit_progress" / f"step_{step:04d}"
-    aggregated_dir = plots_root / "aggregated"
-    manifest = {"aggregated": {}}
+    blocks_dir = plots_root / "blocks"
+    manifest = {"blocks": {}}
 
-    for attr_group in ATTR_GROUP_ORDER:
-        aggregated_info = diagnostics["aggregated_groups"][attr_group]
-        aggregated_path = aggregated_dir / f"{sanitize_name(attr_group)}.png"
+    for qa_key, block_info in diagnostics["blocks"].items():
+        if block_info["symbol_count"] == 0:
+            continue
+        block_path = blocks_dir / block_info["attr_group"] / f"{sanitize_name(qa_key)}.png"
         title = (
-            f"{attr_group} | fitted step {step} | empirical vs CompressAI estimated probability "
-            f"(symbols={aggregated_info['symbol_count']})"
+            f"{block_info['attr_group']} | dim {block_info['dim_idx']} | "
+            f"block {block_info['block_idx']} | fitted step {step} | "
+            f"symbols={block_info['symbol_count']}"
         )
-        plot_probability_distribution(aggregated_info, title, aggregated_path)
-        manifest["aggregated"][attr_group] = str(aggregated_path.resolve())
+        plot_probability_distribution(block_info, title, block_path)
+        manifest["blocks"][qa_key] = str(block_path.resolve())
 
     manifest_path = plots_root / "plot_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -1105,6 +1049,7 @@ def main():
         "ans_subgroup_count": int(args.ans_subgroup_count),
         "symbol_diagnostics_path": str(diagnostics_path.resolve()),
         "symbol_diagnostics_totals": symbol_diagnostics["totals"],
+        "fit_summary": symbol_diagnostics.get("fit_summary", {}),
         "probability_plots_dir": str(plot_root.resolve()) if plot_root is not None else None,
         "probability_plot_manifest": (
             str(plot_manifest_path.resolve()) if plot_manifest_path is not None else None

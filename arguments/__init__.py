@@ -13,7 +13,7 @@ import os
 import sys
 from argparse import ArgumentParser, Namespace
 
-MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_ARG = True
+MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_ARG = False
 DEFAULT_SAVE_PROBABILITY_PLOTS = False
 
 
@@ -78,11 +78,14 @@ class ModelParams(ParamGroup):
         self.num_bits=8
         self.lambda_sparsity=5e-7  # PCS25的稀疏性损失权重
         self.quant_type="lsq"  # 量化器类型: "lsq" 或 "vanilla"
-        self.encode="deflate" # 熵编码方式: "deflate" 或 "ANS"
+        self.encode="deflate" # 熵编码方式: "deflate"、"ans" 或 "laplace"
         self.lambda_rate=0.001  # 使用ANS熵编码时的R权重
-        self.ans_subgroup_count=4
-        self.export_ans_offline_fit=True
-        self.export_ans_offline_fit_steps=1000
+        self.rate_grad_diag=False
+        self.rate_grad_diag_interval=10
+        self.rate_grad_diag_step=1e-4
+        self.ans_subgroup_count=1
+        self.export_ans_offline_fit=False
+        self.export_ans_offline_fit_steps=100
         self.export_ans_offline_fit_plot_interval=100
         self.export_ans_offline_fit_main_lr=1e-3
         self.export_ans_offline_fit_aux_lr=1e-3

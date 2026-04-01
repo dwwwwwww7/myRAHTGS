@@ -21,7 +21,11 @@ from torch.autograd import Function
 from raht_torch import itransform_batched_torch, transform_batched_torch
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
-from utils.quant_utils import split_length
+from utils.quant_utils import (
+    batched_quantize_blocks,
+    estimate_zero_mean_laplace_block_scales,
+    split_length,
+)
 
 PROFILE_TIME = True # Macro added for time profiling
 if PROFILE_TIME:
@@ -238,27 +242,13 @@ def render(viewpoint_camera,
 
 
 def seg_quant(x, lseg, qas):
-    lx = x.shape[0]
-    cnt = 0
-    outs = []
-    for i in range(0, lx, lseg):
-        if i + lseg < lx:
-            r = i + lseg 
-        else:
-            r = lx
-        outs.append(qas[cnt](x[i:r]))
-        cnt+=1
-    return torch.concat(outs, dim=0)
+    split = [lseg] * (x.shape[0] // lseg)
+    if x.shape[0] % lseg:
+        split.append(x.shape[0] % lseg)
+    return batched_quantize_blocks(x, split, qas)
 
 def seg_quant_ave(x, split, qas):
-    start = 0
-    cnt = 0
-    outs = []
-    for length in split:
-        outs.append(qas[cnt](x[start:start+length]))
-        cnt += 1
-        start += length
-    return torch.concat(outs, dim=0)
+    return batched_quantize_blocks(x, split, qas)
 
 
 def ft_render(
@@ -355,6 +345,10 @@ def ft_render(
             print("\n【RAHT变换】正向变换")
             print(f"  输入特征维度: 55 (opacity + euler + f_dc + f_rest + scale)")
         
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_feature_prep_start = time.time()
+
         r = pc.get_ori_rotation
         norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
         q = r / norm[:, None]
@@ -374,6 +368,10 @@ def ft_render(
             print(f"  rf 范围: [{rf.min().item():.4f}, {rf.max().item():.4f}]")
 
         C = rf[pc.reorder]
+
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_feature_prep_end = time.time()
         
         if should_print_debug:
             print(f"  Morton排序后 C 形状: {C.shape}")
@@ -413,13 +411,27 @@ def ft_render(
 
         quantC = torch.zeros_like(C)
         quantC[0] = C[0]
+        total_ans_bits = torch.tensor(0.0, device="cuda")
+        encode_mode = getattr(pc.qas[0], 'encode', 'deflate').lower() if hasattr(pc, 'qas') and len(pc.qas) > 0 else "deflate"
+        uses_rate_model = (
+            raht
+            and hasattr(pc, 'qas')
+            and len(pc.qas) > 0
+            and encode_mode in ("ans", "laplace")
+        )
+
+        # 量化
         if per_channel_quant:
-            for i in range(C.shape[-1]):
-                if hasattr(pc.qas[i], 'init_yet') and not pc.qas[i].init_yet:
-                    pc.qas[i].init_from(C[1:, i])
-                quantC[1:, i] = pc.qas[i](C[1:, i])
+            if uses_rate_model:
+                quantC[1:], total_ans_bits = batched_quantize_blocks(
+                    C[1:],
+                    [C.shape[0] - 1],
+                    pc.qas,
+                    return_ans_bits=True,
+                )
+            else:
+                quantC[1:] = batched_quantize_blocks(C[1:], [C.shape[0] - 1], pc.qas)
         elif per_block_quant:
-            qa_cnt = 0
             lc1 = C.shape[0] - 1
             split_ac = split_length(lc1, pc.n_block)
             
@@ -427,113 +439,65 @@ def ft_render(
                 print(f"  块数量: {pc.n_block}")
                 print(f"  每块点数: {split_ac[:3]}... (前3块)")
                 print(f"  量化 55 维 RAHT 特征 (包含 scale)...")
-            
-            for i in range(C.shape[-1]):
-                for j, length in enumerate(split_ac):
-                    qa_idx = qa_cnt + j
-                    if hasattr(pc.qas[qa_idx], 'init_yet') and not pc.qas[qa_idx].init_yet:
-                        start_idx = sum(split_ac[:j]) + 1
-                        end_idx = start_idx + length
-                        pc.qas[qa_idx].init_from(C[start_idx:end_idx, i])
 
-                quantC[1:, i] = seg_quant_ave(C[1:, i], split_ac, pc.qas[qa_cnt : qa_cnt + pc.n_block])
-                qa_cnt += pc.n_block
+            if uses_rate_model:
+                quantC[1:], total_ans_bits = batched_quantize_blocks(
+                    C[1:],
+                    split_ac,
+                    pc.qas,
+                    return_ans_bits=True,
+                )
+            else:
+                quantC[1:] = batched_quantize_blocks(C[1:], split_ac, pc.qas)
             
             if should_print_debug:
-                print(f"  所有特征量化完成，使用了 {qa_cnt} 个量化器 (55 × {pc.n_block})")
+                print(f"  所有特征量化完成，使用了 {len(pc.qas)} 个量化器 (55 × {pc.n_block})")
             
         else:
             if hasattr(pc.qa, 'init_yet') and not pc.qa.init_yet:
                 pc.qa.init_from(C[1:])
             quantC[1:] = pc.qa(C[1:])
+            if encode_mode == "ans" and getattr(pc.qa, "entropy_bottleneck", None) is not None:
+                if hasattr(pc.qa, "s"):
+                    x_clamped = torch.clamp(quantC[1:] / pc.qa.s, pc.qa.thd_neg, pc.qa.thd_pos)
+                else:
+                    x_clamped = torch.clamp(quantC[1:] / pc.qa.scale, pc.qa.thd_neg, pc.qa.thd_pos)
+                _, likelihoods = pc.qa.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
+                total_ans_bits = -torch.log2(likelihoods.clamp(min=1e-9)).sum()
+            elif encode_mode == "laplace":
+                block_scales = estimate_zero_mean_laplace_block_scales(quantC[1:], [quantC.shape[0] - 1])
+                safe_scale = block_scales.reshape(1, -1).clamp(min=1e-6)
+                upper = torch.where(
+                    quantC[1:] + 0.5 >= 0,
+                    1.0 - 0.5 * torch.exp(-(quantC[1:] + 0.5) / safe_scale),
+                    0.5 * torch.exp((quantC[1:] + 0.5) / safe_scale),
+                )
+                lower = torch.where(
+                    quantC[1:] - 0.5 >= 0,
+                    1.0 - 0.5 * torch.exp(-(quantC[1:] - 0.5) / safe_scale),
+                    0.5 * torch.exp((quantC[1:] - 0.5) / safe_scale),
+                )
+                total_ans_bits = -torch.log2((upper - lower).clamp(min=1e-9)).sum()
 
         if PROFILE_TIME:
             torch.cuda.synchronize()
             t_quant_end = time.time()
-        
-        # === ANS 批处理优化 (按 7 个语义属性组并行) ===
-        total_ans_bits = torch.tensor(0.0, device="cuda")
-        if raht and hasattr(pc, 'qas') and len(pc.qas) > 0:
-            if False and getattr(pc.qas[0], 'encode', 'deflate').lower() == "ans":
-                # 定义 7 个属性组容器和对应的 EB 实例映射
-                group_data = {
-                    'opacity': [], 'euler': [], 'f_dc': [],
-                    'f_rest_0': [], 'f_rest_1': [], 'f_rest_2': [], 'scale': []
-                }
-                group_ebs = {}
 
-                # 遍历 55 个 RAHT 维度 (opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3))
-                for dim_idx in range(55):
-                    # 确定当前维度所属的 CDF 共享组
-                    if dim_idx == 0: g_key = 'opacity'
-                    elif 1 <= dim_idx <= 3: g_key = 'euler'
-                    elif 4 <= dim_idx <= 6: g_key = 'f_dc'
-                    elif 7 <= dim_idx <= 15: g_key = 'f_rest_0'
-                    elif 16 <= dim_idx <= 30: g_key = 'f_rest_1'
-                    elif 31 <= dim_idx <= 51: g_key = 'f_rest_2'
-                    else: g_key = 'scale'
-                    
-                    # 每个维度包含 n_block 个分块量化器
-                    for b_idx in range(pc.n_block):
-                        qa_idx = dim_idx * pc.n_block + b_idx
-                        qa = pc.qas[qa_idx]
-                        if hasattr(qa, 'last_clamped') and qa.last_clamped is not None:
-                            group_data[g_key].append(qa.last_clamped.flatten())
-                            if g_key not in group_ebs:
-                                group_ebs[g_key] = qa.entropy_bottleneck
-                            qa.last_clamped = None # 计算前清空缓存，节省显存
-
-                # 按照 7 个大类执行批处理概率建模
-                num_points = pc.get_xyz.shape[0]
-                for g_key, clamped_list in group_data.items():
-                    if clamped_list and g_key in group_ebs:
-                        eb = group_ebs[g_key]
-                        # 拼接组内所有维度和分块的数据 (例如 scale 组拼接后长度为 3*N)
-                        all_clamped = torch.cat(clamped_list).view(1, 1, -1, 1)
-                        _, likelihoods = eb(all_clamped)
-                        # 累加香农信息量 bits = -log2(P)
-                        group_bits = -torch.log2(likelihoods.clamp(min=1e-9)).sum()
-                        total_ans_bits += group_bits
-                        # avg_bpp = group_bits.item() / num_points if num_points > 0 else 0
-                        # print(f"  {g_key:<12} | {group_bits.item():<15.2f} | {avg_bpp:<12.4f}")
+        t_entropy_start = None
+        t_entropy_end = None
+        t_entropy_collect_end = None
+        t_entropy_model_start = None
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_entropy_start = time.time()
+            t_entropy_collect_end = t_entropy_start
+            t_entropy_model_start = t_entropy_start
+            t_entropy_end = t_entropy_start
 
         if should_print_debug:
             print("\n【RAHT变换】逆变换")
             print(f"  quantC 形状: {quantC.shape}")
             print(f"  quantC 范围: [{quantC.min().item():.4f}, {quantC.max().item():.4f}]")
-        
-        if raht and hasattr(pc, 'qas') and len(pc.qas) > 0:
-            if getattr(pc.qas[0], 'encode', 'deflate').lower() == "ans" and hasattr(pc, 'ans_entropy_bottlenecks'):
-                group_data = pc.build_empty_ans_group_data()
-                ac_subgroups = getattr(pc, 'raht_subgroup_ids', np.zeros((0,), dtype=np.int64))
-                ac_len = C.shape[0] - 1
-                split_for_ans = split_ac if per_block_quant else [ac_len]
-
-                for dim_idx in range(55):
-                    block_start = 0
-                    qa_base = dim_idx * len(split_for_ans)
-                    for block_idx, block_len in enumerate(split_for_ans):
-                        qa_idx = qa_base + block_idx
-                        if qa_idx >= len(pc.qas):
-                            continue
-                        qa = pc.qas[qa_idx]
-                        if hasattr(qa, 'last_clamped') and qa.last_clamped is not None:
-                            row_subgroups = ac_subgroups[block_start:block_start + block_len]
-                            pc.collect_ans_symbols_for_dim(
-                                group_data,
-                                dim_idx,
-                                qa.last_clamped.flatten(),
-                                row_subgroups,
-                            )
-                            qa.last_clamped = None
-                        block_start += block_len
-
-                for group_key, clamped_list in group_data.items():
-                    if clamped_list:
-                        eb = pc.get_ans_entropy_model(group_key)
-                        all_clamped = torch.cat(clamped_list).view(1, 1, -1, 1)
-                        _, likelihoods = eb(all_clamped)
-                        total_ans_bits += -torch.log2(likelihoods.clamp(min=1e-9)).sum()
 
         res_inv = pc.res_inv
         pos = res_inv['pos']
@@ -590,6 +554,10 @@ def ft_render(
             print(f"  raht_features 范围: [{raht_features.min().item():.4f}, {raht_features.max().item():.4f}]")
             print(f"  提取特征: opacity[0:1], euler[1:4], all_sh[4:52], scale[52:55]")
         
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_covariance_start = time.time()
+
         # Extract scale from raht_features (no longer need separate quantization)
         scalesq = raht_features[:, 52:55]  # Extract scale from RAHT features
         
@@ -607,6 +575,10 @@ def ft_render(
         eulers = raht_features[:, 1:4]
         cov3D_precomp = pc.covariance_activation_for_euler(scaling, 1.0, eulers)
 
+        if PROFILE_TIME:
+            torch.cuda.synchronize()
+            t_covariance_end = time.time()
+
         assert cov3D_precomp is not None
         
         opacity = raht_features[:, :1]
@@ -620,11 +592,17 @@ def ft_render(
         sh_zero = None
         sh_ones = None
         
+        t_sh_eval_start = None
+        t_sh_eval_end = None
         if pipe.use_indexed:
             sh_zero = raht_features[:, shzero_range[0]:].unsqueeze(1).contiguous()
             sh_ones = pc.get_features_extra.reshape(-1, (pc.max_sh_degree+1)**2 - 1, 3)
             sh_indices = pc.get_feature_indices
         else:
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_sh_eval_start = time.time()
+
             # When not using indexed mode, compute colors directly from SH coefficients
             # Extract all SH coefficients from raht_features: f_dc(3) + f_rest(45) = 48 dims
             all_sh_features = raht_features[:, shzero_range[0]:shzero_range[1]]  # [N, 48]
@@ -640,10 +618,17 @@ def ft_render(
             sh_zero = None
             sh_ones = None
             sh_indices = None
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_sh_eval_end = time.time()
     else:
         raise Exception("Sorry, w/o raht version is unimplemented.")
         
     # Call rasterizer with appropriate parameters based on type
+    if PROFILE_TIME:
+        torch.cuda.synchronize()
+        t_rasterize_start = time.time()
+
     if pipe.use_indexed:
         rendered_image, radii = rasterizer(
             means3D = means3D,
@@ -667,6 +652,10 @@ def ft_render(
             rotations = rotations,
             cov3D_precomp = cov3D_precomp)
 
+    if PROFILE_TIME:
+        torch.cuda.synchronize()
+        t_rasterize_end = time.time()
+
     # 返回结果，如果使用RAHT则包含系数C用于稀疏性损失
     result = {
         "render": rendered_image,
@@ -681,9 +670,16 @@ def ft_render(
         result["raht_coeffs"] = C[1:]  # 只返回AC系数，不包括DC
         if PROFILE_TIME:
             result["profile"] = {
+                "feature_prep": t_feature_prep_end - t_feature_prep_start,
                 "raht_forward": t_raht_forward_end - t_raht_forward_start,
                 "quant": t_quant_end - t_quant_start,
+                "entropy_collect": t_entropy_collect_end - t_entropy_start,
+                "entropy_model": t_entropy_end - t_entropy_model_start,
+                "entropy": t_entropy_end - t_entropy_start,
                 "raht_inverse": t_raht_inverse_end - t_raht_inverse_start,
+                "covariance": t_covariance_end - t_covariance_start,
+                "sh_eval": 0.0 if t_sh_eval_start is None else (t_sh_eval_end - t_sh_eval_start),
+                "rasterize_forward": t_rasterize_end - t_rasterize_start,
             }
     
     # 标记第一次渲染已完成

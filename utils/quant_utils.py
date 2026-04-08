@@ -1,4 +1,5 @@
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -157,7 +158,7 @@ def _laplace_bits_with_tail_clip(quantized_symbols, block_scale, block_mean=None
     2. Input 3-sigma clamp *before* the CDF: ``x ← clamp(x, -σb, σb)``.
        Outlier symbols are pulled to the boundary so their CDF interval
        probability remains a reasonable positive number and the gradient
-       still flows through the symbol value.
+       still flows through the symbol value.（没做）
     3. ``probs.clamp(min=1e-5)`` → max penalty ≈ 16.6 bits/element,
        prevents log(0) and keeps gradient magnitudes bounded.
 
@@ -237,7 +238,36 @@ def estimate_zero_mean_laplace_block_scales(symbols, split):
     return block_scales
 
 
-def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=False, return_ans_bits=False):
+def _sync_profile_device(device):
+    if device.type == "cuda":
+        torch.cuda.synchronize(device=device)
+
+
+def _flatten_quant_buffer(buffer, default_value, device, dtype):
+    if buffer is None or buffer.nelement() == 0:
+        return torch.as_tensor([default_value], device=device, dtype=dtype)
+    return buffer.detach().reshape(1).to(device=device, dtype=dtype)
+
+
+def _write_quant_buffer(module, name, value):
+    target = getattr(module, name)
+    value = value.detach().to(device=target.device, dtype=target.dtype)
+    if target.nelement() == value.nelement():
+        target.data.copy_(value.reshape_as(target))
+    else:
+        setattr(module, name, value.clone())
+
+
+def batched_quantize_blocks(
+    x,
+    split,
+    qas,
+    return_symbols=False,
+    return_trans=False,
+    return_ans_bits=False,
+    return_profile=False,
+    profile_time=False,
+):
     """
     Quantize all attribute/block pairs in a single batched tensor path.
     x can be [N] or [N, D], while qas are arranged in dim-major block order.
@@ -249,6 +279,22 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
     elif x.dim() != 2:
         raise ValueError(f"Expected x to be 1D or 2D, got shape {tuple(x.shape)}")
 
+    quant_profile = {
+        "index_prepare": 0.0,
+        "pack_scatter": 0.0,
+        "block_stat": 0.0,
+        "quant_param_update": 0.0,
+        "quant_param_stack": 0.0,
+        "quant_core": 0.0,
+        "entropy_bits": 0.0,
+        "trans_collect": 0.0,
+        "total": 0.0,
+    } if return_profile else None
+    total_start = None
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        total_start = time.perf_counter()
+
     flat_qas = list(qas)
     n_points, n_dims = x.shape
     n_blocks = len(split)
@@ -256,10 +302,20 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
     if len(flat_qas) != expected_qas:
         raise ValueError(f"Expected {expected_qas} quantizers, got {len(flat_qas)}")
 
+    stage_start = None
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        stage_start = time.perf_counter()
     split_tensor, block_ids, local_ids = _build_block_index_tensors(split, x.device)
     if int(split_tensor.sum().item()) != n_points:
         raise ValueError(f"Split sum {int(split_tensor.sum().item())} does not match input length {n_points}")
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["index_prepare"] = time.perf_counter() - stage_start
 
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        stage_start = time.perf_counter()
     max_block_len = int(split_tensor.max().item())
     xt = x.transpose(0, 1).contiguous()
     packed = xt.new_zeros((n_dims, n_blocks, max_block_len))
@@ -273,10 +329,21 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
     valid_mask_f = valid_mask.to(dtype=x.dtype)
     abs_packed = packed.abs()
     block_lengths = split_tensor.to(dtype=x.dtype).view(1, n_blocks)
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["pack_scatter"] = time.perf_counter() - stage_start
 
     first_qa = flat_qas[0]
     if hasattr(first_qa, "init_yet"):
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
         block_abs_mean = (abs_packed * valid_mask_f).sum(dim=-1) / block_lengths
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            quant_profile["block_stat"] = time.perf_counter() - stage_start
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
         for dim_idx in range(n_dims):
             base = dim_idx * n_blocks
             for block_idx in range(n_blocks):
@@ -286,63 +353,136 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
                     with torch.no_grad():
                         qa.s.data.fill_(init_scale.item())
                     qa.init_yet = True
+        if quant_profile is not None and profile_time:
+            quant_profile["quant_param_update"] = time.perf_counter() - stage_start
     elif hasattr(first_qa, "scale"):
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
         neg_fill = torch.full_like(packed, torch.finfo(packed.dtype).min)
         pos_fill = torch.full_like(packed, torch.finfo(packed.dtype).max)
         block_abs_max = torch.where(valid_mask, abs_packed, abs_packed.new_zeros(1)).amax(dim=-1)
         block_max = torch.where(valid_mask, packed, neg_fill).amax(dim=-1)
         block_min = torch.where(valid_mask, packed, pos_fill).amin(dim=-1)
-        for dim_idx in range(n_dims):
-            base = dim_idx * n_blocks
-            for block_idx in range(n_blocks):
-                qa = flat_qas[base + block_idx]
-                with torch.no_grad():
-                    if getattr(qa, "withzeropoint", False):
-                        current_max = block_max[dim_idx, block_idx].detach()
-                        current_min = block_min[dim_idx, block_idx].detach()
-                        if qa.max_val.nelement() == 0 or qa.max_val.data < current_max.data:
-                            qa.max_val.data = current_max.data
-                        if qa.min_val.nelement() == 0 or qa.min_val.data > current_min.data:
-                            qa.min_val.data = current_min.data
-                        if qa.all_positive:
-                            qa.max_val.clamp_(min=0)
-                            qa.min_val.clamp_(max=0)
-                        qa.max_val.data = torch.maximum(
-                            qa.max_val.data,
-                            qa.min_val.data + qa.max_val.new_tensor(1e-8),
-                        )
-                        scale, zero_point = calcScaleZeroPoint(
-                            qa.min_val,
-                            qa.max_val,
-                            qa.bit,
-                            qmin=float(qa.thd_neg),
-                            qmax=float(qa.thd_pos),
-                        )
-                        qa.scale = torch.clamp(scale, min=1e-8)
-                        qa.zero_point.data.copy_(
-                            zero_point.to(device=qa.zero_point.device, dtype=qa.zero_point.dtype).reshape_as(qa.zero_point)
-                        )
-                    elif qa.all_positive:
-                        current_max = block_max[dim_idx, block_idx].detach()
-                        if qa.max_val.nelement() == 0 or qa.max_val.data < current_max.data:
-                            qa.max_val.data = current_max.data
-                        qa.max_val.clamp_(min=1e-8)
-                        qa.min_val.data.zero_()
-                        qmax = max(float(qa.thd_pos), 1.0)
-                        qa.scale = torch.clamp(qa.max_val / qmax, min=1e-8)
-                        qa.zero_point.data.zero_()
-                    else:
-                        current_abs_max = block_abs_max[dim_idx, block_idx].detach()
-                        if qa.max_val.nelement() == 0 or qa.max_val.data < current_abs_max.data:
-                            qa.max_val.data = current_abs_max.data
-                        qa.max_val.clamp_(min=1e-8)
-                        qa.min_val.data = -qa.max_val.data
-                        qmax = max(float(qa.thd_pos), 1.0)
-                        qa.scale = torch.clamp(qa.max_val / qmax, min=1e-8)
-                        qa.zero_point.data.zero_()
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            quant_profile["block_stat"] = time.perf_counter() - stage_start
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
+        flat_block_max = block_max.reshape(-1).detach()
+        flat_block_min = block_min.reshape(-1).detach()
+        flat_block_abs_max = block_abs_max.reshape(-1).detach()
+
+        with_zero_mask = torch.tensor(
+            [bool(getattr(qa, "withzeropoint", False)) for qa in flat_qas],
+            device=x.device,
+            dtype=torch.bool,
+        )
+        all_positive_mask = torch.tensor(
+            [bool(getattr(qa, "all_positive", False)) for qa in flat_qas],
+            device=x.device,
+            dtype=torch.bool,
+        )
+        thd_neg_flat = torch.tensor(
+            [float(qa.thd_neg) for qa in flat_qas],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        thd_pos_flat = torch.tensor(
+            [float(qa.thd_pos) for qa in flat_qas],
+            device=x.device,
+            dtype=x.dtype,
+        )
+        qmax_safe_flat = torch.clamp(thd_pos_flat, min=1.0)
+        prev_max_flat = torch.cat(
+            [
+                _flatten_quant_buffer(qa.max_val, float("-inf"), x.device, x.dtype)
+                for qa in flat_qas
+            ],
+            dim=0,
+        )
+        prev_min_flat = torch.cat(
+            [
+                _flatten_quant_buffer(qa.min_val, float("inf"), x.device, x.dtype)
+                for qa in flat_qas
+            ],
+            dim=0,
+        )
+
+        updated_max_flat = prev_max_flat.clone()
+        updated_min_flat = prev_min_flat.clone()
+        updated_scale_flat = torch.ones_like(prev_max_flat)
+        updated_zero_flat = torch.zeros_like(prev_max_flat)
+
+        if with_zero_mask.any():
+            zp_max = torch.maximum(prev_max_flat[with_zero_mask], flat_block_max[with_zero_mask])
+            zp_min = torch.minimum(prev_min_flat[with_zero_mask], flat_block_min[with_zero_mask])
+            zp_all_positive = all_positive_mask[with_zero_mask]
+            if zp_all_positive.any():
+                zp_max = torch.where(zp_all_positive, torch.clamp(zp_max, min=0.0), zp_max)
+                zp_min = torch.where(zp_all_positive, torch.clamp(zp_min, max=0.0), zp_min)
+            zp_max = torch.maximum(zp_max, zp_min + 1e-8)
+            qrange = torch.clamp(
+                thd_pos_flat[with_zero_mask] - thd_neg_flat[with_zero_mask],
+                min=1.0,
+            )
+            zp_scale = torch.clamp((zp_max - zp_min) / qrange, min=1e-8)
+            zp_zero = thd_pos_flat[with_zero_mask] - (zp_max / zp_scale)
+            zp_zero = torch.clamp(
+                zp_zero,
+                min=thd_neg_flat[with_zero_mask],
+                max=thd_pos_flat[with_zero_mask],
+            ).round()
+            updated_max_flat[with_zero_mask] = zp_max
+            updated_min_flat[with_zero_mask] = zp_min
+            updated_scale_flat[with_zero_mask] = zp_scale
+            updated_zero_flat[with_zero_mask] = zp_zero
+
+        positive_mask = (~with_zero_mask) & all_positive_mask
+        if positive_mask.any():
+            pos_max = torch.maximum(prev_max_flat[positive_mask], flat_block_max[positive_mask])
+            pos_max = torch.clamp(pos_max, min=1e-8)
+            updated_max_flat[positive_mask] = pos_max
+            updated_min_flat[positive_mask] = 0.0
+            updated_scale_flat[positive_mask] = torch.clamp(
+                pos_max / qmax_safe_flat[positive_mask],
+                min=1e-8,
+            )
+            updated_zero_flat[positive_mask] = 0.0
+
+        signed_mask = (~with_zero_mask) & (~all_positive_mask)
+        if signed_mask.any():
+            signed_abs_max = torch.maximum(
+                prev_max_flat[signed_mask],
+                flat_block_abs_max[signed_mask],
+            )
+            signed_abs_max = torch.clamp(signed_abs_max, min=1e-8)
+            updated_max_flat[signed_mask] = signed_abs_max
+            updated_min_flat[signed_mask] = -signed_abs_max
+            updated_scale_flat[signed_mask] = torch.clamp(
+                signed_abs_max / qmax_safe_flat[signed_mask],
+                min=1e-8,
+            )
+            updated_zero_flat[signed_mask] = 0.0
+
+        with torch.no_grad():
+            for idx, qa in enumerate(flat_qas):
+                _write_quant_buffer(qa, "max_val", updated_max_flat[idx])
+                _write_quant_buffer(qa, "min_val", updated_min_flat[idx])
+                _write_quant_buffer(qa, "scale", updated_scale_flat[idx])
+                qa.zero_point.data.copy_(
+                    updated_zero_flat[idx]
+                    .to(device=qa.zero_point.device, dtype=qa.zero_point.dtype)
+                    .reshape_as(qa.zero_point)
+                )
+        if quant_profile is not None and profile_time:
+            quant_profile["quant_param_update"] = time.perf_counter() - stage_start
     else:
         raise ValueError(f"Unsupported quantizer type: {type(first_qa)}")
 
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        stage_start = time.perf_counter()
     scale_entries = []
     zero_entries = []
     neg_entries = []
@@ -363,7 +503,13 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
     zero_points = torch.stack(zero_entries, dim=0).view(n_dims, n_blocks, 1)
     thd_neg = torch.stack(neg_entries, dim=0).view(n_dims, n_blocks, 1)
     thd_pos = torch.stack(pos_entries, dim=0).view(n_dims, n_blocks, 1)
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["quant_param_stack"] = time.perf_counter() - stage_start
 
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        stage_start = time.perf_counter()
     if hasattr(first_qa, "s"):
         grad_factors = 1.0 / torch.sqrt(thd_pos.clamp(min=1.0) * block_lengths.view(1, n_blocks, 1))
         scales = grad_scale(scales, grad_factors)
@@ -382,11 +528,17 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
     flat_clamped = x_clamped[:, block_ids, local_ids]
     flat_symbols = x_q[:, block_ids, local_ids].transpose(0, 1).contiguous()
     flat_dequantized = dequantized[:, block_ids, local_ids].transpose(0, 1).contiguous()
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["quant_core"] = time.perf_counter() - stage_start
 
     ans_bits = x.new_zeros(())
     entropy_scales = None
     encode_mode = getattr(first_qa, "encode", "deflate").lower()
     needs_clamped_cache = any(getattr(qa, "encode", "deflate").lower() == "ans" for qa in flat_qas)
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        stage_start = time.perf_counter()
     if return_ans_bits and encode_mode == "laplace":
         zero_mean_mask = build_laplace_zero_mean_mask(
             flat_qas,
@@ -415,33 +567,52 @@ def batched_quantize_blocks(x, split, qas, return_symbols=False, return_trans=Fa
                         ans_bits = ans_bits + per_elem_bits.sum()
                     qa.last_clamped = None
                 start += length
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["entropy_bits"] = time.perf_counter() - stage_start
 
     trans = None
     if return_trans:
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
         trans = []
         for qa in flat_qas:
             i_scale, i_zp, _ = qa.get_quant_params()
             trans.extend([i_scale.item(), i_zp.item()])
+        if quant_profile is not None and profile_time:
+            quant_profile["trans_collect"] = time.perf_counter() - stage_start
 
     if squeeze_output:
         flat_dequantized = flat_dequantized.reshape(-1)
         flat_symbols = flat_symbols.reshape(-1)
 
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["total"] = time.perf_counter() - total_start
+
     if return_symbols and return_trans and return_ans_bits:
-        return flat_dequantized, flat_symbols, trans, ans_bits
-    if return_symbols and return_trans:
-        return flat_dequantized, flat_symbols, trans
-    if return_symbols and return_ans_bits:
-        return flat_dequantized, flat_symbols, ans_bits
-    if return_symbols:
-        return flat_dequantized, flat_symbols
-    if return_trans and return_ans_bits:
-        return flat_dequantized, trans, ans_bits
-    if return_trans:
-        return flat_dequantized, trans
-    if return_ans_bits:
-        return flat_dequantized, ans_bits
-    return flat_dequantized
+        result = (flat_dequantized, flat_symbols, trans, ans_bits)
+    elif return_symbols and return_trans:
+        result = (flat_dequantized, flat_symbols, trans)
+    elif return_symbols and return_ans_bits:
+        result = (flat_dequantized, flat_symbols, ans_bits)
+    elif return_symbols:
+        result = (flat_dequantized, flat_symbols)
+    elif return_trans and return_ans_bits:
+        result = (flat_dequantized, trans, ans_bits)
+    elif return_trans:
+        result = (flat_dequantized, trans)
+    elif return_ans_bits:
+        result = (flat_dequantized, ans_bits)
+    else:
+        result = flat_dequantized
+
+    if return_profile:
+        if isinstance(result, tuple):
+            return (*result, quant_profile)
+        return result, quant_profile
+    return result
 
 class Round(Function):
     @staticmethod

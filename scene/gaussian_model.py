@@ -310,9 +310,10 @@ def ToEulerAngles_FT(q):
     cosy_cosp = 1 - 2 * (y * y + z * z)
     yaw = torch.arctan2(siny_cosp, cosy_cosp)
 
-    roll = roll.reshape(-1, 1)
-    pitch = pitch.reshape(-1, 1)
-    yaw = yaw.reshape(-1, 1)
+    # nan_to_num_()防护
+    roll = roll.reshape(-1, 1).nan_to_num_()
+    pitch = pitch.reshape(-1, 1).nan_to_num_()
+    yaw = yaw.reshape(-1, 1).nan_to_num_()
 
     return torch.concat([roll, pitch, yaw], -1)
 
@@ -678,6 +679,7 @@ class GaussianModel:
         self.raht_level_ids = np.zeros((0,), dtype=np.int64)
         self.raht_subgroup_ids = np.zeros((0,), dtype=np.int64)
         self.ans_entropy_bottlenecks = nn.ModuleDict()
+        self._static_eval_quant_cache = None
         
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -699,6 +701,21 @@ class GaussianModel:
         for qa in self.qas:
             params.extend(list(qa.parameters(recurse=False)))
         return params
+
+    def clear_static_eval_quant_cache(self):
+        self._static_eval_quant_cache = None
+
+    def get_static_eval_quant_cache(self, cache_key):
+        cache = getattr(self, "_static_eval_quant_cache", None)
+        if cache is None or cache.get("key") != cache_key:
+            return None
+        return cache.get("value")
+
+    def set_static_eval_quant_cache(self, cache_key, cache_value):
+        self._static_eval_quant_cache = {
+            "key": cache_key,
+            "value": cache_value,
+        }
 
     @property
     def ans_effective_subgroup_count(self):
@@ -1910,7 +1927,15 @@ class GaussianModel:
             if is_ans or is_laplace:
                 ac_len = C.shape[0] - 1
                 split = split_length(ac_len, self.n_block) if per_block_quant else [ac_len]
-                qci = []
+                _, qci_tensor, trans = batched_quantize_blocks(
+                    C[1:],
+                    split,
+                    self.qas,
+                    return_symbols=True,
+                    return_trans=True,
+                )
+                qci = qci_tensor.detach().cpu().numpy().astype(np.float32)
+                trans_array.extend(trans)
                 dim_bits = []
                 dim_ranges = []
                 signed_flags = []
@@ -1918,15 +1943,11 @@ class GaussianModel:
 
                 for dim_idx in range(C.shape[-1]):
                     qas_for_dim = self.qas[qa_cnt: qa_cnt + len(split)]
-                    q_dim, trans_dim = self.quantize_ac_dimension_for_ans(C[1:, dim_idx], qas_for_dim, split)
-                    qci.append(q_dim.reshape(-1, 1))
-                    trans_array.extend(trans_dim)
                     dim_bits.append(qas_for_dim[0].bit)
                     dim_ranges.append((int(qas_for_dim[0].thd_neg), int(qas_for_dim[0].thd_pos)))
                     signed_flags.append(int(qas_for_dim[0].thd_neg < 0))
                     qa_cnt += len(split)
 
-                qci = np.concatenate(qci, axis=-1).astype(np.float32)
                 group_data = self.build_ans_group_tensors_from_qci(qci)
                 if is_ans:
                     if export_ans_offline_fit:

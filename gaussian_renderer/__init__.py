@@ -29,7 +29,7 @@ from utils.quant_utils import (
     split_length,
 )
 
-PROFILE_TIME = True # Macro added for time profiling
+PROFILE_TIME = False # Macro added for time profiling
 if PROFILE_TIME:
     import time
 
@@ -266,6 +266,7 @@ def ft_render(
         per_block_quant=False,
         debug=False,
         clamp_color=True,
+        profile_detail=False,
         ):
     """
     Render the scene. 
@@ -342,274 +343,362 @@ def ft_render(
     means2D = screenspace_points
 
 
+    eval_cache_key = None
+    cached_static = None
+    if raht and (not training) and override_color is None:
+        eval_cache_key = (
+            bool(pipe.use_indexed),
+            bool(per_channel_quant),
+            bool(per_block_quant),
+            int(pc.active_sh_degree),
+            float(scaling_modifier),
+        )
+        cached_static = pc.get_static_eval_quant_cache(eval_cache_key)
+
+    scales = None
+    rotations = None
+    eulers = None
+    colors_precomp = None
+    sh_indices = None
+    sh_zero = None
+    sh_ones = None
+    all_sh_features = None
+
     if raht:
         if should_print_debug:
             print("\n【RAHT变换】正向变换")
             print(f"  输入特征维度: 55 (opacity + euler + f_dc + f_rest + scale)")
         
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_feature_prep_start = time.time()
+        if cached_static is None:
+            quant_detail_profile = None
+            want_quant_detail = PROFILE_TIME and profile_detail
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_feature_prep_start = time.time()
 
-        r = pc.get_ori_rotation
-        norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
-        q = r / norm[:, None]
-        eulers = ToEulerAngles_FT(q, save=False)
-        # Include f_rest and scale in RAHT transform: 
-        # opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3) = 55 dims
-        rf = torch.concat([
-            pc.get_origin_opacity, 
-            eulers, 
-            pc.get_features_dc.contiguous().squeeze(),
-            pc.get_indexed_feature_extra.contiguous().flatten(-2),  # f_rest (45 dims)
-            pc.get_ori_scaling  # scale (3 dims)
-        ], -1)
-        
-        if should_print_debug:
-            print(f"  rf 形状: {rf.shape}")
-            print(f"  rf 范围: [{rf.min().item():.4f}, {rf.max().item():.4f}]")
-
-        C = rf[pc.reorder]
-
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_feature_prep_end = time.time()
-        
-        if should_print_debug:
-            print(f"  Morton排序后 C 形状: {C.shape}")
-        iW1 = pc.res['iW1']
-        iW2 = pc.res['iW2']
-        iLeft_idx = pc.res['iLeft_idx']
-        iRight_idx = pc.res['iRight_idx']
-
-        if should_print_debug:
-            print(f"  执行 {pc.depth * 3} 层 RAHT 变换...")
-        
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_raht_forward_start = time.time()
-
-        for d in range(pc.depth * 3):
-            w1 = iW1[d]
-            w2 = iW2[d]
-            left_idx = iLeft_idx[d]
-            right_idx = iRight_idx[d]
-            C[left_idx], C[right_idx] = transform_batched_torch(w1, 
-                                                  w2, 
-                                                  C[left_idx], 
-                                                  C[right_idx])
-        
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_raht_forward_end = time.time()
-
-        if should_print_debug:
-            print(f"  RAHT变换后 C 范围: [{C.min().item():.4f}, {C.max().item():.4f}]")
-            print("\n【量化】分块量化")
-        
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_quant_start = time.time()
-
-        quantC = torch.zeros_like(C)
-        quantC[0] = C[0]
-        total_ans_bits = torch.tensor(0.0, device="cuda")
-        encode_mode = getattr(pc.qas[0], 'encode', 'deflate').lower() if hasattr(pc, 'qas') and len(pc.qas) > 0 else "deflate"
-        uses_rate_model = (
-            raht
-            and hasattr(pc, 'qas')
-            and len(pc.qas) > 0
-            and encode_mode in ("ans", "laplace")
-        )
-
-        # 量化
-        if per_channel_quant:
-            if uses_rate_model:
-                quantC[1:], total_ans_bits = batched_quantize_blocks(
-                    C[1:],
-                    [C.shape[0] - 1],
-                    pc.qas,
-                    return_ans_bits=True,
-                )
-            else:
-                quantC[1:] = batched_quantize_blocks(C[1:], [C.shape[0] - 1], pc.qas)
-        elif per_block_quant:
-            lc1 = C.shape[0] - 1
-            split_ac = split_length(lc1, pc.n_block)
+            r = pc.get_ori_rotation
+            norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
+            q = r / norm[:, None]
+            eulers = ToEulerAngles_FT(q, save=False)
+            # Include f_rest and scale in RAHT transform: 
+            # opacity(1) + euler(3) + f_dc(3) + f_rest(45) + scale(3) = 55 dims
+            rf = torch.concat([
+                pc.get_origin_opacity, 
+                eulers, 
+                pc.get_features_dc.contiguous().squeeze(),
+                pc.get_indexed_feature_extra.contiguous().flatten(-2),  # f_rest (45 dims)
+                pc.get_ori_scaling  # scale (3 dims)
+            ], -1)
             
             if should_print_debug:
-                print(f"  块数量: {pc.n_block}")
-                print(f"  每块点数: {split_ac[:3]}... (前3块)")
-                print(f"  量化 55 维 RAHT 特征 (包含 scale)...")
+                print(f"  rf 形状: {rf.shape}")
+                print(f"  rf 范围: [{rf.min().item():.4f}, {rf.max().item():.4f}]")
 
-            if uses_rate_model:
-                quantC[1:], total_ans_bits = batched_quantize_blocks(
-                    C[1:],
-                    split_ac,
-                    pc.qas,
-                    return_ans_bits=True,
-                )
-            else:
-                quantC[1:] = batched_quantize_blocks(C[1:], split_ac, pc.qas)
+            C = rf[pc.reorder]
+
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_feature_prep_end = time.time()
             
             if should_print_debug:
-                print(f"  所有特征量化完成，使用了 {len(pc.qas)} 个量化器 (55 × {pc.n_block})")
+                print(f"  Morton排序后 C 形状: {C.shape}")
+            iW1 = pc.res['iW1']
+            iW2 = pc.res['iW2']
+            iLeft_idx = pc.res['iLeft_idx']
+            iRight_idx = pc.res['iRight_idx']
+
+            if should_print_debug:
+                print(f"  执行 {pc.depth * 3} 层 RAHT 变换...")
             
-        else:
-            if hasattr(pc.qa, 'init_yet') and not pc.qa.init_yet:
-                pc.qa.init_from(C[1:])
-            quantC[1:] = pc.qa(C[1:])
-            if encode_mode == "ans" and getattr(pc.qa, "entropy_bottleneck", None) is not None:
-                if hasattr(pc.qa, "s"):
-                    symbol_domain = quantC[1:] / pc.qa.s
-                elif quantizer_uses_zero_point(pc.qa):
-                    symbol_domain = pc.qa.zero_point + (quantC[1:] / pc.qa.scale)
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_raht_forward_start = time.time()
+
+            for d in range(pc.depth * 3):
+                w1 = iW1[d]
+                w2 = iW2[d]
+                left_idx = iLeft_idx[d]
+                right_idx = iRight_idx[d]
+                C[left_idx], C[right_idx] = transform_batched_torch(w1, 
+                                                      w2, 
+                                                      C[left_idx], 
+                                                      C[right_idx])
+            
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_raht_forward_end = time.time()
+
+            if should_print_debug:
+                print(f"  RAHT变换后 C 范围: [{C.min().item():.4f}, {C.max().item():.4f}]")
+                print("\n【量化】分块量化")
+            
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_quant_start = time.time()
+
+            quantC = torch.zeros_like(C)
+            quantC[0] = C[0]
+            total_ans_bits = torch.tensor(0.0, device="cuda")
+            encode_mode = getattr(pc.qas[0], 'encode', 'deflate').lower() if hasattr(pc, 'qas') and len(pc.qas) > 0 else "deflate"
+            uses_rate_model = (
+                raht
+                and hasattr(pc, 'qas')
+                and len(pc.qas) > 0
+                and encode_mode in ("ans", "laplace")
+            )
+
+            # 量化
+            if per_channel_quant:
+                if uses_rate_model:
+                    quant_outputs = batched_quantize_blocks(
+                        C[1:],
+                        [C.shape[0] - 1],
+                        pc.qas,
+                        return_ans_bits=True,
+                        return_profile=want_quant_detail,
+                        profile_time=want_quant_detail,
+                    )
+                    if want_quant_detail:
+                        quantC[1:], total_ans_bits, quant_detail_profile = quant_outputs
+                    else:
+                        quantC[1:], total_ans_bits = quant_outputs
                 else:
-                    symbol_domain = quantC[1:] / pc.qa.scale
-                x_clamped = torch.clamp(symbol_domain, pc.qa.thd_neg, pc.qa.thd_pos)
-                _, likelihoods = pc.qa.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
-                total_ans_bits = torch.clamp(-torch.log2(likelihoods.clamp(min=1e-6)), max=32.0).sum()
-            elif encode_mode == "laplace":
-                from utils.quant_utils import _laplace_bits_with_tail_clip
-                if hasattr(pc.qa, "s"):
-                    symbol_domain = quantC[1:] / pc.qa.s
-                elif quantizer_uses_zero_point(pc.qa):
-                    symbol_domain = pc.qa.zero_point + (quantC[1:] / pc.qa.scale)
-                else:
-                    symbol_domain = quantC[1:] / pc.qa.scale
-                zero_mean_flags = [[quantizer_uses_zero_mean_laplace(pc.qa)]]
-                block_means, block_scales = estimate_laplace_block_params(
-                    symbol_domain,
-                    [quantC.shape[0] - 1],
-                    zero_mean_flags=zero_mean_flags,
-                )
-                safe_mean = block_means.reshape(1, -1)
-                safe_scale = block_scales.reshape(1, -1).clamp(min=1e-6)
-                total_ans_bits = _laplace_bits_with_tail_clip(
-                    symbol_domain,
-                    safe_scale,
-                    block_mean=safe_mean,
-                ).sum()
-
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_quant_end = time.time()
-
-        t_entropy_start = None
-        t_entropy_end = None
-        t_entropy_collect_end = None
-        t_entropy_model_start = None
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_entropy_start = time.time()
-            t_entropy_collect_end = t_entropy_start
-            t_entropy_model_start = t_entropy_start
-            t_entropy_end = t_entropy_start
-
-        if should_print_debug:
-            print("\n【RAHT变换】逆变换")
-            print(f"  quantC 形状: {quantC.shape}")
-            print(f"  quantC 范围: [{quantC.min().item():.4f}, {quantC.max().item():.4f}]")
-
-        res_inv = pc.res_inv
-        pos = res_inv['pos']
-        iW1 = res_inv['iW1']
-        iW2 = res_inv['iW2']
-        iS = res_inv['iS']
-        
-        iLeft_idx = res_inv['iLeft_idx']
-        iRight_idx = res_inv['iRight_idx']
-    
-        iLeft_idx_CT = res_inv['iLeft_idx_CT']
-        iRight_idx_CT = res_inv['iRight_idx_CT']
-        iTrans_idx = res_inv['iTrans_idx']
-        iTrans_idx_CT = res_inv['iTrans_idx_CT'] 
-
-        CT_yuv_q_temp = quantC[pos.astype(int)]
-        raht_features = torch.zeros(quantC.shape).cuda()
-        OC = torch.zeros(quantC.shape).cuda()
-        
-        if should_print_debug:
-            print(f"  执行 {pc.depth*3} 层逆 RAHT 变换...")
-        
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_raht_inverse_start = time.time()
-
-        for i in range(pc.depth*3):
-            w1 = iW1[i]
-            w2 = iW2[i]
-            S = iS[i]
-            
-            left_idx, right_idx = iLeft_idx[i], iRight_idx[i]
-            left_idx_CT, right_idx_CT = iLeft_idx_CT[i], iRight_idx_CT[i]
-            
-            trans_idx, trans_idx_CT = iTrans_idx[i], iTrans_idx_CT[i]
-            
-            
-            OC[trans_idx] = CT_yuv_q_temp[trans_idx_CT]
-            OC[left_idx], OC[right_idx] = itransform_batched_torch(w1, 
-                                                    w2, 
-                                                    CT_yuv_q_temp[left_idx_CT], 
-                                                    CT_yuv_q_temp[right_idx_CT])  
-            CT_yuv_q_temp[:S] = OC[:S]
-
-        raht_features[pc.reorder] = OC
-        
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_raht_inverse_end = time.time()
-        
-        if should_print_debug:
-            print(f"  逆变换完成")
-            print(f"  raht_features 形状: {raht_features.shape}")
-            print(f"  raht_features 范围: [{raht_features.min().item():.4f}, {raht_features.max().item():.4f}]")
-            print(f"  提取特征: opacity[0:1], euler[1:4], all_sh[4:52], scale[52:55]")
-        
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_covariance_start = time.time()
-
-        # Extract scale from raht_features (no longer need separate quantization)
-        scalesq = raht_features[:, 52:55]  # Extract scale from RAHT features
-        
-        if should_print_debug:
-            print(f"\n【特征提取】从 RAHT 特征提取 Scale")
-            print(f"  scalesq 形状: {scalesq.shape}")
-            print(f"  scalesq 范围: [{scalesq.min().item():.4f}, {scalesq.max().item():.4f}]")
+                    quant_outputs = batched_quantize_blocks(
+                        C[1:],
+                        [C.shape[0] - 1],
+                        pc.qas,
+                        return_profile=want_quant_detail,
+                        profile_time=want_quant_detail,
+                    )
+                    if want_quant_detail:
+                        quantC[1:], quant_detail_profile = quant_outputs
+                    else:
+                        quantC[1:] = quant_outputs
+            elif per_block_quant:
+                lc1 = C.shape[0] - 1
+                split_ac = split_length(lc1, pc.n_block)
                 
-        scaling = torch.exp(scalesq)
-        
-        # if re_mode == 'rot':
-        #     rotations = raht_features[:, 1:5]
-        #     cov3D_precomp = pc.covariance_activation(scaling, 1.0, rotations)
-        # elif re_mode == 'euler':
-        eulers = raht_features[:, 1:4]
-        cov3D_precomp = pc.covariance_activation_for_euler(scaling, 1.0, eulers)
+                if should_print_debug:
+                    print(f"  块数量: {pc.n_block}")
+                    print(f"  每块点数: {split_ac[:3]}... (前3块)")
+                    print(f"  量化 55 维 RAHT 特征 (包含 scale)...")
 
-        if PROFILE_TIME:
-            torch.cuda.synchronize()
-            t_covariance_end = time.time()
+                if uses_rate_model:
+                    quant_outputs = batched_quantize_blocks(
+                        C[1:],
+                        split_ac,
+                        pc.qas,
+                        return_ans_bits=True,
+                        return_profile=want_quant_detail,
+                        profile_time=want_quant_detail,
+                    )
+                    if want_quant_detail:
+                        quantC[1:], total_ans_bits, quant_detail_profile = quant_outputs
+                    else:
+                        quantC[1:], total_ans_bits = quant_outputs
+                else:
+                    quant_outputs = batched_quantize_blocks(
+                        C[1:],
+                        split_ac,
+                        pc.qas,
+                        return_profile=want_quant_detail,
+                        profile_time=want_quant_detail,
+                    )
+                    if want_quant_detail:
+                        quantC[1:], quant_detail_profile = quant_outputs
+                    else:
+                        quantC[1:] = quant_outputs
+                
+                if should_print_debug:
+                    print(f"  所有特征量化完成，使用了 {len(pc.qas)} 个量化器 (55 × {pc.n_block})")
+                
+            else:
+                if hasattr(pc.qa, 'init_yet') and not pc.qa.init_yet:
+                    pc.qa.init_from(C[1:])
+                quantC[1:] = pc.qa(C[1:])
+                if encode_mode == "ans" and getattr(pc.qa, "entropy_bottleneck", None) is not None:
+                    if hasattr(pc.qa, "s"):
+                        symbol_domain = quantC[1:] / pc.qa.s
+                    elif quantizer_uses_zero_point(pc.qa):
+                        symbol_domain = pc.qa.zero_point + (quantC[1:] / pc.qa.scale)
+                    else:
+                        symbol_domain = quantC[1:] / pc.qa.scale
+                    x_clamped = torch.clamp(symbol_domain, pc.qa.thd_neg, pc.qa.thd_pos)
+                    _, likelihoods = pc.qa.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
+                    total_ans_bits = torch.clamp(-torch.log2(likelihoods.clamp(min=1e-6)), max=32.0).sum()
+                elif encode_mode == "laplace":
+                    from utils.quant_utils import _laplace_bits_with_tail_clip
+                    if hasattr(pc.qa, "s"):
+                        symbol_domain = quantC[1:] / pc.qa.s
+                    elif quantizer_uses_zero_point(pc.qa):
+                        symbol_domain = pc.qa.zero_point + (quantC[1:] / pc.qa.scale)
+                    else:
+                        symbol_domain = quantC[1:] / pc.qa.scale
+                    zero_mean_flags = [[quantizer_uses_zero_mean_laplace(pc.qa)]]
+                    block_means, block_scales = estimate_laplace_block_params(
+                        symbol_domain,
+                        [quantC.shape[0] - 1],
+                        zero_mean_flags=zero_mean_flags,
+                    )
+                    safe_mean = block_means.reshape(1, -1)
+                    safe_scale = block_scales.reshape(1, -1).clamp(min=1e-6)
+                    total_ans_bits = _laplace_bits_with_tail_clip(
+                        symbol_domain,
+                        safe_scale,
+                        block_mean=safe_mean,
+                    ).sum()
 
-        assert cov3D_precomp is not None
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_quant_end = time.time()
+            if quant_detail_profile is None and want_quant_detail:
+                quant_detail_profile = {
+                    "index_prepare": 0.0,
+                    "pack_scatter": 0.0,
+                    "block_stat": 0.0,
+                    "quant_param_update": 0.0,
+                    "quant_param_stack": 0.0,
+                    "quant_core": 0.0,
+                    "entropy_bits": 0.0,
+                    "trans_collect": 0.0,
+                    "total": 0.0,
+                }
+
+            t_entropy_start = None
+            t_entropy_end = None
+            t_entropy_collect_end = None
+            t_entropy_model_start = None
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_entropy_start = time.time()
+                t_entropy_collect_end = t_entropy_start
+                t_entropy_model_start = t_entropy_start
+                t_entropy_end = t_entropy_start
+
+            if should_print_debug:
+                print("\n【RAHT变换】逆变换")
+                print(f"  quantC 形状: {quantC.shape}")
+                print(f"  quantC 范围: [{quantC.min().item():.4f}, {quantC.max().item():.4f}]")
+
+            res_inv = pc.res_inv
+            pos = res_inv['pos']
+            iW1 = res_inv['iW1']
+            iW2 = res_inv['iW2']
+            iS = res_inv['iS']
+            
+            iLeft_idx = res_inv['iLeft_idx']
+            iRight_idx = res_inv['iRight_idx']
         
-        opacity = raht_features[:, :1]
-        opacity = torch.sigmoid(opacity)    
-        
-        scales = None
-        rotations = None
-        eulers = None
-        colors_precomp = None
-        sh_indices = None
-        sh_zero = None
-        sh_ones = None
+            iLeft_idx_CT = res_inv['iLeft_idx_CT']
+            iRight_idx_CT = res_inv['iRight_idx_CT']
+            iTrans_idx = res_inv['iTrans_idx']
+            iTrans_idx_CT = res_inv['iTrans_idx_CT'] 
+
+            CT_yuv_q_temp = quantC[pos.astype(int)]
+            raht_features = torch.zeros(quantC.shape).cuda()
+            OC = torch.zeros(quantC.shape).cuda()
+            
+            if should_print_debug:
+                print(f"  执行 {pc.depth*3} 层逆 RAHT 变换...")
+            
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_raht_inverse_start = time.time()
+
+            for i in range(pc.depth*3):
+                w1 = iW1[i]
+                w2 = iW2[i]
+                S = iS[i]
+                
+                left_idx, right_idx = iLeft_idx[i], iRight_idx[i]
+                left_idx_CT, right_idx_CT = iLeft_idx_CT[i], iRight_idx_CT[i]
+                
+                trans_idx, trans_idx_CT = iTrans_idx[i], iTrans_idx_CT[i]
+                
+                
+                OC[trans_idx] = CT_yuv_q_temp[trans_idx_CT]
+                OC[left_idx], OC[right_idx] = itransform_batched_torch(w1, 
+                                                        w2, 
+                                                        CT_yuv_q_temp[left_idx_CT], 
+                                                        CT_yuv_q_temp[right_idx_CT])  
+                CT_yuv_q_temp[:S] = OC[:S]
+
+            raht_features[pc.reorder] = OC
+            
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_raht_inverse_end = time.time()
+            
+            if should_print_debug:
+                print(f"  逆变换完成")
+                print(f"  raht_features 形状: {raht_features.shape}")
+                print(f"  raht_features 范围: [{raht_features.min().item():.4f}, {raht_features.max().item():.4f}]")
+                print(f"  提取特征: opacity[0:1], euler[1:4], all_sh[4:52], scale[52:55]")
+            
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_covariance_start = time.time()
+
+            # Extract scale from raht_features (no longer need separate quantization)
+            scalesq = raht_features[:, 52:55]  # Extract scale from RAHT features
+            
+            if should_print_debug:
+                print(f"\n【特征提取】从 RAHT 特征提取 Scale")
+                print(f"  scalesq 形状: {scalesq.shape}")
+                print(f"  scalesq 范围: [{scalesq.min().item():.4f}, {scalesq.max().item():.4f}]")
+                    
+            scaling = torch.exp(scalesq)
+            
+            # if re_mode == 'rot':
+            #     rotations = raht_features[:, 1:5]
+            #     cov3D_precomp = pc.covariance_activation(scaling, 1.0, rotations)
+            # elif re_mode == 'euler':
+            eulers = raht_features[:, 1:4]
+            cov3D_precomp = pc.covariance_activation_for_euler(scaling, 1.0, eulers)
+
+            if PROFILE_TIME:
+                torch.cuda.synchronize()
+                t_covariance_end = time.time()
+
+            assert cov3D_precomp is not None
+            
+            opacity = raht_features[:, :1]
+            opacity = torch.sigmoid(opacity)
+        else:
+            total_ans_bits = cached_static["total_ans_bits"]
+            opacity = cached_static["opacity"]
+            cov3D_precomp = cached_static["cov3D_precomp"]
+            all_sh_features = cached_static.get("all_sh_features")
+            sh_zero = cached_static.get("sh_zero")
+            sh_ones = cached_static.get("sh_ones")
+            sh_indices = cached_static.get("sh_indices")
         
         t_sh_eval_start = None
         t_sh_eval_end = None
+        if cached_static is None:
+            if pipe.use_indexed:
+                sh_zero = raht_features[:, shzero_range[0]:].unsqueeze(1).contiguous()
+                sh_ones = pc.get_features_extra.reshape(-1, (pc.max_sh_degree+1)**2 - 1, 3)
+                sh_indices = pc.get_feature_indices
+            else:
+                all_sh_features = raht_features[:, shzero_range[0]:shzero_range[1]]
+
+            if eval_cache_key is not None:
+                pc.set_static_eval_quant_cache(
+                    eval_cache_key,
+                    {
+                        "total_ans_bits": total_ans_bits,
+                        "opacity": opacity,
+                        "cov3D_precomp": cov3D_precomp,
+                        "all_sh_features": all_sh_features,
+                        "sh_zero": sh_zero,
+                        "sh_ones": sh_ones,
+                        "sh_indices": sh_indices,
+                    },
+                )
+
         if pipe.use_indexed:
-            sh_zero = raht_features[:, shzero_range[0]:].unsqueeze(1).contiguous()
-            sh_ones = pc.get_features_extra.reshape(-1, (pc.max_sh_degree+1)**2 - 1, 3)
-            sh_indices = pc.get_feature_indices
+            pass
         else:
             if PROFILE_TIME:
                 torch.cuda.synchronize()
@@ -617,7 +706,6 @@ def ft_render(
 
             # When not using indexed mode, compute colors directly from SH coefficients
             # Extract all SH coefficients from raht_features: f_dc(3) + f_rest(45) = 48 dims
-            all_sh_features = raht_features[:, shzero_range[0]:shzero_range[1]]  # [N, 48]
             # Reshape to [N, 16, 3] where 16 = (max_sh_degree+1)^2 = 4^2
             n_sh = (pc.max_sh_degree + 1) ** 2  # 16
             features = all_sh_features.reshape(-1, n_sh, 3)  # [N, 16, 3]
@@ -692,6 +780,7 @@ def ft_render(
                 "covariance": t_covariance_end - t_covariance_start,
                 "sh_eval": 0.0 if t_sh_eval_start is None else (t_sh_eval_end - t_sh_eval_start),
                 "rasterize_forward": t_rasterize_end - t_rasterize_start,
+                "quant_detail": quant_detail_profile if cached_static is None else None,
             }
     
     # 标记第一次渲染已完成

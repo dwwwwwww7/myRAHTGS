@@ -38,14 +38,19 @@ except ImportError:
     TENSORBOARD_FOUND = False
 
 
-def get_time_csv_path(csv_path):
-    path = Path(csv_path)
-    return str(path.with_name(path.stem + "_time" + path.suffix))
-
-
 def get_time_detail_csv_path(csv_path):
     path = Path(csv_path)
     return str(path.with_name(path.stem + "_time_detail" + path.suffix))
+
+
+def get_quant_detail_csv_path(csv_path):
+    path = Path(csv_path)
+    return str(path.with_name(path.stem + "_quant_detail" + path.suffix))
+
+
+def get_backward_detail_csv_path(csv_path):
+    path = Path(csv_path)
+    return str(path.with_name(path.stem + "_backward_detail" + path.suffix))
 
 
 def get_rate_diag_param_groups(gaussians):
@@ -67,6 +72,49 @@ def get_rate_diag_param_groups(gaussians):
         if ans_main_params:
             groups.append(("ans_models", ans_main_params))
     return groups
+
+
+def get_main_backward_params(optimizer):
+    params = []
+    seen = set()
+    for group in optimizer.param_groups:
+        for param in group.get("params", []):
+            if not isinstance(param, torch.Tensor) or not param.requires_grad:
+                continue
+            param_id = id(param)
+            if param_id in seen:
+                continue
+            seen.add(param_id)
+            params.append(param)
+    return params
+
+
+def profile_single_backward_component(loss_term, params):
+    if not isinstance(loss_term, torch.Tensor) or not loss_term.requires_grad or not params:
+        return 0.0
+    torch.cuda.synchronize()
+    t_start = torch.cuda.Event(enable_timing=True)
+    t_end = torch.cuda.Event(enable_timing=True)
+    t_start.record()
+    grads = torch.autograd.grad(
+        loss_term,
+        params,
+        retain_graph=True,
+        allow_unused=True,
+    )
+    t_end.record()
+    torch.cuda.synchronize()
+    elapsed_ms = t_start.elapsed_time(t_end)
+    del grads
+    return elapsed_ms
+
+
+def profile_main_backward_components(loss_D, loss_R, loss_S, params):
+    return {
+        "loss_D_backward": profile_single_backward_component(loss_D, params),
+        "loss_R_backward": profile_single_backward_component(loss_R, params),
+        "loss_S_backward": profile_single_backward_component(loss_S, params),
+    }
 
 
 def run_rate_gradient_diagnostic(
@@ -1125,6 +1173,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
     progress_bar = tqdm(range(opt.iterations), desc="微调进度")
     psnr_train = 0
     for iteration in range(1, opt.iterations + 1):    
+        gaussians.clear_static_eval_quant_cache()
         iter_start.record()
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -1149,7 +1198,8 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             debug=dataset.debug,
             per_channel_quant=dataset.per_channel_quant,
             per_block_quant=dataset.per_block_quant,
-            clamp_color=dataset.clamp_color)
+            clamp_color=dataset.clamp_color,
+            profile_detail=(iteration in testing_iterations))
         image, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
         current_profile = render_pkg.get("profile") if PROFILE_TIME else None
 
@@ -1236,6 +1286,15 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         # 清空梯度
         # if aux_optimizer is not None:
         #     aux_optimizer.zero_grad(set_to_none=True)
+        backward_detail = None
+        if PROFILE_TIME and iteration in testing_iterations:
+            backward_detail = profile_main_backward_components(
+                loss_D,
+                loss_R if uses_rate_model and dataset.lambda_rate > 0 else None,
+                loss_S if dataset.lambda_sparsity > 0 and isinstance(loss_S, torch.Tensor) else None,
+                get_main_backward_params(gaussians.optimizer),
+            )
+
         if PROFILE_TIME:
             torch.cuda.synchronize()
             t_main_backward_start = torch.cuda.Event(enable_timing=True)
@@ -1315,7 +1374,6 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 ft_render, 
                 pipe.scene_imp, 
                 dataset.csv_path, 
-                get_time_csv_path(dataset.csv_path),
                 get_time_detail_csv_path(dataset.csv_path),
                 dataset.model_path, 
                 current_profile,
@@ -1357,6 +1415,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 gaussians.optimizer.step()
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians.update_learning_rate(iteration+30000)
+                gaussians.clear_static_eval_quant_cache()
                 if PROFILE_TIME:
                     t_opt_end.record()
                     torch.cuda.synchronize()
@@ -1371,6 +1430,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                     aux_backward_ms = t_aux_backward_start.elapsed_time(t_aux_backward_end)
                 detailed_profile["aux_backward"] = aux_backward_ms
                 detailed_profile["optimizer_step"] = optimizer_step_ms
+                detailed_profile["backward_detail"] = backward_detail
                 current_profile = detailed_profile
                 if iteration in testing_iterations:
                     step_total_ms = (elapsed_ms or 0.0) + optimizer_step_ms
@@ -1397,6 +1457,41 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                     f = open(get_time_detail_csv_path(dataset.csv_path), 'a+')
                     wtr = csv.writer(f)
                     wtr.writerow(detail_row)
+                    f.close()
+
+                    quant_detail = detail_profile_ms.get("quant_detail") or {}
+                    quant_row = [
+                        pipe.scene_imp,
+                        iteration,
+                        float(detail_profile_ms.get("quant", 0.0)) * 1000.0,
+                        float(quant_detail.get("index_prepare", 0.0)) * 1000.0,
+                        float(quant_detail.get("pack_scatter", 0.0)) * 1000.0,
+                        float(quant_detail.get("block_stat", 0.0)) * 1000.0,
+                        float(quant_detail.get("quant_param_update", 0.0)) * 1000.0,
+                        float(quant_detail.get("quant_param_stack", 0.0)) * 1000.0,
+                        float(quant_detail.get("quant_core", 0.0)) * 1000.0,
+                        float(quant_detail.get("entropy_bits", 0.0)) * 1000.0,
+                        float(quant_detail.get("trans_collect", 0.0)) * 1000.0,
+                        float(quant_detail.get("total", 0.0)) * 1000.0,
+                    ]
+                    f = open(get_quant_detail_csv_path(dataset.csv_path), 'a+')
+                    wtr = csv.writer(f)
+                    wtr.writerow(quant_row)
+                    f.close()
+
+                    backward_profile = detail_profile_ms.get("backward_detail") or {}
+                    backward_row = [
+                        pipe.scene_imp,
+                        iteration,
+                        float(backward_profile.get("loss_D_backward", 0.0)),
+                        float(backward_profile.get("loss_R_backward", 0.0)),
+                        float(backward_profile.get("loss_S_backward", 0.0)),
+                        float(detail_profile_ms.get("main_backward", 0.0)),
+                        float(detail_profile_ms.get("aux_backward", 0.0)),
+                    ]
+                    f = open(get_backward_detail_csv_path(dataset.csv_path), 'a+')
+                    wtr = csv.writer(f)
+                    wtr.writerow(backward_row)
                     f.close()
         # except Exception as e:
         #     print('error but go')
@@ -1435,7 +1530,6 @@ def training_report(
         renderFunc, 
         scene_name, 
         csv_path, 
-        time_csv_path,
         time_detail_csv_path,
         model_path, 
         profile,
@@ -1532,21 +1626,6 @@ def training_report(
         wtr.writerow(row)
         f.close()
 
-        if PROFILE_TIME and elapsed is not None:
-            profile_ms = profile or {}
-            time_row = [
-                scene_name,
-                iteration,
-                elapsed,
-                float(profile_ms.get("raht_forward", 0.0)) * 1000.0,
-                float(profile_ms.get("quant", 0.0)) * 1000.0,
-                float(profile_ms.get("entropy", 0.0)) * 1000.0,
-                float(profile_ms.get("raht_inverse", 0.0)) * 1000.0,
-            ]
-            f = open(time_csv_path, 'a+')
-            wtr = csv.writer(f)
-            wtr.writerow(time_row)
-            f.close()
         print("Testset Evaluating {}. PSNR: {}, SSIM: {}, LIPIS: {}".format(iteration, psnr_val, ssim_val, lpips_val, zip_size))
 
     return psnr_val, ssim_val, lpips_val
@@ -1626,24 +1705,6 @@ if __name__ == "__main__":
         f.close()
 
     if PROFILE_TIME:
-        time_csv_path = get_time_csv_path(dataset.csv_path)
-        if not os.path.exists(time_csv_path):
-            csv_dir = os.path.dirname(time_csv_path)
-            os.makedirs(csv_dir, exist_ok=True)
-
-            f = open(time_csv_path, 'a+')
-            wtr = csv.writer(f)
-            wtr.writerow([
-                'name',
-                'iteration',
-                'iter_time_ms',
-                'raht_forward_ms',
-                'quant_ms',
-                'entropy_ms',
-                'raht_inverse_ms',
-            ])
-            f.close()
-
         time_detail_csv_path = get_time_detail_csv_path(dataset.csv_path)
         if not os.path.exists(time_detail_csv_path):
             csv_dir = os.path.dirname(time_detail_csv_path)
@@ -1669,6 +1730,47 @@ if __name__ == "__main__":
                 'main_backward_ms',
                 'aux_backward_ms',
                 'optimizer_step_ms',
+            ])
+            f.close()
+
+        quant_detail_csv_path = get_quant_detail_csv_path(dataset.csv_path)
+        if not os.path.exists(quant_detail_csv_path):
+            csv_dir = os.path.dirname(quant_detail_csv_path)
+            os.makedirs(csv_dir, exist_ok=True)
+
+            f = open(quant_detail_csv_path, 'a+')
+            wtr = csv.writer(f)
+            wtr.writerow([
+                'name',
+                'iteration',
+                'quant_wrapper_ms',
+                'split_index_prepare_ms',
+                'pack_scatter_ms',
+                'block_stat_ms',
+                'quant_param_update_ms',
+                'quant_param_stack_ms',
+                'quant_core_ms',
+                'entropy_bits_ms',
+                'trans_collect_ms',
+                'quant_detail_total_ms',
+            ])
+            f.close()
+
+        backward_detail_csv_path = get_backward_detail_csv_path(dataset.csv_path)
+        if not os.path.exists(backward_detail_csv_path):
+            csv_dir = os.path.dirname(backward_detail_csv_path)
+            os.makedirs(csv_dir, exist_ok=True)
+
+            f = open(backward_detail_csv_path, 'a+')
+            wtr = csv.writer(f)
+            wtr.writerow([
+                'name',
+                'iteration',
+                'loss_D_backward_ms',
+                'loss_R_backward_ms',
+                'loss_S_backward_ms',
+                'main_backward_total_ms',
+                'aux_backward_ms',
             ])
             f.close()
         

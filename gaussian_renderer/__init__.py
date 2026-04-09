@@ -23,7 +23,9 @@ from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.quant_utils import (
     batched_quantize_blocks,
-    estimate_laplace_block_params,
+    estimate_zero_inflated_laplace_block_params,
+    quantizer_center_symbol,
+    quantizer_uses_center_inflated_laplace,
     quantizer_uses_zero_point,
     quantizer_uses_zero_mean_laplace,
     split_length,
@@ -527,25 +529,48 @@ def ft_render(
                     _, likelihoods = pc.qa.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
                     total_ans_bits = torch.clamp(-torch.log2(likelihoods.clamp(min=1e-6)), max=32.0).sum()
                 elif encode_mode == "laplace":
-                    from utils.quant_utils import _laplace_bits_with_tail_clip
+                    from utils.quant_utils import _zero_inflated_laplace_bits_with_tail_clip
                     if hasattr(pc.qa, "s"):
                         symbol_domain = quantC[1:] / pc.qa.s
                     elif quantizer_uses_zero_point(pc.qa):
                         symbol_domain = pc.qa.zero_point + (quantC[1:] / pc.qa.scale)
                     else:
                         symbol_domain = quantC[1:] / pc.qa.scale
-                    zero_mean_flags = [[quantizer_uses_zero_mean_laplace(pc.qa)]]
-                    block_means, block_scales = estimate_laplace_block_params(
+                    zero_mean_flags = [
+                        [quantizer_uses_zero_mean_laplace(pc.qa)]
+                        for _ in range(symbol_domain.shape[1])
+                    ]
+                    zero_inflation_flags = [
+                        [quantizer_uses_center_inflated_laplace(pc.qa)]
+                        for _ in range(symbol_domain.shape[1])
+                    ]
+                    center_symbol_values = [
+                        [float(quantizer_center_symbol(pc.qa))]
+                        for _ in range(symbol_domain.shape[1])
+                    ]
+                    block_means, block_scales, block_zero_probs, block_center_symbols = estimate_zero_inflated_laplace_block_params(
                         symbol_domain,
                         [quantC.shape[0] - 1],
                         zero_mean_flags=zero_mean_flags,
+                        zero_inflation_flags=zero_inflation_flags,
+                        center_symbol_values=center_symbol_values,
                     )
                     safe_mean = block_means.reshape(1, -1)
                     safe_scale = block_scales.reshape(1, -1).clamp(min=1e-6)
-                    total_ans_bits = _laplace_bits_with_tail_clip(
+                    safe_zero_probs = block_zero_probs.reshape(1, -1)
+                    safe_center_symbols = block_center_symbols.reshape(1, -1)
+                    zero_inflation_mask = torch.as_tensor(
+                        zero_inflation_flags,
+                        device=symbol_domain.device,
+                        dtype=torch.bool,
+                    )
+                    total_ans_bits = _zero_inflated_laplace_bits_with_tail_clip(
                         symbol_domain,
                         safe_scale,
+                        safe_zero_probs,
                         block_mean=safe_mean,
+                        zero_inflation_mask=zero_inflation_mask,
+                        center_symbol_tensor=safe_center_symbols,
                     ).sum()
 
             if PROFILE_TIME:

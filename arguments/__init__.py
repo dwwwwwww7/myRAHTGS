@@ -81,6 +81,7 @@ class ModelParams(ParamGroup):
         self.vanilla_withzeropoint=True  # VanillaQuan 是否启用 affine zero_point
         self.encode="deflate" # 熵编码方式: "deflate"、"ans" 或 "laplace"
         self.lambda_rate=0.001  # 使用ANS熵编码时的R权重
+        self.disable_center_inflated_laplace=False # 不使用添加zero inflation的拉普拉斯分布
         self.rate_grad_diag=False
         self.rate_grad_diag_interval=10
         self.rate_grad_diag_step=1e-4

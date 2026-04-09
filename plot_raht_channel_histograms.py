@@ -558,6 +558,7 @@ def collect_raht_statistics(args):
         bit_config=bit_config,
         quant_type=args.quant_type,
         encode="deflate",
+        use_center_inflated_laplace=not getattr(args, "disable_center_inflated_laplace", False),
     )
 
     raht_input = build_raht_input_matrix(gaussians)

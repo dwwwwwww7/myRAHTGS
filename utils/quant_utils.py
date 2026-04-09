@@ -73,6 +73,18 @@ def quantizer_uses_zero_mean_laplace(qa):
     return float(getattr(qa, "thd_neg", 0.0)) < 0.0 < float(getattr(qa, "thd_pos", 0.0))
 
 
+def quantizer_uses_center_inflated_laplace(qa):
+    if not bool(getattr(qa, "use_center_inflated_laplace", True)):
+        return False
+    return quantizer_uses_zero_mean_laplace(qa) or quantizer_uses_zero_point(qa)
+
+
+def quantizer_center_symbol(qa):
+    if quantizer_uses_zero_point(qa):
+        return int(round(_get_quantizer_zero_point_value(qa)))
+    return 0
+
+
 def build_laplace_zero_mean_mask(qas, n_dims, n_blocks, device):
     flat_qas = list(qas)
     expected_qas = n_dims * n_blocks
@@ -80,6 +92,24 @@ def build_laplace_zero_mean_mask(qas, n_dims, n_blocks, device):
         raise ValueError(f"Expected {expected_qas} quantizers, got {len(flat_qas)}")
     zero_mean_flags = [quantizer_uses_zero_mean_laplace(qa) for qa in flat_qas]
     return torch.tensor(zero_mean_flags, device=device, dtype=torch.bool).view(n_dims, n_blocks, 1)
+
+
+def build_laplace_zero_inflation_mask(qas, n_dims, n_blocks, device):
+    flat_qas = list(qas)
+    expected_qas = n_dims * n_blocks
+    if len(flat_qas) != expected_qas:
+        raise ValueError(f"Expected {expected_qas} quantizers, got {len(flat_qas)}")
+    zero_inflation_flags = [quantizer_uses_center_inflated_laplace(qa) for qa in flat_qas]
+    return torch.tensor(zero_inflation_flags, device=device, dtype=torch.bool).view(n_dims, n_blocks, 1)
+
+
+def build_laplace_center_symbol_tensor(qas, n_dims, n_blocks, device, dtype):
+    flat_qas = list(qas)
+    expected_qas = n_dims * n_blocks
+    if len(flat_qas) != expected_qas:
+        raise ValueError(f"Expected {expected_qas} quantizers, got {len(flat_qas)}")
+    center_symbols = [quantizer_center_symbol(qa) for qa in flat_qas]
+    return torch.tensor(center_symbols, device=device, dtype=dtype).view(n_dims, n_blocks, 1)
 
 
 def _reshape_zero_mean_mask(zero_mean_mask, n_dims, n_blocks, device):
@@ -91,6 +121,21 @@ def _reshape_zero_mean_mask(zero_mean_mask, n_dims, n_blocks, device):
             f"Expected {n_dims * n_blocks} zero-mean flags, got {int(zero_mean_mask.numel())}"
         )
     return zero_mean_mask.view(n_dims, n_blocks, 1)
+
+
+def _reshape_zero_inflation_mask(zero_inflation_mask, n_dims, n_blocks, device):
+    return _reshape_zero_mean_mask(zero_inflation_mask, n_dims, n_blocks, device)
+
+
+def _reshape_center_symbol_tensor(center_symbol_values, n_dims, n_blocks, device, dtype):
+    if center_symbol_values is None:
+        return None
+    center_symbol_values = torch.as_tensor(center_symbol_values, device=device, dtype=dtype)
+    if center_symbol_values.numel() != n_dims * n_blocks:
+        raise ValueError(
+            f"Expected {n_dims * n_blocks} center-symbol values, got {int(center_symbol_values.numel())}"
+        )
+    return center_symbol_values.view(n_dims, n_blocks, 1)
 
 
 def _estimate_laplace_block_params_from_packed(symbols, split_tensor, zero_mean_mask=None):
@@ -119,6 +164,106 @@ def _estimate_laplace_block_params_from_packed(symbols, split_tensor, zero_mean_
     return block_mean.squeeze(-1), raw_scale
 
 
+def _estimate_zero_inflated_laplace_params_from_packed(
+    symbols,
+    split_tensor,
+    zero_mean_mask=None,
+    zero_inflation_mask=None,
+    center_symbol_tensor=None,
+):
+    block_lengths = split_tensor.to(dtype=symbols.dtype).view(1, -1, 1)
+    max_block_len = symbols.shape[-1]
+    valid_mask = (
+        torch.arange(max_block_len, device=symbols.device, dtype=torch.long)
+        .view(1, 1, -1)
+        < split_tensor.view(1, -1, 1)
+    )
+    valid_mask_f = valid_mask.to(dtype=symbols.dtype)
+
+    empirical_mean = (
+        (symbols.detach() * valid_mask_f).sum(dim=-1)
+        / block_lengths.squeeze(-1).clamp(min=1.0)
+    ).unsqueeze(-1)
+    if zero_mean_mask is None:
+        block_mean = empirical_mean
+    else:
+        block_mean = torch.where(zero_mean_mask, torch.zeros_like(empirical_mean), empirical_mean)
+    if center_symbol_tensor is not None and zero_inflation_mask is not None:
+        block_mean = torch.where(
+            zero_inflation_mask,
+            center_symbol_tensor.to(dtype=empirical_mean.dtype),
+            block_mean,
+        )
+
+    full_scale = (
+        ((symbols.detach() - block_mean).abs() * valid_mask_f).sum(dim=-1)
+        / block_lengths.squeeze(-1).clamp(min=1.0)
+    ).clamp(min=1e-6)
+
+    if zero_inflation_mask is None:
+        zero_probs = torch.zeros_like(full_scale)
+        center_symbols = torch.zeros_like(block_mean.squeeze(-1))
+        return block_mean.squeeze(-1), full_scale, zero_probs, center_symbols
+
+    zero_inflation_mask = zero_inflation_mask.to(dtype=torch.bool)
+    if center_symbol_tensor is None:
+        center_symbol_tensor = torch.zeros_like(block_mean)
+    center_symbols = center_symbol_tensor.squeeze(-1)
+    center_matches = symbols.detach() == center_symbol_tensor.to(dtype=symbols.dtype)
+    zero_counts = (center_matches & valid_mask).to(dtype=symbols.dtype).sum(dim=-1)
+    smoothed_zero_probs = (zero_counts + 1.0) / (block_lengths.squeeze(-1) + 2.0)
+
+    nonzero_mask = valid_mask & (~center_matches)
+    nonzero_mask_f = nonzero_mask.to(dtype=symbols.dtype)
+    nonzero_counts = nonzero_mask_f.sum(dim=-1)
+    nonzero_scale = (
+        ((symbols.detach() - block_mean).abs() * nonzero_mask_f).sum(dim=-1)
+        / nonzero_counts.clamp(min=1.0)
+    )
+    nonzero_scale = torch.where(nonzero_counts > 0, nonzero_scale, torch.ones_like(nonzero_scale))
+
+    zi_mask = zero_inflation_mask.squeeze(-1)
+    raw_scale = torch.where(zi_mask, nonzero_scale, full_scale).clamp(min=1e-6)
+    zero_probs = torch.where(zi_mask, smoothed_zero_probs, torch.zeros_like(smoothed_zero_probs))
+    center_symbols = torch.where(zi_mask, center_symbols, torch.zeros_like(center_symbols))
+    return block_mean.squeeze(-1), raw_scale, zero_probs, center_symbols
+
+
+def _laplace_symbol_probs(quantized_symbols, block_scale, block_mean=None):
+    safe_scale = block_scale.clamp(min=0.01)
+    mean = None if block_mean is None else block_mean
+    upper = _laplace_cdf(quantized_symbols + 0.5, safe_scale, mean=mean)
+    lower = _laplace_cdf(quantized_symbols - 0.5, safe_scale, mean=mean)
+    return (upper - lower).clamp(min=1e-9)
+
+
+def _zero_inflated_laplace_symbol_probs(
+    quantized_symbols,
+    block_scale,
+    block_zero_prob,
+    block_mean=None,
+    zero_inflation_mask=None,
+    center_symbol_tensor=None,
+):
+    base_probs = _laplace_symbol_probs(quantized_symbols, block_scale, block_mean=block_mean)
+    if zero_inflation_mask is None:
+        return base_probs
+
+    safe_zero_prob = block_zero_prob.clamp(min=0.0, max=1.0 - 1e-6)
+    if center_symbol_tensor is None:
+        center_symbol_tensor = torch.zeros_like(block_zero_prob)
+    center_symbols = center_symbol_tensor.to(dtype=quantized_symbols.dtype).expand_as(quantized_symbols)
+    center_bin_prob = _laplace_symbol_probs(center_symbols, block_scale, block_mean=block_mean)
+    tail_norm = (1.0 - center_bin_prob).clamp(min=1e-9)
+    nonzero_probs = ((1.0 - safe_zero_prob) * (base_probs / tail_norm)).clamp(min=1e-9)
+    inflated_probs = torch.where(
+        quantized_symbols == center_symbols,
+        safe_zero_prob.clamp(min=1e-9),
+        nonzero_probs,
+    )
+    return torch.where(zero_inflation_mask, inflated_probs, base_probs).clamp(min=1e-9)
+
+
 def _estimate_laplace_bits(symbols, split_tensor, zero_mean_mask=None):
     max_block_len = symbols.shape[-1]
     valid_mask = (
@@ -144,6 +289,45 @@ def _estimate_laplace_bits(symbols, split_tensor, zero_mean_mask=None):
     per_element_bits = -torch.log2(probs)
     total_bits = (per_element_bits * valid_mask_f).sum()
     return total_bits, block_mean, raw_scale
+
+
+def _estimate_zero_inflated_laplace_bits(
+    symbols,
+    split_tensor,
+    zero_mean_mask=None,
+    zero_inflation_mask=None,
+    center_symbol_tensor=None,
+):
+    max_block_len = symbols.shape[-1]
+    valid_mask = (
+        torch.arange(max_block_len, device=symbols.device, dtype=torch.long)
+        .view(1, 1, -1)
+        < split_tensor.view(1, -1, 1)
+    )
+    valid_mask_f = valid_mask.to(dtype=symbols.dtype)
+
+    block_mean, raw_scale, block_zero_probs, block_center_symbols = _estimate_zero_inflated_laplace_params_from_packed(
+        symbols,
+        split_tensor,
+        zero_mean_mask=zero_mean_mask,
+        zero_inflation_mask=zero_inflation_mask,
+        center_symbol_tensor=center_symbol_tensor,
+    )
+
+    block_mean_expanded = block_mean.unsqueeze(-1)
+    train_scale = raw_scale.clamp(min=0.01).unsqueeze(-1)
+    train_zero_probs = block_zero_probs.unsqueeze(-1)
+    probs = _zero_inflated_laplace_symbol_probs(
+        symbols,
+        train_scale,
+        train_zero_probs,
+        block_mean=block_mean_expanded,
+        zero_inflation_mask=zero_inflation_mask,
+        center_symbol_tensor=block_center_symbols.unsqueeze(-1),
+    )
+    per_element_bits = -torch.log2(probs)
+    total_bits = (per_element_bits * valid_mask_f).sum()
+    return total_bits, block_mean, raw_scale, block_zero_probs, block_center_symbols
 
 
 def _laplace_bits_with_tail_clip(quantized_symbols, block_scale, block_mean=None, sigma=3.0):
@@ -187,6 +371,27 @@ def _laplace_bits_with_tail_clip(quantized_symbols, block_scale, block_mean=None
     return -torch.log2(probs)
 
 
+def _zero_inflated_laplace_bits_with_tail_clip(
+    quantized_symbols,
+    block_scale,
+    block_zero_prob,
+    block_mean=None,
+    zero_inflation_mask=None,
+    center_symbol_tensor=None,
+    sigma=3.0,
+):
+    del sigma
+    probs = _zero_inflated_laplace_symbol_probs(
+        quantized_symbols,
+        block_scale.clamp(min=0.01),
+        block_zero_prob,
+        block_mean=block_mean,
+        zero_inflation_mask=zero_inflation_mask,
+        center_symbol_tensor=center_symbol_tensor,
+    )
+    return -torch.log2(probs.clamp(min=1e-9))
+
+
 def estimate_laplace_block_params(symbols, split, qas=None, zero_mean_flags=None):
     squeeze_output = False
     if symbols.dim() == 1:
@@ -226,6 +431,104 @@ def estimate_laplace_block_params(symbols, split, qas=None, zero_mean_flags=None
     if squeeze_output:
         return block_means.reshape(-1), block_scales.reshape(-1)
     return block_means, block_scales
+
+
+def estimate_zero_inflated_laplace_block_params(
+    symbols,
+    split,
+    qas=None,
+    zero_mean_flags=None,
+    zero_inflation_flags=None,
+    center_symbol_values=None,
+):
+    squeeze_output = False
+    if symbols.dim() == 1:
+        symbols = symbols.reshape(-1, 1)
+        squeeze_output = True
+    if symbols.dim() != 2:
+        raise ValueError(f"Expected symbols to be 1D or 2D, got shape {tuple(symbols.shape)}")
+
+    split_tensor, block_ids, local_ids = _build_block_index_tensors(split, symbols.device)
+    max_block_len = int(split_tensor.max().item())
+    xt = symbols.transpose(0, 1).contiguous()
+    packed = xt.new_zeros((symbols.shape[1], len(split), max_block_len))
+    packed[:, block_ids, local_ids] = xt
+
+    zero_mean_mask = None
+    zero_inflation_mask = None
+    center_symbol_tensor = None
+    if qas is not None:
+        zero_mean_mask = build_laplace_zero_mean_mask(
+            qas,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+        )
+        zero_inflation_mask = build_laplace_zero_inflation_mask(
+            qas,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+        )
+        center_symbol_tensor = build_laplace_center_symbol_tensor(
+            qas,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+            dtype=symbols.dtype,
+        )
+    elif zero_mean_flags is not None:
+        zero_mean_mask = _reshape_zero_mean_mask(
+            zero_mean_flags,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+        )
+        inferred_flags = zero_mean_flags if zero_inflation_flags is None else zero_inflation_flags
+        zero_inflation_mask = _reshape_zero_inflation_mask(
+            inferred_flags,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+        )
+        center_symbol_tensor = _reshape_center_symbol_tensor(
+            center_symbol_values,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+            dtype=symbols.dtype,
+        )
+    elif zero_inflation_flags is not None:
+        zero_inflation_mask = _reshape_zero_inflation_mask(
+            zero_inflation_flags,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+        )
+        center_symbol_tensor = _reshape_center_symbol_tensor(
+            center_symbol_values,
+            n_dims=symbols.shape[1],
+            n_blocks=len(split),
+            device=symbols.device,
+            dtype=symbols.dtype,
+        )
+
+    block_means, block_scales, block_zero_probs, block_center_symbols = _estimate_zero_inflated_laplace_params_from_packed(
+        packed,
+        split_tensor,
+        zero_mean_mask=zero_mean_mask,
+        zero_inflation_mask=zero_inflation_mask,
+        center_symbol_tensor=center_symbol_tensor,
+    )
+
+    if squeeze_output:
+        return (
+            block_means.reshape(-1),
+            block_scales.reshape(-1),
+            block_zero_probs.reshape(-1),
+            block_center_symbols.reshape(-1),
+        )
+    return block_means, block_scales, block_zero_probs, block_center_symbols
 
 
 def estimate_zero_mean_laplace_block_scales(symbols, split):
@@ -546,10 +849,25 @@ def batched_quantize_blocks(
             n_blocks=n_blocks,
             device=x_q.device,
         )
-        ans_bits, entropy_means, entropy_scales = _estimate_laplace_bits(
+        zero_inflation_mask = build_laplace_zero_inflation_mask(
+            flat_qas,
+            n_dims=n_dims,
+            n_blocks=n_blocks,
+            device=x_q.device,
+        )
+        center_symbol_tensor = build_laplace_center_symbol_tensor(
+            flat_qas,
+            n_dims=n_dims,
+            n_blocks=n_blocks,
+            device=x_q.device,
+            dtype=x_q.dtype,
+        )
+        ans_bits, entropy_means, entropy_scales, _, _ = _estimate_zero_inflated_laplace_bits(
             x_q,
             split_tensor,
             zero_mean_mask=zero_mean_mask,
+            zero_inflation_mask=zero_inflation_mask,
+            center_symbol_tensor=center_symbol_tensor,
         )
     if return_ans_bits or needs_clamped_cache:
         for dim_idx in range(n_dims):
@@ -703,6 +1021,7 @@ class Quantizer(nn.Module):
     def __init__(self, bit):
         super().__init__()
         self.bit = bit  # 保存 bit 属性
+        self.use_center_inflated_laplace = True
 
     def init_from(self, x, *args, **kwargs):
         pass

@@ -1039,6 +1039,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
             encode=getattr(dataset, 'encode', 'deflate'),
             ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
+            use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
         )
         print(f"  通道量化: 启用")
     elif dataset.per_block_quant:
@@ -1059,6 +1060,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
             encode=getattr(dataset, 'encode', 'deflate'),
             ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
+            use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
         )
     else:
         print(f"未知的量化模式")

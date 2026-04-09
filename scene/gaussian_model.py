@@ -36,7 +36,9 @@ from utils.quant_utils import (
     LsqQuan,
     VanillaQuan,
     batched_quantize_blocks,
-    estimate_laplace_block_params,
+    estimate_zero_inflated_laplace_block_params,
+    quantizer_center_symbol,
+    quantizer_uses_center_inflated_laplace,
     quantizer_uses_zero_mean_laplace,
     split_length,
 )
@@ -87,7 +89,7 @@ def laplace_cdf(x_values, scale, mean=0.0):
     return np.where(centered >= 0.0, positive, negative)
 
 
-def build_laplace_pmf(scale, support_min, support_max, mean=0.0):
+def build_laplace_pmf(scale, support_min, support_max, mean=0.0, zero_prob=0.0, center_symbol=0):
     support_values = np.arange(int(support_min), int(support_max) + 1, dtype=np.int32)
     pmf = laplace_cdf(support_values + 0.5, scale, mean=mean) - laplace_cdf(
         support_values - 0.5,
@@ -95,6 +97,20 @@ def build_laplace_pmf(scale, support_min, support_max, mean=0.0):
         mean=mean,
     )
     pmf = np.clip(pmf, 1e-12, None)
+    safe_zero_prob = float(np.clip(zero_prob, 0.0, 1.0 - 1e-6))
+    center_indices = np.where(support_values == int(center_symbol))[0]
+    if safe_zero_prob > 0.0 and center_indices.size > 0:
+        zero_idx = int(center_indices[0])
+        tail = pmf.copy()
+        tail[zero_idx] = 0.0
+        tail_mass = float(tail.sum())
+        if tail_mass <= 1e-12:
+            tail = np.ones_like(tail, dtype=np.float64)
+            tail[zero_idx] = 0.0
+            tail_mass = float(tail.sum())
+        pmf = (1.0 - safe_zero_prob) * tail / max(tail_mass, 1e-12)
+        pmf[zero_idx] = safe_zero_prob
+        pmf = np.clip(pmf, 1e-12, None)
     pmf = pmf / max(float(pmf.sum()), 1e-12)
     return support_values, pmf
 
@@ -815,8 +831,23 @@ class GaussianModel:
             support_max = int(2 ** int(bit) - 1)
         return support_min, support_max
 
-    def build_laplace_cdf_info(self, scale, support_min, support_max, mean=0.0):
-        _, pmf = build_laplace_pmf(scale, support_min, support_max, mean=mean)
+    def build_laplace_cdf_info(
+        self,
+        scale,
+        support_min,
+        support_max,
+        mean=0.0,
+        zero_prob=0.0,
+        center_symbol=0,
+    ):
+        _, pmf = build_laplace_pmf(
+            scale,
+            support_min,
+            support_max,
+            mean=mean,
+            zero_prob=zero_prob,
+            center_symbol=center_symbol,
+        )
         cdf = pmf_to_quantized_cdf(torch.tensor(pmf, dtype=torch.float32), precision=16)
         cdf_list = cdf.to(torch.int32).tolist()
         return {
@@ -852,7 +883,7 @@ class GaussianModel:
             qci_tensor = torch.from_numpy(qci.astype(np.float32))
         else:
             qci_tensor = qci.to(torch.float32)
-        laplace_means, laplace_scales = estimate_laplace_block_params(
+        laplace_means, laplace_scales, laplace_zero_probs, laplace_center_symbols = estimate_zero_inflated_laplace_block_params(
             qci_tensor,
             split,
             qas=self.qas,
@@ -860,6 +891,8 @@ class GaussianModel:
         return (
             laplace_means.reshape(-1).cpu().numpy().astype(np.float32),
             laplace_scales.reshape(-1).cpu().numpy().astype(np.float32),
+            laplace_zero_probs.reshape(-1).cpu().numpy().astype(np.float32),
+            laplace_center_symbols.reshape(-1).cpu().numpy().astype(np.float32),
         )
 
     def compress_ans_groups(self, group_data):
@@ -895,7 +928,17 @@ class GaussianModel:
 
         return ans_save_dict, total_ans_bytes
 
-    def compress_laplace_groups(self, group_data, dim_bits, laplace_scales, ac_len, signed_flags=None, laplace_means=None):
+    def compress_laplace_groups(
+        self,
+        group_data,
+        dim_bits,
+        laplace_scales,
+        ac_len,
+        signed_flags=None,
+        laplace_means=None,
+        laplace_zero_probs=None,
+        laplace_center_symbols=None,
+    ):
         save_dict = {
             'packed': np.array([3], dtype=np.uint8),
             'laplace_block_count': np.array([len(self.qas)], dtype=np.int32),
@@ -907,6 +950,16 @@ class GaussianModel:
             np.zeros_like(laplace_scales, dtype=np.float32)
             if laplace_means is None
             else np.asarray(laplace_means, dtype=np.float32).reshape(-1)
+        )
+        laplace_zero_probs = (
+            np.zeros_like(laplace_scales, dtype=np.float32)
+            if laplace_zero_probs is None
+            else np.asarray(laplace_zero_probs, dtype=np.float32).reshape(-1)
+        )
+        laplace_center_symbols = (
+            np.zeros_like(laplace_scales, dtype=np.float32)
+            if laplace_center_symbols is None
+            else np.asarray(laplace_center_symbols, dtype=np.float32).reshape(-1)
         )
 
         for spec in self.iter_ans_block_specs(ac_len):
@@ -925,6 +978,8 @@ class GaussianModel:
                 support_min,
                 support_max,
                 mean=laplace_means[spec["qa_idx"]],
+                zero_prob=laplace_zero_probs[spec["qa_idx"]],
+                center_symbol=laplace_center_symbols[spec["qa_idx"]],
             )
             bitstream = encoder.encode_with_indexes(
                 symbols.reshape(-1).to(torch.int32).cpu().tolist(),
@@ -1388,6 +1443,16 @@ class GaussianModel:
             if "laplace_mean" in npz_data
             else np.zeros_like(scales, dtype=np.float32)
         )
+        zero_probs = (
+            np.asarray(npz_data["laplace_zero_prob"], dtype=np.float32).reshape(-1)
+            if "laplace_zero_prob" in npz_data
+            else np.zeros_like(scales, dtype=np.float32)
+        )
+        center_symbols = (
+            np.asarray(npz_data["laplace_center_symbol"], dtype=np.float32).reshape(-1)
+            if "laplace_center_symbol" in npz_data
+            else np.zeros_like(scales, dtype=np.float32)
+        )
         decoder = compressai_ans.RansDecoder()
 
         for spec in self.iter_ans_block_specs(ac_len):
@@ -1406,6 +1471,8 @@ class GaussianModel:
                 support_min,
                 support_max,
                 mean=means[spec["qa_idx"]],
+                zero_prob=zero_probs[spec["qa_idx"]],
+                center_symbol=center_symbols[spec["qa_idx"]],
             )
             bitstream = bytes(npz_data[key].tolist())
             decoded = decoder.decode_with_indexes(
@@ -1987,7 +2054,7 @@ class GaussianModel:
                             exp_dir,
                         )
                 else:
-                    laplace_means, laplace_scales = self.estimate_laplace_group_params_from_qci(
+                    laplace_means, laplace_scales, laplace_zero_probs, laplace_center_symbols = self.estimate_laplace_group_params_from_qci(
                         qci,
                         split,
                     )
@@ -1998,9 +2065,13 @@ class GaussianModel:
                         ac_len,
                         signed_flags=signed_flags,
                         laplace_means=laplace_means,
+                        laplace_zero_probs=laplace_zero_probs,
+                        laplace_center_symbols=laplace_center_symbols,
                     )
                     save_dict['laplace_mean'] = laplace_means
                     save_dict['laplace_scale'] = laplace_scales
+                    save_dict['laplace_zero_prob'] = laplace_zero_probs
+                    save_dict['laplace_center_symbol'] = laplace_center_symbols
                     print(f"      Laplace 字节流总大小: {total_bytes / 1024:.2f} KB")
 
                 save_dict['f'] = cf
@@ -2011,6 +2082,8 @@ class GaussianModel:
             if not is_ans and not is_laplace:
                 laplace_means = None
                 laplace_scales = None
+                laplace_zero_probs = None
+                laplace_center_symbols = None
                 if per_channel_quant:
                     qci = []
                     dqci = []
@@ -2049,7 +2122,7 @@ class GaussianModel:
                     qci = np.concatenate(qci, axis=-1)
                     dqci = np.concatenate(dqci, axis=-1)
                     if encode_mode == "laplace":
-                        laplace_means, laplace_scales = self.estimate_laplace_group_params_from_qci(
+                        laplace_means, laplace_scales, laplace_zero_probs, laplace_center_symbols = self.estimate_laplace_group_params_from_qci(
                             qci,
                             [qci.shape[0]],
                         )
@@ -2093,7 +2166,7 @@ class GaussianModel:
                 
                     qci = np.concatenate(qci, axis=-1)  # 现在形状是 (N, 55)
                     if encode_mode == "laplace":
-                        laplace_means, laplace_scales = self.estimate_laplace_group_params_from_qci(
+                        laplace_means, laplace_scales, laplace_zero_probs, laplace_center_symbols = self.estimate_laplace_group_params_from_qci(
                             qci,
                             split,
                         )
@@ -2118,13 +2191,26 @@ class GaussianModel:
                     trans_array.append(i_zp.item())
                     dim_bits = [self.qa.bit] * 55  # 所有维度使用相同的位数
                     if encode_mode == "laplace":
-                        laplace_means, laplace_scales = estimate_laplace_block_params(
+                        laplace_means, laplace_scales, laplace_zero_probs, laplace_center_symbols = estimate_zero_inflated_laplace_block_params(
                             torch.from_numpy(qci.astype(np.float32)),
                             [qci.shape[0]],
-                            zero_mean_flags=[[quantizer_uses_zero_mean_laplace(self.qa)]],
+                            zero_mean_flags=[
+                                [quantizer_uses_zero_mean_laplace(self.qa)]
+                                for _ in range(qci.shape[1])
+                            ],
+                            zero_inflation_flags=[
+                                [quantizer_uses_center_inflated_laplace(self.qa)]
+                                for _ in range(qci.shape[1])
+                            ],
+                            center_symbol_values=[
+                                [float(quantizer_center_symbol(self.qa))]
+                                for _ in range(qci.shape[1])
+                            ],
                         )
                         laplace_means = laplace_means.reshape(-1).cpu().numpy().astype(np.float32)
                         laplace_scales = laplace_scales.reshape(-1).cpu().numpy().astype(np.float32)
+                        laplace_zero_probs = laplace_zero_probs.reshape(-1).cpu().numpy().astype(np.float32)
+                        laplace_center_symbols = laplace_center_symbols.reshape(-1).cpu().numpy().astype(np.float32)
                 
                 print(f"\n  保存 RAHT 系数 (包含 scale)...")
             
@@ -2158,6 +2244,8 @@ class GaussianModel:
                         if laplace_scales is not None:
                             save_dict['laplace_mean'] = laplace_means
                             save_dict['laplace_scale'] = laplace_scales
+                            save_dict['laplace_zero_prob'] = laplace_zero_probs
+                            save_dict['laplace_center_symbol'] = laplace_center_symbols
                     
                         print(f"      原始大小: {qci.nbytes / 1024:.2f} KB")
                         print(f"      打包后大小: {bitstream_size:.2f} KB")
@@ -2192,6 +2280,8 @@ class GaussianModel:
                         if laplace_scales is not None:
                             save_dict['laplace_mean'] = laplace_means
                             save_dict['laplace_scale'] = laplace_scales
+                            save_dict['laplace_zero_prob'] = laplace_zero_probs
+                            save_dict['laplace_center_symbol'] = laplace_center_symbols
                         
                             print(f"      {bit:2d}-bit: {len(dims):2d} 维度, {dtype.__name__:6s}, {group_size:8.2f} KB")
                     
@@ -2209,6 +2299,8 @@ class GaussianModel:
                     if laplace_scales is not None:
                         save_dict['laplace_mean'] = laplace_means
                         save_dict['laplace_scale'] = laplace_scales
+                        save_dict['laplace_zero_prob'] = laplace_zero_probs
+                        save_dict['laplace_center_symbol'] = laplace_center_symbols
                     np.savez(os.path.join(bin_dir,'orgb.npz'), **save_dict)
                     print(f"    orgb.npz: 形状 {qci.shape}, 大小 {qci.nbytes / 1024:.2f} KB")
             
@@ -2238,6 +2330,7 @@ class GaussianModel:
         encode="deflate",
         ans_subgroup_count=1,
         vanilla_withzeropoint=None,
+        use_center_inflated_laplace=True,
     ):
         """
         初始化量化器，支持不同属性使用不同的量化位数
@@ -2261,6 +2354,7 @@ class GaussianModel:
         self.encode = encode
         self.ans_subgroup_count = max(1, int(ans_subgroup_count))
         self.vanilla_withzeropoint = vanilla_withzeropoint
+        self.use_center_inflated_laplace = bool(use_center_inflated_laplace)
         self.update_raht_subgroups()
         
         # 默认配置：所有属性8-bit
@@ -2327,26 +2421,24 @@ class GaussianModel:
                     eb = EntropyBottleneck(1).cuda()
                     self.ans_entropy_bottlenecks[qa_key] = eb
                 if quant_type.lower() == "lsq":
-                    self.qas.append(
-                        LsqQuan(
-                            bit=bit,
-                            init_yet=False,
-                            all_positive=False,
-                            encode=encode,
-                            shared_eb=eb,
-                        ).cuda()
-                    )
+                    qa_module = LsqQuan(
+                        bit=bit,
+                        init_yet=False,
+                        all_positive=False,
+                        encode=encode,
+                        shared_eb=eb,
+                    ).cuda()
                 else:
-                    self.qas.append(
-                        VanillaQuan(
-                            bit=bit,
-                            all_positive=False,
-                            symmetric=False,
-                            withzeropoint=vanilla_withzeropoint,
-                            encode=encode,
-                            shared_eb=eb,
-                        ).cuda()
-                    )
+                    qa_module = VanillaQuan(
+                        bit=bit,
+                        all_positive=False,
+                        symmetric=False,
+                        withzeropoint=vanilla_withzeropoint,
+                        encode=encode,
+                        shared_eb=eb,
+                    ).cuda()
+                qa_module.use_center_inflated_laplace = self.use_center_inflated_laplace
+                self.qas.append(qa_module)
 
         
         n_qs = len(self.qas)
@@ -2357,6 +2449,7 @@ class GaussianModel:
         print(f'量化器类型: {quant_type.upper()}')
         if quant_type.lower() == "vanilla":
             print(f'Vanilla zero_point: {"ON" if bool(vanilla_withzeropoint) else "OFF"}')
+        print(f'Center-inflated Laplace: {"ON" if self.use_center_inflated_laplace else "OFF"}')
         print(f'块数量: {n_block}')
         print()
         print('量化位数配置:')

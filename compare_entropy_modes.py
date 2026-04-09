@@ -20,7 +20,11 @@ from scene.gaussian_model import (
     split_length,
     transform_batched_torch,
 )
-from utils.quant_utils import quantizer_uses_zero_mean_laplace
+from utils.quant_utils import (
+    quantizer_center_symbol,
+    quantizer_uses_center_inflated_laplace,
+    quantizer_uses_zero_mean_laplace,
+)
 
 
 DEFAULT_BIT_CONFIG = {
@@ -68,6 +72,19 @@ def parse_args():
         action="store_true",
         default=False,
         help="Enable affine zero_point for VanillaQuan instead of zero-centered scaling only.",
+    )
+    parser.add_argument(
+        "--center-inflated-laplace",
+        dest="center_inflated_laplace",
+        action="store_true",
+        default=True,
+        help="Enable center-inflated Laplace (default: enabled).",
+    )
+    parser.add_argument(
+        "--no-center-inflated-laplace",
+        dest="center_inflated_laplace",
+        action="store_false",
+        help="Disable center-inflated Laplace and fall back to plain Laplace.",
     )
     parser.add_argument("--oct-merge", choices=["mean", "imp", "rand"], default="mean")
     parser.add_argument(
@@ -312,16 +329,28 @@ def estimate_laplace_probability(info):
     )
     symbol_count = max(int(info["symbol_count"]), 0)
     if symbol_count == 0 or support_values.size == 0:
-        return {}, 0.0, 0.0, 0.0
+        return {}, 0.0, 0.0, 0.0, 0.0
 
     zero_mean_assumed = bool(info.get("laplace_zero_mean", False))
-    empirical_mean = float(
-        np.sum(support_values.astype(np.float64) * counts) / max(symbol_count, 1)
-    )
-    mean = 0.0 if zero_mean_assumed else empirical_mean
-    scale = float(
-        np.sum(np.abs(support_values.astype(np.float64) - mean) * counts) / max(symbol_count, 1)
-    )
+    center_inflated = bool(info.get("laplace_center_inflated", zero_mean_assumed))
+    center_symbol = int(round(float(info.get("laplace_center_symbol", 0.0))))
+    support_values_f = support_values.astype(np.float64)
+    empirical_mean = float(np.sum(support_values_f * counts) / max(symbol_count, 1))
+    mean = float(center_symbol) if center_inflated else (0.0 if zero_mean_assumed else empirical_mean)
+    zero_prob = 0.0
+    if center_inflated:
+        zero_count = float(info["histogram_counts"].get(str(center_symbol), 0))
+        zero_prob = float((zero_count + 1.0) / (symbol_count + 2.0))
+        nonzero_mask = support_values != center_symbol
+        nonzero_counts = counts[nonzero_mask]
+        nonzero_values = support_values_f[nonzero_mask]
+        nonzero_count = float(nonzero_counts.sum())
+        if nonzero_count > 0.0:
+            scale = float(np.sum(np.abs(nonzero_values - mean) * nonzero_counts) / nonzero_count)
+        else:
+            scale = 1.0
+    else:
+        scale = float(np.sum(np.abs(support_values_f - mean) * counts) / max(symbol_count, 1))
     scale = max(scale, 1e-4)
     probs = laplace_cdf(support_values + 0.5, scale, mean=mean) - laplace_cdf(
         support_values - 0.5,
@@ -329,13 +358,27 @@ def estimate_laplace_probability(info):
         mean=mean,
     )
     probs = np.clip(probs, 1e-12, None)
+    if zero_prob > 0.0:
+        zero_idx = np.where(support_values == center_symbol)[0]
+        if zero_idx.size > 0:
+            zero_idx = int(zero_idx[0])
+            tail = probs.copy()
+            tail[zero_idx] = 0.0
+            tail_mass = float(tail.sum())
+            if tail_mass <= 1e-12:
+                tail = np.ones_like(tail, dtype=np.float64)
+                tail[zero_idx] = 0.0
+                tail_mass = float(tail.sum())
+            probs = (1.0 - zero_prob) * tail / max(tail_mass, 1e-12)
+            probs[zero_idx] = zero_prob
+            probs = np.clip(probs, 1e-12, None)
     support_mass = float(probs.sum())
     normalized = probs / max(support_mass, 1e-12)
     probabilities = {
         str(int(symbol)): float(prob)
         for symbol, prob in zip(support_values.tolist(), normalized.tolist())
     }
-    return probabilities, support_mass, mean, scale
+    return probabilities, support_mass, mean, scale, zero_prob
 
 
 def compute_probability_fit_metrics(empirical, estimated):
@@ -536,11 +579,20 @@ def build_group_diagnostics(gaussians, qci, dim_bits, dim_ranges):
     for block_info in diagnostics["blocks"].values():
         qa = gaussians.qas[int(block_info["qa_idx"])]
         block_info["laplace_zero_mean"] = bool(quantizer_uses_zero_mean_laplace(qa))
-        laplace_probabilities, laplace_support_mass, laplace_mean, laplace_scale = estimate_laplace_probability(block_info)
+        block_info["laplace_center_inflated"] = bool(quantizer_uses_center_inflated_laplace(qa))
+        block_info["laplace_center_symbol"] = int(quantizer_center_symbol(qa))
+        (
+            laplace_probabilities,
+            laplace_support_mass,
+            laplace_mean,
+            laplace_scale,
+            laplace_zero_prob,
+        ) = estimate_laplace_probability(block_info)
         block_info["laplace_probabilities"] = laplace_probabilities
         block_info["laplace_probability_mass_on_support"] = float(laplace_support_mass)
         block_info["laplace_mean"] = float(laplace_mean)
         block_info["laplace_scale"] = float(laplace_scale)
+        block_info["laplace_zero_prob"] = float(laplace_zero_prob)
 
         _, empirical, estimated, laplace = prepare_probability_arrays(block_info)
         compressai_metrics = compute_probability_fit_metrics(empirical, estimated)
@@ -619,6 +671,7 @@ def collect_symbol_diagnostics(args, ply_format, importance, bit_config, output_
         vanilla_withzeropoint=args.vanilla_withzeropoint,
         encode="ans",
         ans_subgroup_count=args.ans_subgroup_count,
+        use_center_inflated_laplace=args.center_inflated_laplace,
     )
     update_ans_models(gaussians)
 
@@ -711,7 +764,9 @@ def plot_probability_distribution(info, title, save_path):
         linestyle="--",
         label=(
             f"Laplace fit (mu={info.get('laplace_mean', 0.0):.4f}, "
-            f"b={info.get('laplace_scale', 0.0):.4f})"
+            f"b={info.get('laplace_scale', 0.0):.4f}, "
+            f"pi={info.get('laplace_zero_prob', 0.0):.4f}, "
+            f"c={info.get('laplace_center_symbol', 0.0):.0f})"
         ),
     )
     axes[0].set_ylabel("Probability")
@@ -930,6 +985,7 @@ def run_single_mode(args, mode, ply_format, importance, bit_config, output_dir, 
         vanilla_withzeropoint=args.vanilla_withzeropoint,
         encode=mode,
         ans_subgroup_count=args.ans_subgroup_count,
+        use_center_inflated_laplace=args.center_inflated_laplace,
     )
     C = build_raht_feature_matrix(gaussians)
     warmup_quantizers_from_raht(gaussians, C, per_channel_quant, per_block_quant)
@@ -1032,6 +1088,7 @@ def main():
     print(f"RAHT depth     : {args.depth}")
     print(f"Octree merge   : {args.oct_merge}")
     print(f"Quant type     : {args.quant_type}")
+    print(f"Center-infl.   : {args.center_inflated_laplace}")
     print(f"Bit config     : {bit_config}")
 
     symbol_diagnostics, fitted_ans_state = collect_symbol_diagnostics(

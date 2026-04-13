@@ -440,6 +440,9 @@ def ft_render(
 
             quantC = torch.zeros_like(C)
             quantC[0] = C[0]
+            raht_coeffs = C[1:]
+            if training:
+                raht_coeffs.retain_grad()
             total_ans_bits = torch.tensor(0.0, device="cuda")
             encode_mode = getattr(pc.qas[0], 'encode', 'deflate').lower() if hasattr(pc, 'qas') and len(pc.qas) > 0 else "deflate"
             uses_rate_model = (
@@ -448,12 +451,15 @@ def ft_render(
                 and len(pc.qas) > 0
                 and encode_mode in ("ans", "laplace")
             )
+            adaptive_step_override = None
+            if per_block_quant:
+                adaptive_step_override = pc.get_adaptive_block_step_override(device=C.device, dtype=C.dtype)
 
             # 量化
             if per_channel_quant:
                 if uses_rate_model:
                     quant_outputs = batched_quantize_blocks(
-                        C[1:],
+                        raht_coeffs,
                         [C.shape[0] - 1],
                         pc.qas,
                         return_ans_bits=True,
@@ -466,7 +472,7 @@ def ft_render(
                         quantC[1:], total_ans_bits = quant_outputs
                 else:
                     quant_outputs = batched_quantize_blocks(
-                        C[1:],
+                        raht_coeffs,
                         [C.shape[0] - 1],
                         pc.qas,
                         return_profile=want_quant_detail,
@@ -487,12 +493,14 @@ def ft_render(
 
                 if uses_rate_model:
                     quant_outputs = batched_quantize_blocks(
-                        C[1:],
+                        raht_coeffs,
                         split_ac,
                         pc.qas,
                         return_ans_bits=True,
                         return_profile=want_quant_detail,
                         profile_time=want_quant_detail,
+                        step_override=adaptive_step_override,
+                        override_uses_vanilla_zero_point=getattr(pc, "adaptive_keep_vanilla_zero_point", False),
                     )
                     if want_quant_detail:
                         quantC[1:], total_ans_bits, quant_detail_profile = quant_outputs
@@ -500,11 +508,13 @@ def ft_render(
                         quantC[1:], total_ans_bits = quant_outputs
                 else:
                     quant_outputs = batched_quantize_blocks(
-                        C[1:],
+                        raht_coeffs,
                         split_ac,
                         pc.qas,
                         return_profile=want_quant_detail,
                         profile_time=want_quant_detail,
+                        step_override=adaptive_step_override,
+                        override_uses_vanilla_zero_point=getattr(pc, "adaptive_keep_vanilla_zero_point", False),
                     )
                     if want_quant_detail:
                         quantC[1:], quant_detail_profile = quant_outputs
@@ -516,8 +526,8 @@ def ft_render(
                 
             else:
                 if hasattr(pc.qa, 'init_yet') and not pc.qa.init_yet:
-                    pc.qa.init_from(C[1:])
-                quantC[1:] = pc.qa(C[1:])
+                    pc.qa.init_from(raht_coeffs)
+                quantC[1:] = pc.qa(raht_coeffs)
                 if encode_mode == "ans" and getattr(pc.qa, "entropy_bottleneck", None) is not None:
                     if hasattr(pc.qa, "s"):
                         symbol_domain = quantC[1:] / pc.qa.s
@@ -792,7 +802,7 @@ def ft_render(
     
     # 如果使用RAHT且在训练模式，返回AC系数用于稀疏性损失
     if raht and training and 'C' in locals():
-        result["raht_coeffs"] = C[1:]  # 只返回AC系数，不包括DC
+        result["raht_coeffs"] = raht_coeffs
         if PROFILE_TIME:
             result["profile"] = {
                 "feature_prep": t_feature_prep_end - t_feature_prep_start,

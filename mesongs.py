@@ -53,6 +53,47 @@ def get_backward_detail_csv_path(csv_path):
     return str(path.with_name(path.stem + "_backward_detail" + path.suffix))
 
 
+def format_quant_config_summary(dataset, pipe, opt=None):
+    parts = [
+        f"λ_S={float(getattr(dataset, 'lambda_sparsity', 0.0)):.3g}",
+        f"λ_R={float(getattr(dataset, 'lambda_rate', 0.0)):.3g}",
+        f"quant={getattr(dataset, 'quant_type', 'unknown')}",
+        f"encode={getattr(dataset, 'encode', 'deflate')}",
+        f"block_quant={bool(getattr(dataset, 'per_block_quant', False))}",
+        #f"per_channel_quant={bool(getattr(dataset, 'per_channel_quant', False))}",
+        f"n_block={int(getattr(dataset, 'n_block', getattr(pipe, 'n_block', 1)))}",
+        f"adaptive_quant={bool(getattr(dataset, 'adaptive_block_quant', False))}",
+        f"alpha={float(getattr(dataset, 'adaptive_step_alpha', 0.35)):.3g}",
+        f"beta={float(getattr(dataset, 'adaptive_step_beta', 0.25)):.3g}",
+        f"ema_decay={float(getattr(dataset, 'adaptive_step_ema_decay', 0.9)):.3g}",
+        f"update_interval={int(getattr(dataset, 'adaptive_update_interval', 8))}",
+        f"bootstrap_iters={int(getattr(dataset, 'adaptive_bootstrap_iters', 200))}",
+        f"clip=[{float(getattr(dataset, 'adaptive_step_clip_min', 0.5)):.3g},{float(getattr(dataset, 'adaptive_step_clip_max', 2.0)):.3g}]",
+        #f"vanilla_zeropoint={bool(getattr(dataset, 'vanilla_withzeropoint', False))}",
+        #f"adaptive_keep_vanilla_zp={bool(getattr(dataset, 'adaptive_keep_vanilla_zero_point', True))}",
+    ]
+    # if opt is not None:
+    #     parts.append(f"iters={int(getattr(opt, 'iterations', 0))}")
+    #     parts.append(f"ft_lr_scale={float(getattr(opt, 'finetune_lr_scale', 1.0)):.3g}")  #注意这里终端输出的是结果缩放的，但scv表格显示的是厨师配置
+    return " | ".join(parts)
+
+
+def ensure_result_csv_initialized(csv_path, dataset, pipe, opt=None):
+    csv_dir = os.path.dirname(csv_path)
+    if csv_dir:
+        os.makedirs(csv_dir, exist_ok=True)
+
+    needs_header = (not os.path.exists(csv_path)) or os.path.getsize(csv_path) == 0
+    mode = "w" if needs_header else "a"
+    with open(csv_path, mode, newline="", encoding="utf-8") as f:
+        if needs_header:
+            wtr = csv.writer(f)
+            wtr.writerow(['name', 'iteration', 'psnr', 'ssim', 'lpips', 'size'])
+        else:
+            f.write("\n")
+        f.write("# CONFIG: " + format_quant_config_summary(dataset, pipe, opt) + "\n")
+
+
 def get_rate_diag_param_groups(gaussians):
     groups = [
         ("opacity", [gaussians._opacity]),
@@ -1040,6 +1081,16 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             encode=getattr(dataset, 'encode', 'deflate'),
             ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
             use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
+            adaptive_block_quant=getattr(dataset, 'adaptive_block_quant', False),
+            adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
+            adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 8),
+            adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
+            adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
+            adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-6),
+            adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
+            adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
+            adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
+            adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
         )
         print(f"  通道量化: 启用")
     elif dataset.per_block_quant:
@@ -1061,6 +1112,16 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             encode=getattr(dataset, 'encode', 'deflate'),
             ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
             use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
+            adaptive_block_quant=getattr(dataset, 'adaptive_block_quant', False),
+            adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
+            adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 10),
+            adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
+            adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
+            adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-8),
+            adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
+            adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
+            adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
+            adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
         )
     else:
         print(f"未知的量化模式")
@@ -1072,6 +1133,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
     print("\n" + "-"*50)
     print("【Step3】初始评估 (Iter 0)")
     print("-"*50)
+    print("[CONFIG] " + format_quant_config_summary(dataset, pipe, opt))
     with torch.no_grad():
         psnr_val, ssim_val, lpips_val = evaluate_test(
             scene,
@@ -1305,6 +1367,75 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         loss.backward()
         if PROFILE_TIME:
             t_main_backward_end.record()
+
+        # 打印自适应量化的步长信息，与vanilla对比
+        if (
+            getattr(dataset, 'adaptive_block_quant', False)
+            and dataset.per_block_quant
+            and "raht_coeffs" in render_pkg
+        ):
+            raht_ac = render_pkg["raht_coeffs"]
+            raht_grad = getattr(raht_ac, "grad", None)
+            if raht_grad is not None:
+                #####################print###########################
+                raht_grad_detached = raht_grad.detach()
+                raht_grad_abs = raht_grad_detached.abs()
+                print(
+                    "[adaptive-step] "
+                    f"iter={iteration} "
+                    f"raht_grad_mean_abs={raht_grad_abs.mean().item():.3e} "
+                    f"raht_grad_max_abs={raht_grad_abs.max().item():.3e} "
+                    f"raht_grad_norm={raht_grad_detached.norm().item():.3e}"
+                )
+                ####################################################
+                updated_adaptive_steps = gaussians.maybe_update_adaptive_block_steps(
+                    iteration,
+                    raht_ac.detach(),
+                    raht_grad_detached,
+                )
+                if updated_adaptive_steps :
+                    ratio_summary = gaussians.summarize_adaptive_step_ratios()
+                    print(
+                        f"[adaptive-step] iter={iteration} "
+                        f"updates={gaussians.adaptive_step_update_counter} "
+                        f"alpha={gaussians.adaptive_step_alpha:.3f} "
+                        f"beta={gaussians.adaptive_step_beta:.3f}"
+                    )
+                    if ratio_summary is not None:
+                        print(
+                            "[adaptive-step-ratio] "
+                            f"count={ratio_summary['count']} "
+                            f"min={ratio_summary['min']:.3f} "
+                            f"p10={ratio_summary['p10']:.3f} "
+                            f"p50={ratio_summary['p50']:.3f} "
+                            f"mean={ratio_summary['mean']:.3f} "
+                            f"p90={ratio_summary['p90']:.3f} "
+                            f"max={ratio_summary['max']:.3f} "
+                            f"std={ratio_summary['std']:.3f}"
+                        )
+                        print(
+                            "[adaptive-step-ratio] "
+                            f"near1@5%={ratio_summary['near_1pct_5']:.1%} "
+                            f"near1@10%={ratio_summary['near_1pct_10']:.1%} "
+                            f"clip_low={ratio_summary['clip_low_frac']:.1%} "
+                            f"clip_high={ratio_summary['clip_high_frac']:.1%} "
+                            f"top_dims={','.join(ratio_summary['top_dims'])}"
+                        )
+                    if iteration % 10 == 0:
+                        step_dumps = gaussians.format_vanilla_adaptive_step_dumps(max_dims=4)
+                        for step_dump in step_dumps:
+                            print(
+                                f"[adaptive-step-dim] label={step_dump['label']} "
+                                f"spread={step_dump['spread']:.3e}"
+                            )
+                            print(f"[vanilla-step-vector][{step_dump['label']}]")
+                            print(step_dump["vanilla"])
+                            print(f"[adaptive-step-vector][{step_dump['label']}]")
+                            print(step_dump["adaptive"])
+                            print(f"[adaptive-over-vanilla-ratio-vector][{step_dump['label']}]")
+                            print(step_dump["ratio"])
+            else:
+                print(f"[adaptive-step] iter={iteration} raht_grad=None, skip adaptive update")
 
         # ==========================================
         # ANS 辅助参数的反向传播
@@ -1696,15 +1827,7 @@ if __name__ == "__main__":
         dataset.depth = used_config['depth'][pipe.scene_imp]
         dataset.n_block = used_config['n_block'][pipe.scene_imp]
         
-    if not os.path.exists(dataset.csv_path):
-        # Create directory if it doesn't exist
-        csv_dir = os.path.dirname(dataset.csv_path)
-        os.makedirs(csv_dir, exist_ok=True)
-        
-        f = open(dataset.csv_path, 'a+')
-        wtr = csv.writer(f)
-        wtr.writerow(['name', 'iteration', 'psnr', 'ssim', 'lpips', 'size'])
-        f.close()
+    ensure_result_csv_initialized(dataset.csv_path, dataset, pipe, op.extract(args))
 
     if PROFILE_TIME:
         time_detail_csv_path = get_time_detail_csv_path(dataset.csv_path)

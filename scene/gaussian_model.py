@@ -510,15 +510,31 @@ def torch_seg_quant(x, lseg, qas):
         cnt+=1
     return np.concatenate(outs, axis=0), trans
 
-def torch_vanilla_quant(x, lseg, qas):
+def torch_vanilla_quant(x, lseg, qas, step_override=None, override_uses_vanilla_zero_point=False):
     split = [lseg] * (x.shape[0] // lseg)
     if x.shape[0] % lseg:
         split.append(x.shape[0] % lseg)
-    _, symbols, trans = batched_quantize_blocks(x, split, qas, return_symbols=True, return_trans=True)
+    _, symbols, trans = batched_quantize_blocks(
+        x,
+        split,
+        qas,
+        return_symbols=True,
+        return_trans=True,
+        step_override=step_override,
+        override_uses_vanilla_zero_point=override_uses_vanilla_zero_point,
+    )
     return symbols.detach().cpu().numpy(), trans
 
-def torch_vanilla_quant_ave(x, split, qas):
-    _, symbols, trans = batched_quantize_blocks(x, split, qas, return_symbols=True, return_trans=True)
+def torch_vanilla_quant_ave(x, split, qas, step_override=None, override_uses_vanilla_zero_point=False):
+    _, symbols, trans = batched_quantize_blocks(
+        x,
+        split,
+        qas,
+        return_symbols=True,
+        return_trans=True,
+        step_override=step_override,
+        override_uses_vanilla_zero_point=override_uses_vanilla_zero_point,
+    )
     return symbols.detach().cpu().numpy(), trans
 
 def torch_vanilla_dequant(x, lseg, sz):
@@ -696,6 +712,26 @@ class GaussianModel:
         self.raht_subgroup_ids = np.zeros((0,), dtype=np.int64)
         self.ans_entropy_bottlenecks = nn.ModuleDict()
         self._static_eval_quant_cache = None
+        self.adaptive_block_quant_enabled = False
+        self.adaptive_step_ready = False
+        self.adaptive_bootstrap_iters = 200
+        self.adaptive_update_interval = 8
+        self.adaptive_step_alpha = 0.35
+        self.adaptive_step_beta = 0.25
+        self.adaptive_step_eps = 1e-6
+        self.adaptive_step_ema_decay = 0.9
+        self.adaptive_step_clip_min = 0.5
+        self.adaptive_step_clip_max = 2.0
+        self.adaptive_keep_vanilla_zero_point = True
+        self.adaptive_step_update_counter = 0
+        self.adaptive_base_steps = torch.ones((55,), dtype=torch.float32)
+        self.adaptive_block_sigma_ema = torch.ones((55, 1), dtype=torch.float32)
+        self.adaptive_block_sens_ema = torch.ones((55, 1), dtype=torch.float32)
+        self.adaptive_block_steps = torch.ones((55, 1), dtype=torch.float32)
+        self.adaptive_reference_vanilla_block_steps = torch.ones((55, 1), dtype=torch.float32)
+        self.adaptive_reference_vanilla_block_steps_ready = False
+        self.adaptive_sigma_initialized = False
+        self.adaptive_sens_initialized = False
         
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -732,6 +768,342 @@ class GaussianModel:
             "key": cache_key,
             "value": cache_value,
         }
+
+    def _reset_adaptive_quant_buffer(self, name, value):
+        setattr(self, name, value.detach())
+
+    def init_adaptive_quant_state(self, n_dims=55, n_block=None):
+        n_dims = int(n_dims)
+        n_block = max(int(n_block if n_block is not None else getattr(self, "n_block", 1)), 1)
+        device = None
+        if hasattr(self, "qas") and len(self.qas) > 0:
+            first_param = next(self.qas[0].parameters(recurse=False), None)
+            if first_param is not None:
+                device = first_param.device
+            else:
+                scale = getattr(self.qas[0], "scale", None)
+                if torch.is_tensor(scale) and scale.numel() > 0:
+                    device = scale.device
+        if device is None and torch.is_tensor(getattr(self, "_opacity", None)):
+            device = self._opacity.device
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self._reset_adaptive_quant_buffer(
+            "adaptive_base_steps",
+            torch.ones((n_dims,), dtype=torch.float32, device=device),
+        )
+        self._reset_adaptive_quant_buffer(
+            "adaptive_block_sigma_ema",
+            torch.ones((n_dims, n_block), dtype=torch.float32, device=device),
+        )
+        self._reset_adaptive_quant_buffer(
+            "adaptive_block_sens_ema",
+            torch.ones((n_dims, n_block), dtype=torch.float32, device=device),
+        )
+        self._reset_adaptive_quant_buffer(
+            "adaptive_block_steps",
+            torch.ones((n_dims, n_block), dtype=torch.float32, device=device),
+        )
+        self._reset_adaptive_quant_buffer(
+            "adaptive_reference_vanilla_block_steps",
+            torch.ones((n_dims, n_block), dtype=torch.float32, device=device),
+        )
+        self.adaptive_step_ready = False
+        self.adaptive_step_update_counter = 0
+        self.adaptive_reference_vanilla_block_steps_ready = False
+        self.adaptive_sigma_initialized = False
+        self.adaptive_sens_initialized = False
+        self.clear_static_eval_quant_cache()
+
+    def get_adaptive_block_step_override(self, device=None, dtype=None):
+        if (
+            not bool(getattr(self, "adaptive_block_quant_enabled", False))
+            or not bool(getattr(self, "adaptive_step_ready", False))
+        ):
+            return None
+        steps = self.adaptive_block_steps
+        if device is not None or dtype is not None:
+            steps = steps.to(
+                device=device if device is not None else steps.device,
+                dtype=dtype if dtype is not None else steps.dtype,
+            )
+        return steps
+
+    def bootstrap_base_steps_from_qas(self):
+        if not hasattr(self, "qas") or len(self.qas) == 0:
+            return
+        n_dims = len(getattr(self, "dim_to_bit", [])) or 55
+        n_block = max(int(getattr(self, "n_block", 1)), 1)
+        vanilla_block_steps = self.collect_current_block_steps_from_qas()
+        base_steps = torch.ones((n_dims,), dtype=torch.float32, device=self.adaptive_base_steps.device)
+        for dim_idx in range(n_dims):
+            dim_steps = []
+            for block_idx in range(n_block):
+                step = vanilla_block_steps[dim_idx, block_idx]
+                if torch.isfinite(step) and float(step.item()) > 0.0:
+                    dim_steps.append(step.to(device=base_steps.device, dtype=base_steps.dtype))
+            if dim_steps:
+                base_steps[dim_idx] = torch.stack(dim_steps).median()
+        self.adaptive_base_steps.copy_(base_steps.clamp(min=1e-8))
+        if (
+            vanilla_block_steps is not None
+            and vanilla_block_steps.shape == self.adaptive_reference_vanilla_block_steps.shape
+        ):
+            self.adaptive_reference_vanilla_block_steps.copy_(
+                vanilla_block_steps.to(
+                    device=self.adaptive_reference_vanilla_block_steps.device,
+                    dtype=self.adaptive_reference_vanilla_block_steps.dtype,
+                ).clamp(min=1e-8)
+            )
+            self.adaptive_reference_vanilla_block_steps_ready = True
+
+    def _reduce_raht_blocks(self, values, split, reduce_mode):
+        if values.dim() != 2:
+            raise ValueError(f"Expected [N, C] tensor, got shape {tuple(values.shape)}")
+        n_dims = values.shape[1]
+        out = torch.zeros((n_dims, len(split)), dtype=values.dtype, device=values.device)
+        start = 0
+        for block_idx, block_len in enumerate(split):
+            end = start + int(block_len)
+            if end > start:
+                block = values[start:end]
+                if reduce_mode == "std":
+                    out[:, block_idx] = block.std(dim=0, unbiased=False)
+                elif reduce_mode == "mean_abs":
+                    out[:, block_idx] = block.abs().mean(dim=0)
+                else:
+                    raise ValueError(f"Unsupported reduce mode: {reduce_mode}")
+            start = end
+        return out
+
+    def update_block_sigma_ema(self, raht_ac, split):
+        sigma = self._reduce_raht_blocks(raht_ac.detach(), split, "std")
+        sigma = sigma.to(device=self.adaptive_block_sigma_ema.device, dtype=self.adaptive_block_sigma_ema.dtype)
+        if not bool(getattr(self, "adaptive_sigma_initialized", False)):
+            self.adaptive_block_sigma_ema.copy_(sigma)
+            self.adaptive_sigma_initialized = True
+            return self.adaptive_block_sigma_ema
+        decay = float(self.adaptive_step_ema_decay)
+        self.adaptive_block_sigma_ema.mul_(decay).add_(sigma, alpha=1.0 - decay)
+        return self.adaptive_block_sigma_ema
+
+    def update_block_sensitivity_ema(self, grad_raht_ac, split):
+        sensitivity = self._reduce_raht_blocks(grad_raht_ac.detach(), split, "mean_abs")
+        sensitivity = sensitivity.to(
+            device=self.adaptive_block_sens_ema.device,
+            dtype=self.adaptive_block_sens_ema.dtype,
+        )
+        if not bool(getattr(self, "adaptive_sens_initialized", False)):
+            self.adaptive_block_sens_ema.copy_(sensitivity)
+            self.adaptive_sens_initialized = True
+            return self.adaptive_block_sens_ema
+        decay = float(self.adaptive_step_ema_decay)
+        self.adaptive_block_sens_ema.mul_(decay).add_(sensitivity, alpha=1.0 - decay)
+        return self.adaptive_block_sens_ema
+
+    def refresh_block_steps(self):
+        base = self.adaptive_base_steps.clamp(min=1e-8).unsqueeze(1)
+        sigma = self.adaptive_block_sigma_ema.clamp(min=0.0)
+        sens = self.adaptive_block_sens_ema.clamp(min=0.0)
+        eps = float(self.adaptive_step_eps)
+        sigma_med = sigma.median(dim=1, keepdim=True).values
+        sens_med = sens.median(dim=1, keepdim=True).values
+        sigma_term = ((sigma + eps) / (sigma_med + eps)).pow(float(self.adaptive_step_alpha))
+        sens_term = ((sens_med + eps) / (sens + eps)).pow(float(self.adaptive_step_beta))
+        steps = base * sigma_term * sens_term
+        steps = torch.clamp(
+            steps,
+            min=base * float(self.adaptive_step_clip_min),
+            max=base * float(self.adaptive_step_clip_max),
+        )
+        self.adaptive_block_steps.copy_(steps.clamp(min=1e-8))
+        self.adaptive_step_ready = True
+        self.adaptive_step_update_counter += 1
+        self.clear_static_eval_quant_cache()
+        return self.adaptive_block_steps
+
+    def summarize_adaptive_step_ratios(self):
+        if (
+            not hasattr(self, "adaptive_base_steps")
+            or not hasattr(self, "adaptive_block_steps")
+            or self.adaptive_base_steps.numel() == 0
+            or self.adaptive_block_steps.numel() == 0
+        ):
+            return None
+
+        base = self.adaptive_base_steps.clamp(min=1e-8).unsqueeze(1)
+        ratios = (self.adaptive_block_steps / base).reshape(-1)
+        ratios = ratios[torch.isfinite(ratios)]
+        if ratios.numel() == 0:
+            return None
+
+        ratios_cpu = ratios.detach().float().cpu()
+        clip_min = float(getattr(self, "adaptive_step_clip_min", 0.5))
+        clip_max = float(getattr(self, "adaptive_step_clip_max", 2.0))
+        tol = 1e-4
+
+        summary = {
+            "count": int(ratios_cpu.numel()),
+            "min": float(ratios_cpu.min().item()),
+            "mean": float(ratios_cpu.mean().item()),
+            "std": float(ratios_cpu.std(unbiased=False).item()) if ratios_cpu.numel() > 1 else 0.0,
+            "p10": float(torch.quantile(ratios_cpu, 0.10).item()),
+            "p50": float(torch.quantile(ratios_cpu, 0.50).item()),
+            "p90": float(torch.quantile(ratios_cpu, 0.90).item()),
+            "max": float(ratios_cpu.max().item()),
+            "near_1pct_5": float((ratios_cpu.sub(1.0).abs() <= 0.05).float().mean().item()),
+            "near_1pct_10": float((ratios_cpu.sub(1.0).abs() <= 0.10).float().mean().item()),
+            "clip_low_frac": float((ratios_cpu <= (clip_min + tol)).float().mean().item()),
+            "clip_high_frac": float((ratios_cpu >= (clip_max - tol)).float().mean().item()),
+        }
+
+        per_dim_median = torch.median(
+            (self.adaptive_block_steps / base).detach().float().cpu(), dim=1
+        ).values
+        top_idx = torch.topk((per_dim_median - 1.0).abs(), k=min(3, per_dim_median.numel())).indices
+        summary["top_dims"] = [
+            f"dim{int(idx.item())}:{float(per_dim_median[idx].item()):.3f}"
+            for idx in top_idx
+        ]
+        return summary
+
+    def collect_current_block_steps_from_qas(self):
+        if not hasattr(self, "qas") or len(self.qas) == 0:
+            return None
+
+        n_dims = len(getattr(self, "dim_to_bit", [])) or 55
+        n_block = max(int(getattr(self, "n_block", 1)), 1)
+        out = torch.ones((n_dims, n_block), dtype=torch.float32)
+
+        def _scalar_or_default(value, default):
+            if torch.is_tensor(value) and value.numel() > 0:
+                scalar = float(value.detach().reshape(-1)[0].item())
+                if np.isfinite(scalar):
+                    return scalar
+            return float(default)
+
+        for dim_idx in range(n_dims):
+            base = dim_idx * n_block
+            for block_idx in range(n_block):
+                qa = self.qas[base + block_idx]
+                scale_val = None
+
+                if hasattr(qa, "scale"):
+                    fallback_scale = _scalar_or_default(getattr(qa, "scale", None), 1.0)
+                    if bool(getattr(qa, "withzeropoint", False)):
+                        max_val = _scalar_or_default(getattr(qa, "max_val", None), np.nan)
+                        min_val = _scalar_or_default(getattr(qa, "min_val", None), np.nan)
+                        qrange = max(float(getattr(qa, "thd_pos", 127)) - float(getattr(qa, "thd_neg", -128)), 1.0)
+                        if np.isfinite(max_val) and np.isfinite(min_val):
+                            scale_val = max((max_val - min_val) / qrange, 1e-8)
+                        else:
+                            scale_val = max(fallback_scale, 1e-8)
+                    elif bool(getattr(qa, "all_positive", False)):
+                        max_val = _scalar_or_default(getattr(qa, "max_val", None), np.nan)
+                        qmax = max(float(getattr(qa, "thd_pos", 255)), 1.0)
+                        if np.isfinite(max_val):
+                            scale_val = max(max_val / qmax, 1e-8)
+                        else:
+                            scale_val = max(fallback_scale, 1e-8)
+                    else:
+                        max_val = _scalar_or_default(getattr(qa, "max_val", None), np.nan)
+                        qmax = max(abs(float(getattr(qa, "thd_pos", 127))), 1.0)
+                        if np.isfinite(max_val):
+                            scale_val = max(max_val / qmax, 1e-8)
+                        else:
+                            scale_val = max(fallback_scale, 1e-8)
+                elif hasattr(qa, "s"):
+                    scale_val = max(_scalar_or_default(getattr(qa, "s", None), 1.0), 1e-8)
+                else:
+                    scale_val = 1.0
+
+                out[dim_idx, block_idx] = float(scale_val)
+
+        return out
+
+    def collect_reference_vanilla_block_steps(self):
+        reference = getattr(self, "adaptive_reference_vanilla_block_steps", None)
+        if (
+            bool(getattr(self, "adaptive_reference_vanilla_block_steps_ready", False))
+            and torch.is_tensor(reference)
+            and reference.numel() > 0
+        ):
+            return reference.detach().clone()
+        return self.collect_current_block_steps_from_qas()
+
+    def format_vanilla_adaptive_step_dumps(self, max_dims=4):
+        vanilla_steps = self.collect_reference_vanilla_block_steps()
+        if vanilla_steps is None or not hasattr(self, "adaptive_block_steps"):
+            return []
+
+        adaptive_steps = self.adaptive_block_steps.detach().float().cpu()
+        vanilla_steps = vanilla_steps.detach().float().cpu()
+        ratio = adaptive_steps / vanilla_steps.clamp(min=1e-8)
+
+        def _fmt(array):
+            return np.array2string(
+                array.numpy(),
+                precision=6,
+                separator=", ",
+                max_line_width=200,
+                threshold=array.numel() + 1,
+            )
+
+        ratio_spread = (ratio.max(dim=1).values - ratio.min(dim=1).values)
+        ratio_spread = torch.where(torch.isfinite(ratio_spread), ratio_spread, torch.zeros_like(ratio_spread))
+        ranked_dims = torch.argsort(ratio_spread, descending=True).tolist()
+
+        selected_dims = []
+        if vanilla_steps.shape[0] > 0:
+            selected_dims.append(0)
+        for dim_idx in ranked_dims:
+            dim_idx = int(dim_idx)
+            if dim_idx in selected_dims:
+                continue
+            selected_dims.append(dim_idx)
+            if len(selected_dims) >= max(int(max_dims), 1):
+                break
+
+        dumps = []
+        for dim_idx in selected_dims:
+            dumps.append({
+                "dim_idx": int(dim_idx),
+                "label": f"{self.get_attr_group_name(dim_idx)}(dim{int(dim_idx)})",
+                "spread": float(ratio_spread[dim_idx].item()),
+                "vanilla": _fmt(vanilla_steps[dim_idx]),
+                "adaptive": _fmt(adaptive_steps[dim_idx]),
+                "ratio": _fmt(ratio[dim_idx]),
+            })
+        return dumps
+
+    def format_vanilla_adaptive_step_dump(self):
+        dumps = self.format_vanilla_adaptive_step_dumps(max_dims=1)
+        if not dumps:
+            return None
+        return dumps[0]
+
+    def maybe_update_adaptive_block_steps(self, iteration, raht_ac, grad_raht_ac):
+        if not bool(getattr(self, "adaptive_block_quant_enabled", False)):
+            return False
+        if raht_ac is None or grad_raht_ac is None:
+            return False
+        if int(getattr(self, "n_block", 1)) <= 1:
+            return False
+        if int(iteration) < int(getattr(self, "adaptive_bootstrap_iters", 0)):
+            return False
+        interval = max(int(getattr(self, "adaptive_update_interval", 1)), 1)
+        if int(iteration) % interval != 0:
+            return False
+        if self.adaptive_base_steps.shape[0] != raht_ac.shape[1] or self.adaptive_block_steps.shape[1] != int(self.n_block):
+            self.init_adaptive_quant_state(n_dims=int(raht_ac.shape[1]), n_block=int(self.n_block))
+        if not bool(getattr(self, "adaptive_step_ready", False)):
+            self.bootstrap_base_steps_from_qas()
+        split = split_length(int(raht_ac.shape[0]), int(self.n_block))
+        self.update_block_sigma_ema(raht_ac, split)
+        self.update_block_sensitivity_ema(grad_raht_ac, split)
+        self.refresh_block_steps()
+        return True
 
     @property
     def ans_effective_subgroup_count(self):
@@ -1994,12 +2366,17 @@ class GaussianModel:
             if is_ans or is_laplace:
                 ac_len = C.shape[0] - 1
                 split = split_length(ac_len, self.n_block) if per_block_quant else [ac_len]
+                adaptive_step_override = None
+                if per_block_quant:
+                    adaptive_step_override = self.get_adaptive_block_step_override(device=C.device, dtype=C.dtype)
                 _, qci_tensor, trans = batched_quantize_blocks(
                     C[1:],
                     split,
                     self.qas,
                     return_symbols=True,
                     return_trans=True,
+                    step_override=adaptive_step_override,
+                    override_uses_vanilla_zero_point=getattr(self, "adaptive_keep_vanilla_zero_point", False),
                 )
                 qci = qci_tensor.detach().cpu().numpy().astype(np.float32)
                 trans_array.extend(trans)
@@ -2131,6 +2508,7 @@ class GaussianModel:
                     lc1 = C.shape[0] - 1
                     qci = [] 
                     split = split_length(lc1, self.n_block)
+                    adaptive_step_override = self.get_adaptive_block_step_override(device=C.device, dtype=C.dtype)
                 
                     print(f"    分块量化模式")
                     print(f"    块数量: {self.n_block}")
@@ -2153,7 +2531,16 @@ class GaussianModel:
                             is_signed = False
                         signed_flags.append(is_signed)
                     
-                        t1, trans1 = torch_vanilla_quant_ave(C[1:, i], split, self.qas[qa_cnt : qa_cnt + self.n_block])
+                        step_override_i = None
+                        if adaptive_step_override is not None:
+                            step_override_i = adaptive_step_override[i : i + 1]
+                        t1, trans1 = torch_vanilla_quant_ave(
+                            C[1:, i],
+                            split,
+                            self.qas[qa_cnt : qa_cnt + self.n_block],
+                            step_override=step_override_i,
+                            override_uses_vanilla_zero_point=getattr(self, "adaptive_keep_vanilla_zero_point", False),
+                        )
                         qci.append(t1.reshape(-1, 1))  # 添加维度: (N,) -> (N, 1)
                         trans_array.extend(trans1)
                         qa_cnt += self.n_block
@@ -2331,6 +2718,16 @@ class GaussianModel:
         ans_subgroup_count=1,
         vanilla_withzeropoint=None,
         use_center_inflated_laplace=True,
+        adaptive_block_quant=False,
+        adaptive_bootstrap_iters=200,
+        adaptive_update_interval=8,
+        adaptive_step_alpha=0.35,
+        adaptive_step_beta=0.25,
+        adaptive_step_eps=1e-6,
+        adaptive_step_ema_decay=0.9,
+        adaptive_step_clip_min=0.5,
+        adaptive_step_clip_max=2.0,
+        adaptive_keep_vanilla_zero_point=True,
     ):
         """
         初始化量化器，支持不同属性使用不同的量化位数
@@ -2355,6 +2752,16 @@ class GaussianModel:
         self.ans_subgroup_count = max(1, int(ans_subgroup_count))
         self.vanilla_withzeropoint = vanilla_withzeropoint
         self.use_center_inflated_laplace = bool(use_center_inflated_laplace)
+        self.adaptive_block_quant_enabled = bool(adaptive_block_quant)
+        self.adaptive_bootstrap_iters = int(adaptive_bootstrap_iters)
+        self.adaptive_update_interval = int(adaptive_update_interval)
+        self.adaptive_step_alpha = float(adaptive_step_alpha)
+        self.adaptive_step_beta = float(adaptive_step_beta)
+        self.adaptive_step_eps = float(adaptive_step_eps)
+        self.adaptive_step_ema_decay = float(adaptive_step_ema_decay)
+        self.adaptive_step_clip_min = float(adaptive_step_clip_min)
+        self.adaptive_step_clip_max = float(adaptive_step_clip_max)
+        self.adaptive_keep_vanilla_zero_point = bool(adaptive_keep_vanilla_zero_point)
         self.update_raht_subgroups()
         
         # 默认配置：所有属性8-bit
@@ -2408,6 +2815,7 @@ class GaussianModel:
         self.dim_to_bit = dim_to_bit
         
         self.ans_entropy_bottlenecks = nn.ModuleDict()
+        self.init_adaptive_quant_state(n_dims=len(self.dim_to_bit), n_block=n_block)
         
         # 创建量化器
         self.qas = nn.ModuleList([])
@@ -2436,6 +2844,7 @@ class GaussianModel:
                         withzeropoint=vanilla_withzeropoint,
                         encode=encode,
                         shared_eb=eb,
+                        adaptive_block_quant=adaptive_block_quant,
                     ).cuda()
                 qa_module.use_center_inflated_laplace = self.use_center_inflated_laplace
                 self.qas.append(qa_module)

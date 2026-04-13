@@ -77,7 +77,7 @@ def parse_args():
         "--center-inflated-laplace",
         dest="center_inflated_laplace",
         action="store_true",
-        default=True,
+        default=False,
         help="Enable center-inflated Laplace (default: enabled).",
     )
     parser.add_argument(

@@ -570,6 +570,9 @@ def batched_quantize_blocks(
     return_ans_bits=False,
     return_profile=False,
     profile_time=False,
+    step_override=None,
+    lock_quant_params=False,
+    override_uses_vanilla_zero_point=False,
 ):
     """
     Quantize all attribute/block pairs in a single batched tensor path.
@@ -637,7 +640,106 @@ def batched_quantize_blocks(
         quant_profile["pack_scatter"] = time.perf_counter() - stage_start
 
     first_qa = flat_qas[0]
-    if hasattr(first_qa, "init_yet"):
+    use_step_override = step_override is not None
+    override_zero_points = None
+    if use_step_override:
+        override_steps = torch.as_tensor(step_override, device=x.device, dtype=x.dtype)
+        if override_steps.dim() == 2:
+            override_steps = override_steps.unsqueeze(-1)
+        elif override_steps.dim() != 3:
+            raise ValueError(
+                f"Expected step_override to have shape [n_dims, n_blocks] or [n_dims, n_blocks, 1], got {tuple(override_steps.shape)}"
+            )
+        if override_steps.shape[0] != n_dims or override_steps.shape[1] != n_blocks:
+            raise ValueError(
+                f"step_override shape {tuple(override_steps.shape)} does not match expected ({n_dims}, {n_blocks}, 1)"
+            )
+        override_steps = override_steps.clamp(min=1e-8)
+        override_zero_points = override_steps.new_zeros((n_dims, n_blocks, 1))
+        if hasattr(first_qa, "scale") and bool(override_uses_vanilla_zero_point):
+            if quant_profile is not None and profile_time:
+                _sync_profile_device(x.device)
+                stage_start = time.perf_counter()
+            neg_fill = torch.full_like(packed, torch.finfo(packed.dtype).min)
+            pos_fill = torch.full_like(packed, torch.finfo(packed.dtype).max)
+            block_max = torch.where(valid_mask, packed, neg_fill).amax(dim=-1)
+            block_min = torch.where(valid_mask, packed, pos_fill).amin(dim=-1)
+            flat_block_max = block_max.reshape(-1).detach()
+            flat_block_min = block_min.reshape(-1).detach()
+            flat_override_steps = override_steps.reshape(-1).detach()
+            with_zero_mask = torch.tensor(
+                [bool(getattr(qa, "withzeropoint", False)) for qa in flat_qas],
+                device=x.device,
+                dtype=torch.bool,
+            )
+            all_positive_mask = torch.tensor(
+                [bool(getattr(qa, "all_positive", False)) for qa in flat_qas],
+                device=x.device,
+                dtype=torch.bool,
+            )
+            thd_neg_flat = torch.tensor(
+                [float(qa.thd_neg) for qa in flat_qas],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            thd_pos_flat = torch.tensor(
+                [float(qa.thd_pos) for qa in flat_qas],
+                device=x.device,
+                dtype=x.dtype,
+            )
+            prev_max_flat = torch.cat(
+                [
+                    _flatten_quant_buffer(qa.max_val, float("-inf"), x.device, x.dtype)
+                    for qa in flat_qas
+                ],
+                dim=0,
+            )
+            prev_min_flat = torch.cat(
+                [
+                    _flatten_quant_buffer(qa.min_val, float("inf"), x.device, x.dtype)
+                    for qa in flat_qas
+                ],
+                dim=0,
+            )
+            updated_max_flat = prev_max_flat.clone()
+            updated_min_flat = prev_min_flat.clone()
+            updated_zero_flat = torch.zeros_like(prev_max_flat)
+            if with_zero_mask.any():
+                zp_max = torch.maximum(prev_max_flat[with_zero_mask], flat_block_max[with_zero_mask])
+                zp_min = torch.minimum(prev_min_flat[with_zero_mask], flat_block_min[with_zero_mask])
+                zp_all_positive = all_positive_mask[with_zero_mask]
+                if zp_all_positive.any():
+                    zp_max = torch.where(zp_all_positive, torch.clamp(zp_max, min=0.0), zp_max)
+                    zp_min = torch.where(zp_all_positive, torch.clamp(zp_min, max=0.0), zp_min)
+                zp_max = torch.maximum(zp_max, zp_min + 1e-8)
+                zp_scale = flat_override_steps[with_zero_mask].clamp(min=1e-8)
+                zp_zero = thd_pos_flat[with_zero_mask] - (zp_max / zp_scale)
+                zp_zero = torch.clamp(
+                    zp_zero,
+                    min=thd_neg_flat[with_zero_mask],
+                    max=thd_pos_flat[with_zero_mask],
+                ).round()
+                updated_max_flat[with_zero_mask] = zp_max
+                updated_min_flat[with_zero_mask] = zp_min
+                updated_zero_flat[with_zero_mask] = zp_zero
+            with torch.no_grad():
+                for idx, qa in enumerate(flat_qas):
+                    _write_quant_buffer(qa, "scale", flat_override_steps[idx])
+                    if hasattr(qa, "max_val"):
+                        _write_quant_buffer(qa, "max_val", updated_max_flat[idx])
+                    if hasattr(qa, "min_val"):
+                        _write_quant_buffer(qa, "min_val", updated_min_flat[idx])
+                    if hasattr(qa, "zero_point"):
+                        qa.zero_point.data.copy_(
+                            updated_zero_flat[idx]
+                            .to(device=qa.zero_point.device, dtype=qa.zero_point.dtype)
+                            .reshape_as(qa.zero_point)
+                        )
+            override_zero_points = updated_zero_flat.view(n_dims, n_blocks, 1)
+            if quant_profile is not None and profile_time:
+                _sync_profile_device(x.device)
+                quant_profile["quant_param_update"] = time.perf_counter() - stage_start
+    elif hasattr(first_qa, "init_yet"):
         if quant_profile is not None and profile_time:
             _sync_profile_device(x.device)
             stage_start = time.perf_counter()
@@ -786,24 +888,30 @@ def batched_quantize_blocks(
     if quant_profile is not None and profile_time:
         _sync_profile_device(x.device)
         stage_start = time.perf_counter()
-    scale_entries = []
-    zero_entries = []
     neg_entries = []
     pos_entries = []
-    for qa in flat_qas:
-        if hasattr(qa, "s"):
-            scale_entries.append(qa.s.reshape(1))
-        else:
-            scale_entries.append(qa.scale.reshape(1))
-        if hasattr(qa, "zero_point"):
-            zero_entries.append(qa.zero_point.reshape(1).to(dtype=scale_entries[-1].dtype))
-        else:
-            zero_entries.append(scale_entries[-1].new_zeros(1))
-        neg_entries.append(scale_entries[-1].new_tensor(float(qa.thd_neg)))
-        pos_entries.append(scale_entries[-1].new_tensor(float(qa.thd_pos)))
-
-    scales = torch.stack(scale_entries, dim=0).view(n_dims, n_blocks, 1)
-    zero_points = torch.stack(zero_entries, dim=0).view(n_dims, n_blocks, 1)
+    if use_step_override:
+        scales = override_steps
+        zero_points = override_zero_points
+        for qa in flat_qas:
+            neg_entries.append(scales.new_tensor(float(qa.thd_neg)))
+            pos_entries.append(scales.new_tensor(float(qa.thd_pos)))
+    else:
+        scale_entries = []
+        zero_entries = []
+        for qa in flat_qas:
+            if hasattr(qa, "s"):
+                scale_entries.append(qa.s.reshape(1))
+            else:
+                scale_entries.append(qa.scale.reshape(1))
+            if hasattr(qa, "zero_point"):
+                zero_entries.append(qa.zero_point.reshape(1).to(dtype=scale_entries[-1].dtype))
+            else:
+                zero_entries.append(scale_entries[-1].new_zeros(1))
+            neg_entries.append(scale_entries[-1].new_tensor(float(qa.thd_neg)))
+            pos_entries.append(scale_entries[-1].new_tensor(float(qa.thd_pos)))
+        scales = torch.stack(scale_entries, dim=0).view(n_dims, n_blocks, 1)
+        zero_points = torch.stack(zero_entries, dim=0).view(n_dims, n_blocks, 1)
     thd_neg = torch.stack(neg_entries, dim=0).view(n_dims, n_blocks, 1)
     thd_pos = torch.stack(pos_entries, dim=0).view(n_dims, n_blocks, 1)
     if quant_profile is not None and profile_time:
@@ -813,7 +921,7 @@ def batched_quantize_blocks(
     if quant_profile is not None and profile_time:
         _sync_profile_device(x.device)
         stage_start = time.perf_counter()
-    if hasattr(first_qa, "s"):
+    if hasattr(first_qa, "s") and not use_step_override:
         grad_factors = 1.0 / torch.sqrt(thd_pos.clamp(min=1.0) * block_lengths.view(1, n_blocks, 1))
         scales = grad_scale(scales, grad_factors)
 
@@ -895,9 +1003,15 @@ def batched_quantize_blocks(
             _sync_profile_device(x.device)
             stage_start = time.perf_counter()
         trans = []
-        for qa in flat_qas:
-            i_scale, i_zp, _ = qa.get_quant_params()
-            trans.extend([i_scale.item(), i_zp.item()])
+        if use_step_override:
+            flat_scales = scales.reshape(-1)
+            flat_zeros = zero_points.reshape(-1)
+            for idx in range(flat_scales.numel()):
+                trans.extend([flat_scales[idx].item(), flat_zeros[idx].item()])
+        else:
+            for qa in flat_qas:
+                i_scale, i_zp, _ = qa.get_quant_params()
+                trans.extend([i_scale.item(), i_zp.item()])
         if quant_profile is not None and profile_time:
             quant_profile["trans_collect"] = time.perf_counter() - stage_start
 
@@ -1141,11 +1255,13 @@ class VanillaQuan(Quantizer):
         encode="deflate",
         channels=1,
         shared_eb=None,
+        adaptive_block_quant=False,
     ):
         super().__init__(bit)
         self.all_positive = all_positive
         self.symmetric = symmetric
         self.withzeropoint = all_positive if withzeropoint is None else bool(withzeropoint)
+        self.adaptive_block_quant = bool(adaptive_block_quant)
         
         if all_positive:
             assert not symmetric, "Positive quantization cannot be symmetric"
@@ -1161,6 +1277,11 @@ class VanillaQuan(Quantizer):
                 # signed weight/activation is quantized to [-2^(b-1), 2^(b-1)-1]
                 self.thd_neg = - 2 ** (bit - 1)
                 self.thd_pos = 2 ** (bit - 1) - 1
+        
+        #自适应量化不能限制量化level
+        if self.adaptive_block_quant:
+            self.thd_neg -= 10000
+            self.thd_pos += 10000
 
         self.bit = bit
         self.register_buffer('scale', torch.tensor([], requires_grad=False))

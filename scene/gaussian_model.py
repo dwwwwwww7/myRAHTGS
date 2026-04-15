@@ -33,6 +33,7 @@ from utils.general_utils import (build_rotation, build_scaling_rotation,
 from utils.graphics_utils import BasicPointCloud
 from utils.quant_utils import (
     LSQPlusActivationQuantizer,
+    LsqPlusQuan,
     LsqQuan,
     VanillaQuan,
     batched_quantize_blocks,
@@ -745,14 +746,26 @@ class GaussianModel:
         self.rotation_activation = torch.nn.functional.normalize
 
     def get_quantizer_trainable_params(self):
-        params = []
+        scale_params, zero_point_params, other_params = self.get_quantizer_trainable_param_groups()
+        return scale_params + zero_point_params + other_params
+
+    def get_quantizer_trainable_param_groups(self):
+        scale_params = []
+        zero_point_params = []
+        other_params = []
         if not hasattr(self, "qas"):
-            return params
+            return scale_params, zero_point_params, other_params
         # Only keep parameters owned by the quantizer itself (for example LSQ scale).
         # This avoids re-adding shared entropy-model parameters through recursive traversal.
         for qa in self.qas:
-            params.extend(list(qa.parameters(recurse=False)))
-        return params
+            for name, param in qa.named_parameters(recurse=False):
+                if name == "s":
+                    scale_params.append(param)
+                elif name == "zero_point":
+                    zero_point_params.append(param)
+                else:
+                    other_params.append(param)
+        return scale_params, zero_point_params, other_params
 
     def clear_static_eval_quant_cache(self):
         self._static_eval_quant_cache = None
@@ -2021,16 +2034,23 @@ class GaussianModel:
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
         ]
 
-        quantizer_params = self.get_quantizer_trainable_params()
-        if quantizer_params:
-            l.append({'params': quantizer_params, 'lr': 0.005, "name": "quantizers"})
+        # 添加量化器的学习参数到优化器
+        quant_scale_params, quant_zero_point_params, quant_other_params = self.get_quantizer_trainable_param_groups()
+        if quant_scale_params:
+            l.append({'params': quant_scale_params, 'lr': training_args.quant_scale_lr, "name": "quant_scales"})
+        if quant_zero_point_params:
+            l.append({'params': quant_zero_point_params, 'lr': training_args.quant_zero_point_lr, "name": "quant_zero_points"})
+        if quant_other_params:
+            l.append({'params': quant_other_params, 'lr': training_args.quant_scale_lr, "name": "quantizers"})
+        
+        # 使用eb在线或离线拟合分布时，ans_entropy_bottlenecks 主参数组的学习率
         if hasattr(self, 'ans_entropy_bottlenecks') and len(self.ans_entropy_bottlenecks) > 0:
             ans_main_params = [
                 param for name, param in self.ans_entropy_bottlenecks.named_parameters()
                 if not name.endswith("quantiles")
             ]
             if ans_main_params:
-                l.append({'params': ans_main_params, 'lr': 1e-4, "name": "ans_models"})
+                l.append({'params': ans_main_params, 'lr': 1e-3, "name": "ans_models"})
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -2060,9 +2080,15 @@ class GaussianModel:
         ]
         
         # 添加量化器的学习参数到优化器
-        quantizer_params = self.get_quantizer_trainable_params()
-        if quantizer_params:
-            l.append({'params': quantizer_params, 'lr': 0.005, "name": "quantizers"})
+        quant_scale_params, quant_zero_point_params, quant_other_params = self.get_quantizer_trainable_param_groups()
+        if quant_scale_params:
+            l.append({'params': quant_scale_params, 'lr': training_args.quant_scale_lr, "name": "quant_scales"})
+        if quant_zero_point_params:
+            l.append({'params': quant_zero_point_params, 'lr': training_args.quant_zero_point_lr, "name": "quant_zero_points"})
+        if quant_other_params:
+            l.append({'params': quant_other_params, 'lr': training_args.quant_scale_lr, "name": "quantizers"})
+        
+        # 使用eb在线或离线拟合分布时，ans_entropy_bottlenecks 主参数组的学习率
         if hasattr(self, 'ans_entropy_bottlenecks') and len(self.ans_entropy_bottlenecks) > 0:
             ans_main_params = [
                 param for name, param in self.ans_entropy_bottlenecks.named_parameters()
@@ -2744,7 +2770,7 @@ class GaussianModel:
                     'f_rest_2': 2,     # 21维 (sh_3: 24-44)
                     'scale': 10        # 3维
                 }
-            quant_type: 量化器类型，"lsq" 或 "vanilla"
+            quant_type: 量化器类型，"lsq"、"lsqplus" 或 "vanilla"
         """
         self.n_block = n_block
         self.quant_type = quant_type.lower()
@@ -2830,6 +2856,14 @@ class GaussianModel:
                     self.ans_entropy_bottlenecks[qa_key] = eb
                 if quant_type.lower() == "lsq":
                     qa_module = LsqQuan(
+                        bit=bit,
+                        init_yet=False,
+                        all_positive=False,
+                        encode=encode,
+                        shared_eb=eb,
+                    ).cuda()
+                elif quant_type.lower() in ("lsqplus", "lsq+"):
+                    qa_module = LsqPlusQuan(
                         bit=bit,
                         init_yet=False,
                         all_positive=False,
@@ -2956,7 +2990,7 @@ class GaussianModel:
         if not hasattr(self, 'qas') or len(self.qas) == 0:
             return
             
-        if not hasattr(self, 'quant_type') or self.quant_type != "lsq":
+        if not hasattr(self, 'quant_type') or self.quant_type not in ("lsq", "lsqplus", "lsq+"):
             return
             
         # 每100次迭代输出一次
@@ -2964,7 +2998,7 @@ class GaussianModel:
             return
             
         print(f"\n{'='*80}")
-        print(f"LSQ Scale 参数演化 [Iteration {iteration}]")
+        print(f"{self.quant_type.upper()} Scale 参数演化 [Iteration {iteration}]")
         print(f"{'='*80}")
         
         # 获取每个维度的第一个量化器的scale值
@@ -3036,7 +3070,7 @@ class GaussianModel:
         if not hasattr(self, 'qas') or len(self.qas) == 0:
             return
             
-        if not hasattr(self, 'quant_type') or self.quant_type != "lsq":
+        if not hasattr(self, 'quant_type') or self.quant_type not in ("lsq", "lsqplus", "lsq+"):
             return
         
         # 收集所有LSQ scale值

@@ -77,7 +77,8 @@ class ModelParams(ParamGroup):
         self.depth=12
         self.num_bits=8
         self.lambda_sparsity=5e-7  # PCS25的稀疏性损失权重
-        self.quant_type="lsq"  # 量化器类型: "lsq" 或 "vanilla"
+        self.quant_type="vanilla"  # 量化器类型: "lsq"、"lsqplus" 或 "vanilla"
+        self.learnable_quant_start_iter=500  # 前多少个iter先使用vanilla量化，之后再切到LSQ/LSQPlus
         self.vanilla_withzeropoint=True  # VanillaQuan 是否启用 affine zero_point
         self.encode="deflate" # 熵编码方式: "deflate"、"ans" 或 "laplace"
         self.lambda_rate=0.001  # 使用ANS熵编码时的R权重
@@ -138,6 +139,8 @@ class OptimizationParams(ParamGroup):
         self.opacity_lr = 0.05
         self.scaling_lr = 0.001
         self.rotation_lr = 0.001
+        self.quant_scale_lr = 0.0001  # LSQ和LSQ+时的scale学习率
+        self.quant_zero_point_lr = 0.0001 # LSQ+时的zeropoint学习率
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.densification_interval = 100

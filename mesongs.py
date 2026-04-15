@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import copy
 import csv
 import os
 import sys
@@ -54,24 +55,43 @@ def get_backward_detail_csv_path(csv_path):
 
 
 def format_quant_config_summary(dataset, pipe, opt=None):
+    target_quant_type = getattr(dataset, 'quant_type', 'unknown')
+    active_quant_type = getattr(dataset, 'active_quant_type', target_quant_type)
     parts = [
         f"λ_S={float(getattr(dataset, 'lambda_sparsity', 0.0)):.3g}",
         f"λ_R={float(getattr(dataset, 'lambda_rate', 0.0)):.3g}",
-        f"quant={getattr(dataset, 'quant_type', 'unknown')}",
+        f"quant={active_quant_type}",
         f"encode={getattr(dataset, 'encode', 'deflate')}",
         f"block_quant={bool(getattr(dataset, 'per_block_quant', False))}",
         #f"per_channel_quant={bool(getattr(dataset, 'per_channel_quant', False))}",
         f"n_block={int(getattr(dataset, 'n_block', getattr(pipe, 'n_block', 1)))}",
         f"adaptive_quant={bool(getattr(dataset, 'adaptive_block_quant', False))}",
-        f"alpha={float(getattr(dataset, 'adaptive_step_alpha', 0.35)):.3g}",
-        f"beta={float(getattr(dataset, 'adaptive_step_beta', 0.25)):.3g}",
-        f"ema_decay={float(getattr(dataset, 'adaptive_step_ema_decay', 0.9)):.3g}",
-        f"update_interval={int(getattr(dataset, 'adaptive_update_interval', 8))}",
-        f"bootstrap_iters={int(getattr(dataset, 'adaptive_bootstrap_iters', 200))}",
-        f"clip=[{float(getattr(dataset, 'adaptive_step_clip_min', 0.5)):.3g},{float(getattr(dataset, 'adaptive_step_clip_max', 2.0)):.3g}]",
-        #f"vanilla_zeropoint={bool(getattr(dataset, 'vanilla_withzeropoint', False))}",
-        #f"adaptive_keep_vanilla_zp={bool(getattr(dataset, 'adaptive_keep_vanilla_zero_point', True))}",
     ]
+    
+    # 用公式定义的自适应量化步长的各种参数
+    if getattr(dataset, 'adaptive_block_quant', False):
+        parts.extend([
+            f"alpha={float(getattr(dataset, 'adaptive_step_alpha', 0.35)):.3g}",
+            f"beta={float(getattr(dataset, 'adaptive_step_beta', 0.25)):.3g}",
+            f"ema_decay={float(getattr(dataset, 'adaptive_step_ema_decay', 0.9)):.3g}",
+            f"update_interval={int(getattr(dataset, 'adaptive_update_interval', 8))}",
+            f"bootstrap_iters={int(getattr(dataset, 'adaptive_bootstrap_iters', 200))}",
+            f"clip=[{float(getattr(dataset, 'adaptive_step_clip_min', 0.5)):.3g},{float(getattr(dataset, 'adaptive_step_clip_max', 2.0)):.3g}]",
+            #f"vanilla_zeropoint={bool(getattr(dataset, 'vanilla_withzeropoint', False))}",
+            #f"adaptive_keep_vanilla_zp={bool(getattr(dataset, 'adaptive_keep_vanilla_zero_point', True))}",
+        ])
+    
+    # LSQ或LSQ+的一些设置
+    learnable_quant_start_iter = int(getattr(dataset, 'learnable_quant_start_iter', 0))
+    if active_quant_type != target_quant_type:
+        parts.append(f"target_quant={target_quant_type}")
+    if learnable_quant_start_iter > 0 and str(target_quant_type).lower() in ("lsq", "lsqplus", "lsq+"):
+        parts.extend(f"learnable_start={learnable_quant_start_iter}")
+    parts.extend([
+            f"quant_scale_lr={float(getattr(opt, 'quant_scale_lr', 0.001)):.3g}",
+            f"quant_zero_point_lr={float(getattr(opt, 'quant_zero_point_lr', 0.0005)):.3g}",
+            ])
+    # 优化器信息
     # if opt is not None:
     #     parts.append(f"iters={int(getattr(opt, 'iterations', 0))}")
     #     parts.append(f"ft_lr_scale={float(getattr(opt, 'finetune_lr_scale', 1.0)):.3g}")  #注意这里终端输出的是结果缩放的，但scv表格显示的是厨师配置
@@ -1059,72 +1079,95 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         dataset.oct_merge,
         raht=dataset.raht
     )
-    
-    if dataset.per_channel_quant:
-        print(f"  量化模式：per_channel_quant")
-        dataset.n_block = 1    #一个属性只用一个量化器，不使用之前定义的n_block
-        # 配置不同属性的量化位数
-        bit_config = {
-            'opacity': 8,
-            'euler': 8,
-            'scale': 10,
-            'f_dc': 8,
-            'f_rest_0': 4,
-            'f_rest_1': 4,
-            'f_rest_2': 2,
-        }
-        gaussians.init_qas(
-            dataset.n_block,
-            bit_config=bit_config,
-            quant_type=dataset.quant_type,
-            vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
-            encode=getattr(dataset, 'encode', 'deflate'),
-            ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
-            use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
-            adaptive_block_quant=getattr(dataset, 'adaptive_block_quant', False),
-            adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
-            adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 8),
-            adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
-            adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
-            adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-6),
-            adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
-            adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
-            adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
-            adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
+
+    target_quant_type = str(getattr(dataset, 'quant_type', 'vanilla')).lower()
+    learnable_quant_start_iter = max(int(getattr(dataset, 'learnable_quant_start_iter', 0)), 0)
+    use_two_stage_learnable_quant = (
+        target_quant_type in ("lsq", "lsqplus", "lsq+")
+        and learnable_quant_start_iter > 0
+    )
+    active_quant_type = "vanilla" if use_two_stage_learnable_quant else target_quant_type
+    dataset.active_quant_type = active_quant_type
+
+    if use_two_stage_learnable_quant:
+        print(
+            f"  两阶段量化: 前 {learnable_quant_start_iter} iter 使用 VANILLA，"
+            f"随后切换到 {target_quant_type.upper()}"
         )
-        print(f"  通道量化: 启用")
-    elif dataset.per_block_quant:
-        print(f"  量化模式：per_block_quant")
-        bit_config = {
-            'opacity': 8,       # alpha
-            'euler': 8,         # rotation (欧拉角)
-            'scale': 10,        # 需要更高精度
-            'f_dc': 8,          # sh_0
-            'f_rest_0': 4,      # sh_1 (SH degree 1: 9维)
-            'f_rest_1': 4,      # sh_2 (SH degree 2: 15维)
-            'f_rest_2': 2,      # sh_3 (SH degree 3: 21维)
-        }
-        gaussians.init_qas(
-            dataset.n_block,
-            bit_config=bit_config,
-            quant_type=dataset.quant_type,
-            vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
-            encode=getattr(dataset, 'encode', 'deflate'),
-            ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
-            use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
-            adaptive_block_quant=getattr(dataset, 'adaptive_block_quant', False),
-            adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
-            adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 10),
-            adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
-            adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
-            adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-8),
-            adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
-            adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
-            adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
-            adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
-        )
-    else:
-        print(f"未知的量化模式")
+        if learnable_quant_start_iter >= opt.iterations:
+            print(
+                f"  提示: learnable_quant_start_iter={learnable_quant_start_iter} >= total_iters={opt.iterations}，"
+                "本次训练将全程保持 VANILLA 量化"
+            )
+
+    def init_active_quantizers(quant_type_name):
+        dataset.active_quant_type = quant_type_name
+        if dataset.per_channel_quant:
+            print(f"  量化模式：per_channel_quant")
+            dataset.n_block = 1    #一个属性只用一个量化器，不使用之前定义的n_block
+            bit_config = {
+                'opacity': 8,
+                'euler': 8,
+                'scale': 10,
+                'f_dc': 8,
+                'f_rest_0': 4,
+                'f_rest_1': 4,
+                'f_rest_2': 2,
+            }
+            gaussians.init_qas(
+                dataset.n_block,
+                bit_config=bit_config,
+                quant_type=quant_type_name,
+                vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
+                encode=getattr(dataset, 'encode', 'deflate'),
+                ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
+                use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
+                adaptive_block_quant=getattr(dataset, 'adaptive_block_quant', False),
+                adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
+                adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 8),
+                adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
+                adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
+                adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-6),
+                adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
+                adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
+                adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
+                adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
+            )
+            print(f"  通道量化: 启用")
+        elif dataset.per_block_quant:
+            print(f"  量化模式：per_block_quant")
+            bit_config = {
+                'opacity': 8,       # alpha
+                'euler': 8,         # rotation (欧拉角)
+                'scale': 10,        # 需要更高精度
+                'f_dc': 8,          # sh_0
+                'f_rest_0': 4,      # sh_1 (SH degree 1: 9维)
+                'f_rest_1': 4,      # sh_2 (SH degree 2: 15维)
+                'f_rest_2': 2,      # sh_3 (SH degree 3: 21维)
+            }
+            gaussians.init_qas(
+                dataset.n_block,
+                bit_config=bit_config,
+                quant_type=quant_type_name,
+                vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
+                encode=getattr(dataset, 'encode', 'deflate'),
+                ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
+                use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
+                adaptive_block_quant=getattr(dataset, 'adaptive_block_quant', False),
+                adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
+                adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 10),
+                adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
+                adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
+                adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-8),
+                adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
+                adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
+                adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
+                adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
+            )
+        else:
+            print(f"未知的量化模式")
+
+    init_active_quantizers(active_quant_type)
 
     # VQ训练（本项目不使用VQ，已删去VQ内部函数，进入vq_fe函数后会直接返回）
     # gaussians.vq_fe(imp, dataset.codebook_size, dataset.batch_size, dataset.steps)
@@ -1213,20 +1256,21 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             print("  当前损失模式: distortion-only (loss_D)")
     print("="*70 + "\n")
     
-    gaussians.finetuning_setup(opt) #微调，需要固定位置，只对外观微调
+    def refresh_finetune_optimizers():
+        gaussians.finetuning_setup(copy.deepcopy(opt)) #微调，需要固定位置，只对外观微调
 
-    # ==========================================
-    # 初始化 ANS 的辅助优化器 (拟合 CDF 曲线)
-    # ==========================================
-    aux_optimizer = None
-    if encode_mode == "ans" and hasattr(gaussians, 'ans_entropy_bottlenecks'):
-        aux_quantiles = [eb.quantiles for eb in gaussians.ans_entropy_bottlenecks.values()]
-        if aux_quantiles:
-            aux_optimizer = torch.optim.Adam(aux_quantiles, lr=1e-3)
-            print(f"\n【ANS 编码】已启用，初始化 aux_optimizer 管理 {len(aux_quantiles)} 个 CDF 参数")
+        local_aux_optimizer = None
+        if encode_mode == "ans" and hasattr(gaussians, 'ans_entropy_bottlenecks'):
+            aux_quantiles = [eb.quantiles for eb in gaussians.ans_entropy_bottlenecks.values()]
+            if aux_quantiles:
+                local_aux_optimizer = torch.optim.Adam(aux_quantiles, lr=1e-3)
+                print(f"\n【ANS 编码】已启用，初始化 aux_optimizer 管理 {len(aux_quantiles)} 个 CDF 参数")
+        return local_aux_optimizer
+
+    aux_optimizer = refresh_finetune_optimizers()
 
     # 输出初始LSQ scale参数
-    if dataset.per_block_quant and dataset.quant_type.lower() == "lsq":
+    if dataset.per_block_quant and getattr(dataset, 'active_quant_type', dataset.quant_type).lower() in ("lsq", "lsqplus", "lsq+"):
         gaussians.print_lsq_scale_evolution(0)
 
     iter_start = torch.cuda.Event(enable_timing = True)
@@ -1237,6 +1281,21 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
     progress_bar = tqdm(range(opt.iterations), desc="微调进度")
     psnr_train = 0
     for iteration in range(1, opt.iterations + 1):    
+        if use_two_stage_learnable_quant and iteration == learnable_quant_start_iter + 1:
+            print("\n" + "-"*50)
+            print(f"【Stage Switch】Iter {iteration}")
+            print("-"*50)
+            print(
+                f"  已完成 {learnable_quant_start_iter} 次 VANILLA 恢复，"
+                f"开始初始化 {target_quant_type.upper()} 可学习量化器"
+            )
+            init_active_quantizers(target_quant_type)
+            aux_optimizer = refresh_finetune_optimizers()
+            gaussians.clear_static_eval_quant_cache()
+            if dataset.per_block_quant and target_quant_type in ("lsq", "lsqplus", "lsq+"):
+                gaussians.print_lsq_scale_evolution(iteration)
+            use_two_stage_learnable_quant = False
+
         gaussians.clear_static_eval_quant_cache()
         iter_start.record()
 
@@ -1368,7 +1427,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         if PROFILE_TIME:
             t_main_backward_end.record()
 
-        # 打印自适应量化的步长信息，与vanilla对比
+        # 打印公式计算自适应量化的步长信息，与vanilla对比
         if (
             getattr(dataset, 'adaptive_block_quant', False)
             and dataset.per_block_quant

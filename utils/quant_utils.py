@@ -754,10 +754,15 @@ def batched_quantize_blocks(
             for block_idx in range(n_blocks):
                 qa = flat_qas[base + block_idx]
                 if not qa.init_yet:
-                    init_scale = block_abs_mean[dim_idx, block_idx] * 2 / (float(qa.thd_pos) ** 0.5)
-                    with torch.no_grad():
-                        qa.s.data.fill_(init_scale.item())
-                    qa.init_yet = True
+                    block_len = int(split[block_idx])
+                    block_values = packed[dim_idx, block_idx, :block_len]
+                    if hasattr(qa, "init_from"):
+                        qa.init_from(block_values)
+                    else:
+                        init_scale = block_abs_mean[dim_idx, block_idx] * 2 / (float(qa.thd_pos) ** 0.5)
+                        with torch.no_grad():
+                            qa.s.data.fill_(init_scale.item())
+                        qa.init_yet = True
         if quant_profile is not None and profile_time:
             quant_profile["quant_param_update"] = time.perf_counter() - stage_start
     elif hasattr(first_qa, "scale"):
@@ -924,6 +929,8 @@ def batched_quantize_blocks(
     if hasattr(first_qa, "s") and not use_step_override:
         grad_factors = 1.0 / torch.sqrt(thd_pos.clamp(min=1.0) * block_lengths.view(1, n_blocks, 1))
         scales = grad_scale(scales, grad_factors)
+        if getattr(first_qa, "withzeropoint", False):
+            zero_points = grad_scale(zero_points, grad_factors)
 
     if getattr(first_qa, "withzeropoint", False):
         x_norm = zero_points + (packed / scales)
@@ -1189,15 +1196,15 @@ class LsqQuan(Quantizer):
 
     def init_from(self, x, *args, **kwargs):
         with torch.no_grad():
-            # LSQ论文里的初始化方法
-            self.s.data.fill_(x.detach().abs().mean().item() * 2 / (self.thd_pos ** 0.5))
+            # LSQ论文里的初始化方法，但是这个初始化对于我的数据来说好像不太行
+            #self.s.data.fill_(x.detach().abs().mean().item() * 2 / (self.thd_pos ** 0.5))
             # 以下为min-max初始化
-            # min_val = x.detach().min()
-            # max_val = x.detach().max()
-            # if max_val == min_val:
-            #     max_val = max_val + 1e-5
-            # scale_init = (max_val - min_val) / (self.thd_pos - self.thd_neg)
-            # self.s.data.fill_(scale_init.item())
+            min_val = x.detach().min()
+            max_val = x.detach().max()
+            if max_val == min_val:
+                max_val = max_val + 1e-5
+            scale_init = (max_val - min_val) / (self.thd_pos - self.thd_neg)
+            self.s.data.fill_(scale_init.item())
         self.init_yet = True
         # print('quant_utils.py Line 62:', self.s)  # 打印初始化后的s
     
@@ -1222,6 +1229,71 @@ class LsqQuan(Quantizer):
 
     def get_quant_params(self):
         return self.s, torch.tensor(0.0, device=self.s.device), self.thd_neg < 0
+
+
+class LsqPlusQuan(Quantizer):
+    def __init__(self, bit, init_yet, all_positive=True, symmetric=False, encode="deflate", channels=1, shared_eb=None):
+        super().__init__(bit)
+
+        if all_positive:
+            assert not symmetric, "Positive quantization cannot be symmetric"
+            self.thd_neg = 0
+            self.thd_pos = 2 ** bit - 1
+        else:
+            if symmetric:
+                self.thd_neg = - 2 ** (bit - 1) + 1
+                self.thd_pos = 2 ** (bit - 1) - 1
+            else:
+                self.thd_neg = - 2 ** (bit - 1)
+                self.thd_pos = 2 ** (bit - 1) - 1
+
+        self.s = nn.Parameter(torch.ones(1))
+        self.zero_point = nn.Parameter(torch.zeros(1))
+        self.withzeropoint = True
+        self.init_yet = init_yet
+
+        self.encode = encode
+        if self.encode.lower() == "ans":
+            self.entropy_bottleneck = shared_eb
+        else:
+            self.entropy_bottleneck = None
+        self.last_likelihoods = None
+        self.last_clamped = None
+
+    def init_from(self, x, *args, **kwargs):
+        with torch.no_grad():
+            min_val = x.detach().min()
+            max_val = x.detach().max()
+            scale, zero_point = calcScaleZeroPoint(
+                min_val,
+                max_val,
+                num_bits=self.bit,
+                qmin=float(self.thd_neg),
+                qmax=float(self.thd_pos),
+            )
+            self.s.data.copy_(torch.clamp(scale.reshape_as(self.s), min=1e-8))
+            self.zero_point.data.copy_(
+                zero_point.to(device=self.zero_point.device, dtype=self.zero_point.dtype).reshape_as(self.zero_point)
+            )
+        self.init_yet = True
+
+    def forward(self, x):
+        grad_factor = 1.0 / ((max(float(self.thd_pos), 1.0) * x.numel()) ** 0.5)
+        s_scale = grad_scale(self.s, grad_factor)
+        zp_scale = grad_scale(self.zero_point, grad_factor)
+
+        x_norm = zp_scale + (x / s_scale)
+        x_clamped = torch.clamp(x_norm, self.thd_neg, self.thd_pos)
+
+        if self.encode.lower() == "ans":
+            self.last_clamped = x_clamped
+
+        x_q = round_pass(x_clamped)
+        x_q = (x_q - zp_scale) * s_scale
+        return x_q
+
+    def get_quant_params(self):
+        return self.s, self.zero_point, self.thd_neg < 0
 
 
 def calcScaleZeroPoint(min_val, max_val, num_bits=8, qmin=None, qmax=None):
@@ -1339,11 +1411,22 @@ class VanillaQuan(Quantizer):
 
         current_abs_max = x.detach().abs().max()
         if self.max_val.nelement() == 0 or self.max_val.data < current_abs_max.data:
-            self.max_val.data = current_abs_max.data
+            self.max_val.data = current_abs_max.data    
         self.max_val.clamp_(min=1e-8)
         self.min_val.data = -self.max_val.data
         qmax = max(float(self.thd_pos), 1.0)
         self.scale = torch.clamp(self.max_val / qmax, min=1e-8)
+
+        # 原始的vanilla量化，非对称有zeropoint
+        # if self.max_val.nelement() == 0 or self.max_val.data < x.max().data:
+        #     self.max_val.data = x.max().data
+        # self.max_val.clamp_(min=0)
+        
+        # if self.min_val.nelement() == 0 or self.min_val.data > x.min().data:
+        #     self.min_val.data = x.min().data 
+        # self.min_val.clamp_(max=0)    
+        
+        # self.scale, self.zero_point = calcScaleZeroPoint(self.min_val, self.max_val, self.bit)
         self.zero_point.data.zero_()
     
     def forward(self, x):

@@ -53,7 +53,10 @@ def _laplace_cdf(x, scale, mean=None):
 
 
 def _get_quantizer_zero_point_value(qa):
-    zero_point = getattr(qa, "zero_point", None)
+    if hasattr(qa, "get_effective_zero_point"):
+        zero_point = qa.get_effective_zero_point()
+    else:
+        zero_point = getattr(qa, "zero_point", None)
     if zero_point is None:
         return 0.0
     if torch.is_tensor(zero_point):
@@ -83,6 +86,17 @@ def quantizer_center_symbol(qa):
     if quantizer_uses_zero_point(qa):
         return int(round(_get_quantizer_zero_point_value(qa)))
     return 0
+
+
+def quantizer_symbol_domain_from_dequantized(x, qa):
+    if hasattr(qa, "beta"):
+        safe_scale = qa.s.clamp(min=1e-8)
+        return (x - qa.beta) / safe_scale
+    if hasattr(qa, "s"):
+        return x / qa.s.clamp(min=1e-8)
+    if quantizer_uses_zero_point(qa):
+        return qa.get_effective_zero_point() + (x / qa.scale.clamp(min=1e-8)) if hasattr(qa, "get_effective_zero_point") else qa.zero_point + (x / qa.scale.clamp(min=1e-8))
+    return x / qa.scale.clamp(min=1e-8)
 
 
 def build_laplace_zero_mean_mask(qas, n_dims, n_blocks, device):
@@ -641,7 +655,8 @@ def batched_quantize_blocks(
 
     first_qa = flat_qas[0]
     use_step_override = step_override is not None
-    override_zero_points = None
+    use_beta_param = hasattr(first_qa, "beta")
+    override_offsets = None
     if use_step_override:
         override_steps = torch.as_tensor(step_override, device=x.device, dtype=x.dtype)
         if override_steps.dim() == 2:
@@ -655,7 +670,13 @@ def batched_quantize_blocks(
                 f"step_override shape {tuple(override_steps.shape)} does not match expected ({n_dims}, {n_blocks}, 1)"
             )
         override_steps = override_steps.clamp(min=1e-8)
-        override_zero_points = override_steps.new_zeros((n_dims, n_blocks, 1))
+        if use_beta_param:
+            beta_entries = []
+            for qa in flat_qas:
+                beta_entries.append(qa.beta.reshape(1).to(device=x.device, dtype=x.dtype))
+            override_offsets = torch.stack(beta_entries, dim=0).view(n_dims, n_blocks, 1)
+        else:
+            override_offsets = override_steps.new_zeros((n_dims, n_blocks, 1))
         if hasattr(first_qa, "scale") and bool(override_uses_vanilla_zero_point):
             if quant_profile is not None and profile_time:
                 _sync_profile_device(x.device)
@@ -735,7 +756,7 @@ def batched_quantize_blocks(
                             .to(device=qa.zero_point.device, dtype=qa.zero_point.dtype)
                             .reshape_as(qa.zero_point)
                         )
-            override_zero_points = updated_zero_flat.view(n_dims, n_blocks, 1)
+            override_offsets = updated_zero_flat.view(n_dims, n_blocks, 1)
             if quant_profile is not None and profile_time:
                 _sync_profile_device(x.device)
                 quant_profile["quant_param_update"] = time.perf_counter() - stage_start
@@ -897,26 +918,28 @@ def batched_quantize_blocks(
     pos_entries = []
     if use_step_override:
         scales = override_steps
-        zero_points = override_zero_points
+        offsets = override_offsets
         for qa in flat_qas:
             neg_entries.append(scales.new_tensor(float(qa.thd_neg)))
             pos_entries.append(scales.new_tensor(float(qa.thd_pos)))
     else:
         scale_entries = []
-        zero_entries = []
+        offset_entries = []
         for qa in flat_qas:
             if hasattr(qa, "s"):
                 scale_entries.append(qa.s.reshape(1))
             else:
                 scale_entries.append(qa.scale.reshape(1))
-            if hasattr(qa, "zero_point"):
-                zero_entries.append(qa.zero_point.reshape(1).to(dtype=scale_entries[-1].dtype))
+            if hasattr(qa, "beta"):
+                offset_entries.append(qa.beta.reshape(1).to(dtype=scale_entries[-1].dtype))
+            elif hasattr(qa, "zero_point"):
+                offset_entries.append(qa.zero_point.reshape(1).to(dtype=scale_entries[-1].dtype))
             else:
-                zero_entries.append(scale_entries[-1].new_zeros(1))
+                offset_entries.append(scale_entries[-1].new_zeros(1))
             neg_entries.append(scale_entries[-1].new_tensor(float(qa.thd_neg)))
             pos_entries.append(scale_entries[-1].new_tensor(float(qa.thd_pos)))
         scales = torch.stack(scale_entries, dim=0).view(n_dims, n_blocks, 1)
-        zero_points = torch.stack(zero_entries, dim=0).view(n_dims, n_blocks, 1)
+        offsets = torch.stack(offset_entries, dim=0).view(n_dims, n_blocks, 1)
     thd_neg = torch.stack(neg_entries, dim=0).view(n_dims, n_blocks, 1)
     thd_pos = torch.stack(pos_entries, dim=0).view(n_dims, n_blocks, 1)
     if quant_profile is not None and profile_time:
@@ -929,17 +952,21 @@ def batched_quantize_blocks(
     if hasattr(first_qa, "s") and not use_step_override:
         grad_factors = 1.0 / torch.sqrt(thd_pos.clamp(min=1.0) * block_lengths.view(1, n_blocks, 1))
         scales = grad_scale(scales, grad_factors)
-        if getattr(first_qa, "withzeropoint", False):
-            zero_points = grad_scale(zero_points, grad_factors)
+        if use_beta_param or getattr(first_qa, "withzeropoint", False):
+            offsets = grad_scale(offsets, grad_factors)
 
-    if getattr(first_qa, "withzeropoint", False):
-        x_norm = zero_points + (packed / scales)
+    if use_beta_param:
+        x_norm = (packed - offsets) / scales
+    elif getattr(first_qa, "withzeropoint", False):
+        x_norm = offsets + (packed / scales)
     else:
         x_norm = packed / scales
     x_clamped = torch.clamp(x_norm, thd_neg, thd_pos)
     x_q = round_pass(x_clamped)
-    if getattr(first_qa, "withzeropoint", False):
-        dequantized = (x_q - zero_points) * scales
+    if use_beta_param:
+        dequantized = x_q * scales + offsets
+    elif getattr(first_qa, "withzeropoint", False):
+        dequantized = (x_q - offsets) * scales
     else:
         dequantized = x_q * scales
 
@@ -1012,7 +1039,10 @@ def batched_quantize_blocks(
         trans = []
         if use_step_override:
             flat_scales = scales.reshape(-1)
-            flat_zeros = zero_points.reshape(-1)
+            if use_beta_param:
+                flat_zeros = -(offsets.reshape(-1) / flat_scales.clamp(min=1e-8))
+            else:
+                flat_zeros = offsets.reshape(-1)
             for idx in range(flat_scales.numel()):
                 trans.extend([flat_scales[idx].item(), flat_zeros[idx].item()])
         else:
@@ -1232,8 +1262,23 @@ class LsqQuan(Quantizer):
 
 
 class LsqPlusQuan(Quantizer):
-    def __init__(self, bit, init_yet, all_positive=True, symmetric=False, encode="deflate", channels=1, shared_eb=None):
+    def __init__(
+        self,
+        bit,
+        init_yet,
+        all_positive=True,
+        symmetric=False,
+        encode="deflate",
+        channels=1,
+        shared_eb=None,
+        learn_beta=False,
+    ):
         super().__init__(bit)
+
+        self.all_positive = all_positive
+        self.symmetric = symmetric
+        self.learn_beta = bool(learn_beta)
+        self.offset_mode = "beta" if self.learn_beta else "zero_point"
 
         if all_positive:
             assert not symmetric, "Positive quantization cannot be symmetric"
@@ -1248,8 +1293,11 @@ class LsqPlusQuan(Quantizer):
                 self.thd_pos = 2 ** (bit - 1) - 1
 
         self.s = nn.Parameter(torch.ones(1))
-        self.zero_point = nn.Parameter(torch.zeros(1))
         self.withzeropoint = True
+        if self.learn_beta:
+            self.beta = nn.Parameter(torch.zeros(1))
+        else:
+            self.zero_point = nn.Parameter(torch.zeros(1))
         self.init_yet = init_yet
 
         self.encode = encode
@@ -1271,29 +1319,48 @@ class LsqPlusQuan(Quantizer):
                 qmin=float(self.thd_neg),
                 qmax=float(self.thd_pos),
             )
-            self.s.data.copy_(torch.clamp(scale.reshape_as(self.s), min=1e-8))
-            self.zero_point.data.copy_(
-                zero_point.to(device=self.zero_point.device, dtype=self.zero_point.dtype).reshape_as(self.zero_point)
-            )
+            scale = torch.clamp(scale.reshape_as(self.s), min=1e-8)
+            self.s.data.copy_(scale)
+            if self.learn_beta:
+                beta = -scale * zero_point.to(device=scale.device, dtype=scale.dtype).reshape_as(scale)
+                self.beta.data.copy_(beta.to(device=self.beta.device, dtype=self.beta.dtype))
+            else:
+                self.zero_point.data.copy_(
+                    zero_point.to(device=self.zero_point.device, dtype=self.zero_point.dtype).reshape_as(self.zero_point)
+                )
         self.init_yet = True
+
+    def get_effective_zero_point(self):
+        if self.learn_beta:
+            safe_scale = self.s.clamp(min=1e-8)
+            return -(self.beta / safe_scale)
+        return self.zero_point
 
     def forward(self, x):
         grad_factor = 1.0 / ((max(float(self.thd_pos), 1.0) * x.numel()) ** 0.5)
         s_scale = grad_scale(self.s, grad_factor)
-        zp_scale = grad_scale(self.zero_point, grad_factor)
 
-        x_norm = zp_scale + (x / s_scale)
+        if self.learn_beta:
+            beta_scale = grad_scale(self.beta, grad_factor)
+            x_norm = (x - beta_scale) / s_scale
+        else:
+            zp_scale = grad_scale(self.zero_point, grad_factor)
+            x_norm = zp_scale + (x / s_scale)
+
         x_clamped = torch.clamp(x_norm, self.thd_neg, self.thd_pos)
 
         if self.encode.lower() == "ans":
             self.last_clamped = x_clamped
 
         x_q = round_pass(x_clamped)
-        x_q = (x_q - zp_scale) * s_scale
+        if self.learn_beta:
+            x_q = x_q * s_scale + beta_scale
+        else:
+            x_q = (x_q - zp_scale) * s_scale
         return x_q
 
     def get_quant_params(self):
-        return self.s, self.zero_point, self.thd_neg < 0
+        return self.s, self.get_effective_zero_point(), self.thd_neg < 0
 
 
 def calcScaleZeroPoint(min_val, max_val, num_bits=8, qmin=None, qmax=None):

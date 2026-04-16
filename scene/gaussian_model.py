@@ -708,6 +708,7 @@ class GaussianModel:
         self.ret_features = None
         self.quant_type = "vanilla"
         self.encode = "deflate"
+        self.lsqplus_learnbeta = False
         self.ans_subgroup_count = 1
         self.raht_level_ids = np.zeros((0,), dtype=np.int64)
         self.raht_subgroup_ids = np.zeros((0,), dtype=np.int64)
@@ -761,7 +762,7 @@ class GaussianModel:
             for name, param in qa.named_parameters(recurse=False):
                 if name == "s":
                     scale_params.append(param)
-                elif name == "zero_point":
+                elif name in ("zero_point", "beta"):
                     zero_point_params.append(param)
                 else:
                     other_params.append(param)
@@ -2742,6 +2743,7 @@ class GaussianModel:
         quant_type="vanilla",
         encode="deflate",
         ans_subgroup_count=1,
+        lsqplus_learnbeta=False,
         vanilla_withzeropoint=None,
         use_center_inflated_laplace=True,
         adaptive_block_quant=False,
@@ -2776,6 +2778,7 @@ class GaussianModel:
         self.quant_type = quant_type.lower()
         self.encode = encode
         self.ans_subgroup_count = max(1, int(ans_subgroup_count))
+        self.lsqplus_learnbeta = bool(lsqplus_learnbeta)
         self.vanilla_withzeropoint = vanilla_withzeropoint
         self.use_center_inflated_laplace = bool(use_center_inflated_laplace)
         self.adaptive_block_quant_enabled = bool(adaptive_block_quant)
@@ -2869,6 +2872,7 @@ class GaussianModel:
                         all_positive=False,
                         encode=encode,
                         shared_eb=eb,
+                        learn_beta=self.lsqplus_learnbeta,
                     ).cuda()
                 else:
                     qa_module = VanillaQuan(
@@ -2890,6 +2894,8 @@ class GaussianModel:
         print('初始化量化器')
         print('='*50)
         print(f'量化器类型: {quant_type.upper()}')
+        if quant_type.lower() in ("lsqplus", "lsq+"):
+            print(f'LSQPlus offset mode: {"beta" if self.lsqplus_learnbeta else "zero_point"}')
         if quant_type.lower() == "vanilla":
             print(f'Vanilla zero_point: {"ON" if bool(vanilla_withzeropoint) else "OFF"}')
         print(f'Center-inflated Laplace: {"ON" if self.use_center_inflated_laplace else "OFF"}')
@@ -2981,8 +2987,9 @@ class GaussianModel:
 
     def print_lsq_scale_evolution(self, iteration):
         """
-        打印LSQ量化器scale参数的演化过程
-        每100次迭代输出第一个量化器的55个scale值
+        打印LSQ量化器参数的演化过程
+        每100次迭代输出每个维度第一个量化器的scale；
+        对LSQPlus额外输出对应的beta值/zero_point
         
         Args:
             iteration: 当前迭代次数
@@ -2994,12 +3001,14 @@ class GaussianModel:
             return
             
         # 每100次迭代输出一次
-        if iteration % 100 != 0:
+        if iteration % 10 != 0:
             return
             
         print(f"\n{'='*80}")
-        print(f"{self.quant_type.upper()} Scale 参数演化 [Iteration {iteration}]")
+        print(f"{self.quant_type.upper()} Quantizer 参数演化 [Iteration {iteration}]")
         print(f"{'='*80}")
+        if self.quant_type in ("lsqplus", "lsq+"):
+            print(f"Offset mode: {'beta' if bool(getattr(self, 'lsqplus_learnbeta', False)) else 'zero_point'}")
         
         # 获取每个维度的第一个量化器的scale值
         dim_names = ['opacity', 'euler_x', 'euler_y', 'euler_z', 
@@ -3008,9 +3017,12 @@ class GaussianModel:
                    ['scale_x', 'scale_y', 'scale_z']
         
         scales = []
+        betas = []
+        zero_points = []
+        effective_zero_points = []
         qa_idx = 0
         
-        # 收集每个维度第一个块的scale值 (55个维度)
+        # 收集每个维度第一个块的scale/beta/zero_point值 (55个维度)
         for dim_idx in range(55):
             if qa_idx < len(self.qas):
                 qa = self.qas[qa_idx]  # 每个维度的第一个量化器
@@ -3019,21 +3031,48 @@ class GaussianModel:
                     scales.append(scale_val)
                 else:
                     scales.append(0.0)  # VanillaQuan没有可学习的scale
+                if hasattr(qa, 'beta'):
+                    beta_val = qa.beta.item()
+                    betas.append(beta_val)
+                    if abs(scale_val) > 1e-12:
+                        effective_zero_points.append(int(round(-beta_val / scale_val)))
+                    else:
+                        effective_zero_points.append(None)
+                else:
+                    betas.append(None)
+                    effective_zero_points.append(None)
+                if hasattr(qa, 'zero_point'):
+                    zero_points.append(qa.zero_point.item())
+                else:
+                    zero_points.append(None)
             else:
                 scales.append(0.0)
+                betas.append(None)
+                zero_points.append(None)
+                effective_zero_points.append(None)
             qa_idx += self.n_block  # 跳到下一个维度的第一个量化器
+
+        def print_quant_param_line(idx, indent="  "):
+            line = f"{indent}{dim_names[idx]:<12s}: scale={scales[idx]:.8f}"
+            if betas[idx] is not None:
+                line += f", beta={betas[idx]:.8f}"
+            elif zero_points[idx] is not None:
+                line += f", zero_point={zero_points[idx]:.8f}"
+            if effective_zero_points[idx] is not None:
+                line += f", effective_zp={effective_zero_points[idx]}"
+            print(line)
         
         # 按类别分组显示
         print(f"Opacity (1维):")
-        print(f"  {dim_names[0]:<12s}: {scales[0]:.8f}")
+        print_quant_param_line(0)
         
         print(f"\nEuler Angles (3维):")
         for i in range(1, 4):
-            print(f"  {dim_names[i]:<12s}: {scales[i]:.8f}")
+            print_quant_param_line(i)
         
         print(f"\nFeatures DC (3维):")
         for i in range(4, 7):
-            print(f"  {dim_names[i]:<12s}: {scales[i]:.8f}")
+            print_quant_param_line(i)
         
         print(f"\nFeatures Rest (45维):")
         for i in range(7, 52):
@@ -3043,11 +3082,11 @@ class GaussianModel:
                 print(f"  SH Degree 2 (15):")
             elif (i - 7) == 21:
                 print(f"  SH Degree 3 (21):")
-            print(f"    {dim_names[i]:<12s}: {scales[i]:.8f}")
+            print_quant_param_line(i, indent="    ")
         
         print(f"\nScaling (3维):")
         for i in range(52, 55):
-            print(f"  {dim_names[i]:<12s}: {scales[i]:.8f}")
+            print_quant_param_line(i)
         
         # 统计信息
         valid_scales = [s for s in scales if s > 0]

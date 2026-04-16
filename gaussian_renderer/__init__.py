@@ -25,6 +25,7 @@ from utils.quant_utils import (
     batched_quantize_blocks,
     estimate_zero_inflated_laplace_block_params,
     quantizer_center_symbol,
+    quantizer_symbol_domain_from_dequantized,
     quantizer_uses_center_inflated_laplace,
     quantizer_uses_zero_point,
     quantizer_uses_zero_mean_laplace,
@@ -529,23 +530,13 @@ def ft_render(
                     pc.qa.init_from(raht_coeffs)
                 quantC[1:] = pc.qa(raht_coeffs)
                 if encode_mode == "ans" and getattr(pc.qa, "entropy_bottleneck", None) is not None:
-                    if hasattr(pc.qa, "s"):
-                        symbol_domain = quantC[1:] / pc.qa.s
-                    elif quantizer_uses_zero_point(pc.qa):
-                        symbol_domain = pc.qa.zero_point + (quantC[1:] / pc.qa.scale)
-                    else:
-                        symbol_domain = quantC[1:] / pc.qa.scale
+                    symbol_domain = quantizer_symbol_domain_from_dequantized(quantC[1:], pc.qa)
                     x_clamped = torch.clamp(symbol_domain, pc.qa.thd_neg, pc.qa.thd_pos)
                     _, likelihoods = pc.qa.entropy_bottleneck(x_clamped.view(1, 1, -1, 1))
                     total_ans_bits = torch.clamp(-torch.log2(likelihoods.clamp(min=1e-6)), max=32.0).sum()
                 elif encode_mode == "laplace":
                     from utils.quant_utils import _zero_inflated_laplace_bits_with_tail_clip
-                    if hasattr(pc.qa, "s"):
-                        symbol_domain = quantC[1:] / pc.qa.s
-                    elif quantizer_uses_zero_point(pc.qa):
-                        symbol_domain = pc.qa.zero_point + (quantC[1:] / pc.qa.scale)
-                    else:
-                        symbol_domain = quantC[1:] / pc.qa.scale
+                    symbol_domain = quantizer_symbol_domain_from_dequantized(quantC[1:], pc.qa)
                     zero_mean_flags = [
                         [quantizer_uses_zero_mean_laplace(pc.qa)]
                         for _ in range(symbol_domain.shape[1])

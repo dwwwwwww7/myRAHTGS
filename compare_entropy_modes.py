@@ -66,7 +66,15 @@ def parse_args():
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--num-bits", type=int, default=8)
     parser.add_argument("--n-block", type=int, default=66)
-    parser.add_argument("--quant-type", choices=["lsq", "vanilla"], default="vanilla")
+    parser.add_argument("--quant-type", choices=["lsq", "lsqplus", "lsq+", "vanilla"], default="vanilla")
+    parser.add_argument(
+        "--LSQplus_learnbeta",
+        "--lsqplus-learnbeta",
+        dest="LSQplus_learnbeta",
+        action="store_true",
+        default=False,
+        help="Use LSQ+ paper-style beta offset instead of quantized-domain zero_point.",
+    )
     parser.add_argument(
         "--vanilla-withzeropoint",
         action="store_true",
@@ -668,6 +676,7 @@ def collect_symbol_diagnostics(args, ply_format, importance, bit_config, output_
         effective_n_block,
         bit_config=bit_config,
         quant_type=args.quant_type,
+        lsqplus_learnbeta=getattr(args, "LSQplus_learnbeta", False),
         vanilla_withzeropoint=args.vanilla_withzeropoint,
         encode="ans",
         ans_subgroup_count=args.ans_subgroup_count,
@@ -982,6 +991,7 @@ def run_single_mode(args, mode, ply_format, importance, bit_config, output_dir, 
         effective_n_block,
         bit_config=bit_config,
         quant_type=args.quant_type,
+        lsqplus_learnbeta=getattr(args, "LSQplus_learnbeta", False),
         vanilla_withzeropoint=args.vanilla_withzeropoint,
         encode=mode,
         ans_subgroup_count=args.ans_subgroup_count,
@@ -1088,6 +1098,10 @@ def main():
     print(f"RAHT depth     : {args.depth}")
     print(f"Octree merge   : {args.oct_merge}")
     print(f"Quant type     : {args.quant_type}")
+    if str(args.quant_type).lower() in ("lsqplus", "lsq+"):
+        print(
+            f"LSQ+ offset    : {'beta' if bool(getattr(args, 'LSQplus_learnbeta', False)) else 'zero_point'}"
+        )
     print(f"Center-infl.   : {args.center_inflated_laplace}")
     print(f"Bit config     : {bit_config}")
 
@@ -1127,6 +1141,9 @@ def main():
         "original_ply_bytes": original_bytes,
         "oct_merge": args.oct_merge,
         "quant_type": args.quant_type,
+        "lsqplus_offset_mode": (
+            "beta" if bool(getattr(args, "LSQplus_learnbeta", False)) else "zero_point"
+        ),
         "quant_granularity": args.quant_granularity,
         "bit_packing": bool(args.bit_packing),
         "bit_config": bit_config,

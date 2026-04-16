@@ -50,7 +50,15 @@ def parse_args():
     parser.add_argument("--depth", type=int, default=12)
     parser.add_argument("--num-bits", type=int, default=8)
     parser.add_argument("--n-block", type=int, default=66)
-    parser.add_argument("--quant-type", choices=["lsq", "vanilla"], default="vanilla")
+    parser.add_argument("--quant-type", choices=["lsq", "lsqplus", "lsq+", "vanilla"], default="vanilla")
+    parser.add_argument(
+        "--LSQplus_learnbeta",
+        "--lsqplus-learnbeta",
+        dest="LSQplus_learnbeta",
+        action="store_true",
+        default=False,
+        help="Use LSQ+ paper-style beta offset instead of quantized-domain zero_point.",
+    )
     parser.add_argument("--oct-merge", choices=["mean", "imp", "rand"], default="mean")
     parser.add_argument(
         "--importance",
@@ -557,6 +565,7 @@ def collect_raht_statistics(args):
         effective_n_block,
         bit_config=bit_config,
         quant_type=args.quant_type,
+        lsqplus_learnbeta=getattr(args, "LSQplus_learnbeta", False),
         encode="deflate",
         use_center_inflated_laplace=not getattr(args, "disable_center_inflated_laplace", False),
     )
@@ -678,6 +687,10 @@ def main():
     print(f"Output dir     : {output_dir}")
     print(f"RAHT depth     : {args.depth}")
     print(f"Quant type     : {args.quant_type}")
+    if str(args.quant_type).lower() in ("lsqplus", "lsq+"):
+        print(
+            f"LSQ+ offset    : {'beta' if bool(getattr(args, 'LSQplus_learnbeta', False)) else 'zero_point'}"
+        )
 
     with torch.no_grad():
         stats = collect_raht_statistics(args)
@@ -688,6 +701,9 @@ def main():
         "output_dir": str(output_dir.resolve()),
         "ply_format": stats["ply_format"],
         "quant_type": args.quant_type,
+        "lsqplus_offset_mode": (
+            "beta" if bool(getattr(args, "LSQplus_learnbeta", False)) else "zero_point"
+        ),
         "quant_granularity": args.quant_granularity,
         "bit_config": stats["bit_config"],
         "effective_n_block": stats["effective_n_block"],

@@ -77,16 +77,22 @@ def format_quant_config_summary(dataset, pipe, opt=None):
             f"update_interval={int(getattr(dataset, 'adaptive_update_interval', 8))}",
             f"bootstrap_iters={int(getattr(dataset, 'adaptive_bootstrap_iters', 200))}",
             f"clip=[{float(getattr(dataset, 'adaptive_step_clip_min', 0.5)):.3g},{float(getattr(dataset, 'adaptive_step_clip_max', 2.0)):.3g}]",
-            #f"vanilla_zeropoint={bool(getattr(dataset, 'vanilla_withzeropoint', False))}",
             #f"adaptive_keep_vanilla_zp={bool(getattr(dataset, 'adaptive_keep_vanilla_zero_point', True))}",
         ])
+
+    if str(active_quant_type).lower() == "vanilla":
+        parts.append(f"vanilla_withzeropoint={bool(getattr(dataset, 'vanilla_withzeropoint', False))}")
     
     # LSQ或LSQ+的一些设置
     learnable_quant_start_iter = int(getattr(dataset, 'learnable_quant_start_iter', 0))
     if active_quant_type != target_quant_type:
         parts.append(f"target_quant={target_quant_type}")
     if learnable_quant_start_iter > 0 and str(target_quant_type).lower() in ("lsq", "lsqplus", "lsq+"):
-        parts.extend(f"learnable_start={learnable_quant_start_iter}")
+        parts.append(f"learnable_start={learnable_quant_start_iter}")
+    if str(target_quant_type).lower() in ("lsqplus", "lsq+"):
+        parts.append(
+            f"lsqplus_offset={'beta' if bool(getattr(dataset, 'LSQplus_learnbeta', False)) else 'zero_point'}"
+        )
     parts.extend([
             f"quant_scale_lr={float(getattr(opt, 'quant_scale_lr', 0.001)):.3g}",
             f"quant_zero_point_lr={float(getattr(opt, 'quant_zero_point_lr', 0.0005)):.3g}",
@@ -1118,6 +1124,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 dataset.n_block,
                 bit_config=bit_config,
                 quant_type=quant_type_name,
+                lsqplus_learnbeta=getattr(dataset, 'LSQplus_learnbeta', False),
                 vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
                 encode=getattr(dataset, 'encode', 'deflate'),
                 ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
@@ -1149,6 +1156,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 dataset.n_block,
                 bit_config=bit_config,
                 quant_type=quant_type_name,
+                lsqplus_learnbeta=getattr(dataset, 'LSQplus_learnbeta', False),
                 vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
                 encode=getattr(dataset, 'encode', 'deflate'),
                 ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
@@ -1536,8 +1544,8 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 progress_bar.update(10)
             
             # # 每100次迭代输出LSQ scale参数演化
-            # if iteration % 100 == 0:
-            #     gaussians.print_lsq_scale_evolution(iteration)
+            if iteration % 10 == 0:
+                gaussians.print_lsq_scale_evolution(iteration)
             
             # # 每50次迭代输出简要统计信息
             # if iteration % 50 == 0 and dataset.per_block_quant and dataset.quant_type.lower() == "lsq":

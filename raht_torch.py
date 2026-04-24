@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# 用的是PCS25的RAHT
+# 用的是PCS25的RAHT，好像改了莫顿编码的代码书写并使用21位，加了一些权重计算的信息打印
 """
 Created on May 25, 2021
 Modified on Jul 20, 2024

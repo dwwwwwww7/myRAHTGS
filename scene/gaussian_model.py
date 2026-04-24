@@ -24,7 +24,7 @@ from compressai.entropy_models import EntropyBottleneck
 from compressai.entropy_models.entropy_models import pmf_to_quantized_cdf
 from compressai import ans as compressai_ans
 
-from raht_torch import (copyAsort, get_RAHT_tree, haar3D_param,
+from raht_torch_mwh import (copyAsort, get_RAHT_tree, haar3D_param,
                         inv_haar3D_param, inv_haar3D_torch,
                         itransform_batched_torch, transform_batched_torch)
 from utils.general_utils import (build_rotation, build_scaling_rotation,
@@ -35,6 +35,7 @@ from utils.quant_utils import (
     LSQPlusActivationQuantizer,
     LsqPlusQuan,
     LsqQuan,
+    RelaxedVanillaQuan,
     VanillaQuan,
     batched_quantize_blocks,
     estimate_zero_inflated_laplace_block_params,
@@ -73,12 +74,45 @@ for _group_name, _dims in ATTR_GROUP_SLICES.items():
         DIM_TO_ATTR_GROUP[_dim_idx] = _group_name
 
 
+DEFAULT_ATTR_BIT_CONFIG = {
+    'opacity': 8,
+    'euler': 8,
+    'f_dc': 8,
+    'f_rest_0': 4,
+    'f_rest_1': 4,
+    'f_rest_2': 2,
+    'scale': 10,
+}
+
+
 def get_attr_group_name(dim_idx):
     return DIM_TO_ATTR_GROUP[dim_idx]
 
 
 def make_ans_group_key(attr_group, subgroup_idx):
     return f"{attr_group}__sg{subgroup_idx}"
+
+
+def build_default_bit_config():
+    return dict(DEFAULT_ATTR_BIT_CONFIG)
+
+
+def expand_dim_bits_to_group_bits(dim_to_bit, n_block):
+    group_bits = []
+    for bit in dim_to_bit:
+        group_bits.extend([int(bit)] * int(n_block))
+    return group_bits
+
+
+def collapse_group_bits_to_dim_bits(group_bits, n_block):
+    group_bits = [int(bit) for bit in group_bits]
+    n_block = max(int(n_block), 1)
+    if len(group_bits) % n_block != 0:
+        raise ValueError(f"group_bits length {len(group_bits)} is not divisible by n_block={n_block}")
+    dim_bits = []
+    for dim_idx in range(len(group_bits) // n_block):
+        dim_bits.append(int(group_bits[dim_idx * n_block]))
+    return dim_bits
 
 
 def laplace_cdf(x_values, scale, mean=0.0):
@@ -748,7 +782,7 @@ class GaussianModel:
 
     def get_quantizer_trainable_params(self):
         scale_params, zero_point_params, other_params = self.get_quantizer_trainable_param_groups()
-        return scale_params + zero_point_params + other_params
+        return scale_params + zero_point_params + other_params + self.get_quantizer_bit_logits_params()
 
     def get_quantizer_trainable_param_groups(self):
         scale_params = []
@@ -764,9 +798,169 @@ class GaussianModel:
                     scale_params.append(param)
                 elif name in ("zero_point", "beta"):
                     zero_point_params.append(param)
+                elif name == "bit_logits":
+                    continue
                 else:
                     other_params.append(param)
         return scale_params, zero_point_params, other_params
+
+    def get_quantizer_bit_logits_params(self):
+        bit_logits_params = []
+        if not hasattr(self, "qas"):
+            return bit_logits_params
+        for qa in self.qas:
+            bit_logits = getattr(qa, "bit_logits", None)
+            if isinstance(bit_logits, torch.Tensor) and bit_logits.requires_grad:
+                bit_logits_params.append(bit_logits)
+        return bit_logits_params
+
+    def has_relaxed_mixed_precision(self):
+        return bool(getattr(self, "mixed_precision_relax_enabled", False))
+
+    def set_mixed_precision_temperature(self, temperature):
+        if not self.has_relaxed_mixed_precision():
+            return
+        for qa in getattr(self, "qas", []):
+            if hasattr(qa, "set_temperature"):
+                qa.set_temperature(temperature)
+
+    def collect_mixed_precision_stats(self):
+        stats = {
+            "enabled": self.has_relaxed_mixed_precision(),
+            "num_groups": 0,
+            "avg_max_prob": 1.0,
+            "avg_entropy": 0.0,
+        }
+        if not self.has_relaxed_mixed_precision():
+            return stats
+
+        max_probs = []
+        entropies = []
+        for qa in getattr(self, "qas", []):
+            if not hasattr(qa, "bit_logits"):
+                continue
+            temperature = float(max(getattr(qa, "get_temperature", lambda: 1.0)(), 1e-3))
+            probs = torch.softmax(qa.bit_logits.detach() / temperature, dim=0).clamp(min=1e-9)
+            max_probs.append(float(probs.max().item()))
+            entropies.append(float((-(probs * probs.log()).sum()).item()))
+        if max_probs:
+            stats["num_groups"] = len(max_probs)
+            stats["avg_max_prob"] = float(sum(max_probs) / len(max_probs))
+            stats["avg_entropy"] = float(sum(entropies) / len(entropies))
+        return stats
+
+    def get_mixed_precision_entropy_loss(self):
+        if not self.has_relaxed_mixed_precision():
+            device = self._xyz.device if hasattr(self, "_xyz") else "cuda"
+            return torch.tensor(0.0, device=device)
+        losses = []
+        for qa in getattr(self, "qas", []):
+            if hasattr(qa, "get_bit_entropy"):
+                losses.append(qa.get_bit_entropy())
+        if not losses:
+            device = self._xyz.device if hasattr(self, "_xyz") else "cuda"
+            return torch.tensor(0.0, device=device)
+        return torch.stack(losses).mean()
+
+    # 用HMQ时获取当前的量化位深情况
+    def get_mixed_precision_snapshot(self, max_quantizers_per_attr=10):
+        snapshots = []
+        if not self.has_relaxed_mixed_precision() or not hasattr(self, "qas"):
+            return snapshots
+
+        max_quantizers_per_attr = max(int(max_quantizers_per_attr), 1)
+        n_block = max(int(getattr(self, "n_block", 1)), 1)
+
+        for attr_group in ATTR_GROUP_ORDER:
+            entries = []
+            for dim_idx in self.get_attr_group_dims(attr_group):
+                qa_start = int(dim_idx) * n_block
+                qa_end = min(qa_start + n_block, len(self.qas))
+                for qa_idx in range(qa_start, qa_end):
+                    qa = self.qas[qa_idx]
+                    if not hasattr(qa, "candidate_bits"):
+                        continue
+                    temperature = float(max(getattr(qa, "get_temperature", lambda: 1.0)(), 1e-3))
+                    probs = torch.softmax(qa.bit_logits.detach() / temperature, dim=0).float().cpu()
+                    candidate_bits = [int(bit) for bit in getattr(qa, "candidate_bits", ())]
+                    mix_bitdepth = float(
+                        sum(float(bit) * float(prob) for bit, prob in zip(candidate_bits, probs.tolist()))
+                    )
+                    entries.append({
+                        "qa_idx": int(qa_idx),
+                        "dim_idx": int(dim_idx),
+                        "block_idx": int(qa_idx - qa_start),
+                        "mix_bitdepth": mix_bitdepth,
+                        "hard_bitdepth": int(qa.get_export_bit()) if hasattr(qa, "get_export_bit") else int(getattr(qa, "bit", 0)),
+                        "temperature": temperature,
+                        "candidate_bits": candidate_bits,
+                        "probabilities": [float(v) for v in probs.tolist()],
+                    })
+                    if len(entries) >= max_quantizers_per_attr:
+                        break
+                if len(entries) >= max_quantizers_per_attr:
+                    break
+            snapshots.append({
+                "attr_group": attr_group,
+                "entries": entries,
+            })
+        return snapshots
+
+    # 用HMQ时打印的量化位深情况
+    def print_mixed_precision_snapshot(self, iteration, max_quantizers_per_attr=10):
+        if not self.has_relaxed_mixed_precision():
+            return
+
+        snapshots = self.get_mixed_precision_snapshot(max_quantizers_per_attr=max_quantizers_per_attr)
+        print(f"\n{'='*100}")
+        print(
+            f"HMQ Mixed Bitdepth Snapshot [Iteration {int(iteration)}] "
+            f"(showing first {max(int(max_quantizers_per_attr), 1)} quantizers per attribute)"
+        )
+        print(f"{'='*100}")
+        for group_snapshot in snapshots:
+            attr_group = group_snapshot["attr_group"]
+            candidate_bits = list(self.candidate_bits_config.get(attr_group, (self.bit_config[attr_group],)))
+            print(f"[{attr_group}] candidates={candidate_bits}")
+            entries = group_snapshot["entries"]
+            if not entries:
+                print("  no relaxed quantizers")
+                continue
+            for entry in entries:
+                prob_text = ", ".join(
+                    f"{int(bit)}b:{float(prob):.4f}"
+                    for bit, prob in zip(entry["candidate_bits"], entry["probabilities"])
+                )
+                print(
+                    f"  qa={entry['qa_idx']:04d} dim={entry['dim_idx']:02d} block={entry['block_idx']:02d} "
+                    f"mix={entry['mix_bitdepth']:.4f}b hard={entry['hard_bitdepth']}b "
+                    f"tau={entry['temperature']:.4f} probs=[{prob_text}]"
+                )
+        print(f"{'='*100}")
+
+    def get_current_group_bit_config(self):
+        if not hasattr(self, "qas"):
+            return []
+        group_bits = []
+        for qa in self.qas:
+            if hasattr(qa, "get_export_bit"):
+                group_bits.append(int(qa.get_export_bit()))
+            else:
+                group_bits.append(int(getattr(qa, "bit", 8)))
+        return group_bits
+
+    def freeze_mixed_precision_group_bits(self):
+        group_bits = []
+        for qa in getattr(self, "qas", []):
+            if hasattr(qa, "freeze_bit"):
+                qa.freeze_bit()
+                group_bits.append(int(qa.get_export_bit()))
+            else:
+                group_bits.append(int(getattr(qa, "bit", 8)))
+        self.group_bit_config = group_bits
+        if group_bits:
+            self.dim_to_bit = collapse_group_bits_to_dim_bits(group_bits, getattr(self, "n_block", 1))
+        return group_bits
 
     def clear_static_eval_quant_cache(self):
         self._static_eval_quant_cache = None
@@ -1320,6 +1514,7 @@ class GaussianModel:
         dim_bits,
         laplace_scales,
         ac_len,
+        group_bits=None,
         signed_flags=None,
         laplace_means=None,
         laplace_zero_probs=None,
@@ -1355,8 +1550,9 @@ class GaussianModel:
                 continue
 
             dim_signed = True if signed_flags is None else bool(signed_flags[spec["dim_idx"]])
+            current_bit = int(group_bits[spec["qa_idx"]]) if group_bits is not None else int(dim_bits[spec["dim_idx"]])
             support_min, support_max = self.get_dim_range_from_bit(
-                dim_bits[spec["dim_idx"]],
+                current_bit,
                 signed=dim_signed,
             )
             cdf_info = self.build_laplace_cdf_info(
@@ -1821,7 +2017,7 @@ class GaussianModel:
 
         return q_raht_i
 
-    def decompress_laplace_groups(self, npz_data, ac_len, dim_bits, signed_flags=None):
+    def decompress_laplace_groups(self, npz_data, ac_len, dim_bits, signed_flags=None, group_bits=None):
         q_raht_i = np.zeros((ac_len, 55), dtype=np.float32)
         scales = np.asarray(npz_data["laplace_scale"], dtype=np.float32).reshape(-1)
         means = (
@@ -1848,8 +2044,9 @@ class GaussianModel:
                 continue
 
             dim_signed = True if signed_flags is None else bool(signed_flags[spec["dim_idx"]])
+            current_bit = int(group_bits[spec["qa_idx"]]) if group_bits is not None else int(dim_bits[spec["dim_idx"]])
             support_min, support_max = self.get_dim_range_from_bit(
-                dim_bits[spec["dim_idx"]],
+                current_bit,
                 signed=dim_signed,
             )
             cdf_info = self.build_laplace_cdf_info(
@@ -2037,12 +2234,15 @@ class GaussianModel:
 
         # 添加量化器的学习参数到优化器
         quant_scale_params, quant_zero_point_params, quant_other_params = self.get_quantizer_trainable_param_groups()
+        quant_bit_logits_params = self.get_quantizer_bit_logits_params()
         if quant_scale_params:
             l.append({'params': quant_scale_params, 'lr': training_args.quant_scale_lr, "name": "quant_scales"})
         if quant_zero_point_params:
             l.append({'params': quant_zero_point_params, 'lr': training_args.quant_zero_point_lr, "name": "quant_zero_points"})
         if quant_other_params:
             l.append({'params': quant_other_params, 'lr': training_args.quant_scale_lr, "name": "quantizers"})
+        if quant_bit_logits_params:
+            l.append({'params': quant_bit_logits_params, 'lr': training_args.bit_logits_lr, "name": "bit_logits"})
         
         # 使用eb在线或离线拟合分布时，ans_entropy_bottlenecks 主参数组的学习率
         if hasattr(self, 'ans_entropy_bottlenecks') and len(self.ans_entropy_bottlenecks) > 0:
@@ -2082,12 +2282,15 @@ class GaussianModel:
         
         # 添加量化器的学习参数到优化器
         quant_scale_params, quant_zero_point_params, quant_other_params = self.get_quantizer_trainable_param_groups()
+        quant_bit_logits_params = self.get_quantizer_bit_logits_params()
         if quant_scale_params:
             l.append({'params': quant_scale_params, 'lr': training_args.quant_scale_lr, "name": "quant_scales"})
         if quant_zero_point_params:
             l.append({'params': quant_zero_point_params, 'lr': training_args.quant_zero_point_lr, "name": "quant_zero_points"})
         if quant_other_params:
             l.append({'params': quant_other_params, 'lr': training_args.quant_scale_lr, "name": "quantizers"})
+        if quant_bit_logits_params:
+            l.append({'params': quant_bit_logits_params, 'lr': training_args.bit_logits_lr, "name": "bit_logits"})
         
         # 使用eb在线或离线拟合分布时，ans_entropy_bottlenecks 主参数组的学习率
         if hasattr(self, 'ans_entropy_bottlenecks') and len(self.ans_entropy_bottlenecks) > 0:
@@ -2407,17 +2610,20 @@ class GaussianModel:
                 )
                 qci = qci_tensor.detach().cpu().numpy().astype(np.float32)
                 trans_array.extend(trans)
+                group_bits = self.get_current_group_bit_config()
                 dim_bits = []
                 dim_ranges = []
                 signed_flags = []
-                qa_cnt = 0
-
                 for dim_idx in range(C.shape[-1]):
-                    qas_for_dim = self.qas[qa_cnt: qa_cnt + len(split)]
-                    dim_bits.append(qas_for_dim[0].bit)
-                    dim_ranges.append((int(qas_for_dim[0].thd_neg), int(qas_for_dim[0].thd_pos)))
-                    signed_flags.append(int(qas_for_dim[0].thd_neg < 0))
-                    qa_cnt += len(split)
+                    qa = self.qas[dim_idx * len(split)]
+                    current_bit = int(group_bits[dim_idx * len(split)])
+                    dim_bits.append(current_bit)
+                    if hasattr(qa, "get_thresholds_for_bit"):
+                        thd_neg, thd_pos = qa.get_thresholds_for_bit(current_bit)
+                    else:
+                        thd_neg, thd_pos = int(qa.thd_neg), int(qa.thd_pos)
+                    dim_ranges.append((int(thd_neg), int(thd_pos)))
+                    signed_flags.append(int(thd_neg < 0))
 
                 group_data = self.build_ans_group_tensors_from_qci(qci)
                 if is_ans:
@@ -2467,6 +2673,7 @@ class GaussianModel:
                         dim_bits,
                         laplace_scales,
                         ac_len,
+                        group_bits=group_bits,
                         signed_flags=signed_flags,
                         laplace_means=laplace_means,
                         laplace_zero_probs=laplace_zero_probs,
@@ -2480,6 +2687,7 @@ class GaussianModel:
 
                 save_dict['f'] = cf
                 save_dict['bit_config'] = np.array(dim_bits, dtype=np.uint8)
+                save_dict['group_bit_config'] = np.array(group_bits, dtype=np.uint8)
                 save_dict['signed_config'] = np.array(signed_flags, dtype=np.uint8)
                 np.savez(os.path.join(bin_dir, 'orgb.npz'), **save_dict)
 
@@ -2740,12 +2948,16 @@ class GaussianModel:
         self,
         n_block,
         bit_config=None,
+        group_bit_config=None,
+        candidate_bits_config=None,
         quant_type="vanilla",
         encode="deflate",
         ans_subgroup_count=1,
         lsqplus_learnbeta=False,
         vanilla_withzeropoint=None,
         use_center_inflated_laplace=True,
+        mixed_precision_relax=False,
+        gumbel_tau_init=1.0,
         adaptive_block_quant=False,
         adaptive_bootstrap_iters=200,
         adaptive_update_interval=8,
@@ -2781,6 +2993,8 @@ class GaussianModel:
         self.lsqplus_learnbeta = bool(lsqplus_learnbeta)
         self.vanilla_withzeropoint = vanilla_withzeropoint
         self.use_center_inflated_laplace = bool(use_center_inflated_laplace)
+        self.mixed_precision_relax_enabled = bool(mixed_precision_relax) and self.quant_type == "vanilla"
+        self.mixed_precision_gumbel_tau = float(gumbel_tau_init)
         self.adaptive_block_quant_enabled = bool(adaptive_block_quant)
         self.adaptive_bootstrap_iters = int(adaptive_bootstrap_iters)
         self.adaptive_update_interval = int(adaptive_update_interval)
@@ -2795,17 +3009,13 @@ class GaussianModel:
         
         # 默认配置：所有属性8-bit
         if bit_config is None:
-            bit_config = {
-                'opacity': 8,
-                'euler': 8,
-                'f_dc': 8,
-                'f_rest_0': 8,
-                'f_rest_1': 8,
-                'f_rest_2': 8,
-                'scale': 8
-            }
+            bit_config = build_default_bit_config()
         
-        self.bit_config = bit_config
+        self.bit_config = {key: int(value) for key, value in bit_config.items()}
+        self.candidate_bits_config = {
+            key: tuple(int(v) for v in values)
+            for key, values in (candidate_bits_config or {}).items()
+        }
         
         # 特征维度分配：
         # 0: opacity (1)
@@ -2819,29 +3029,38 @@ class GaussianModel:
         dim_to_bit = []
         
         # opacity (1维)
-        dim_to_bit.extend([bit_config['opacity']] * 1)
+        dim_to_bit.extend([self.bit_config['opacity']] * 1)
         
         # euler (3维)
-        dim_to_bit.extend([bit_config['euler']] * 3)
+        dim_to_bit.extend([self.bit_config['euler']] * 3)
         
         # f_dc (3维)
-        dim_to_bit.extend([bit_config['f_dc']] * 3)
+        dim_to_bit.extend([self.bit_config['f_dc']] * 3)
         
         # f_rest_0 (9维) - sh_1
-        dim_to_bit.extend([bit_config['f_rest_0']] * 9)
+        dim_to_bit.extend([self.bit_config['f_rest_0']] * 9)
         
         # f_rest_1 (16维) - sh_2
-        dim_to_bit.extend([bit_config['f_rest_1']] * 15)
+        dim_to_bit.extend([self.bit_config['f_rest_1']] * 15)
         
         # f_rest_2 (21维) - sh_3
-        dim_to_bit.extend([bit_config['f_rest_2']] * 21)
+        dim_to_bit.extend([self.bit_config['f_rest_2']] * 21)
         
         # scale (3维)
-        dim_to_bit.extend([bit_config['scale']] * 3)
+        dim_to_bit.extend([self.bit_config['scale']] * 3)
         
         assert len(dim_to_bit) == 55, f"维度配置错误: {len(dim_to_bit)} != 55"
         
         self.dim_to_bit = dim_to_bit
+        if group_bit_config is None:
+            self.group_bit_config = expand_dim_bits_to_group_bits(self.dim_to_bit, n_block)
+        else:
+            if len(group_bit_config) != 55 * int(n_block):
+                raise ValueError(
+                    f"group_bit_config length {len(group_bit_config)} does not match 55 * n_block ({55 * int(n_block)})"
+                )
+            self.group_bit_config = [int(bit) for bit in group_bit_config]
+            self.dim_to_bit = collapse_group_bits_to_dim_bits(self.group_bit_config, n_block)
         
         self.ans_entropy_bottlenecks = nn.ModuleDict()
         self.init_adaptive_quant_state(n_dims=len(self.dim_to_bit), n_block=n_block)
@@ -2849,15 +3068,32 @@ class GaussianModel:
         # 创建量化器
         self.qas = nn.ModuleList([])
         for dim_idx in range(55):
-            bit = dim_to_bit[dim_idx]
+            attr_group = self.get_attr_group_name(dim_idx)
+            candidate_bits = self.candidate_bits_config.get(attr_group, ())
 
-            for _ in range(n_block):
+            for block_idx in range(n_block):
+                qa_idx = len(self.qas)
+                bit = int(self.group_bit_config[qa_idx])
                 eb = None
                 if encode.lower() == "ans":
-                    qa_key = self.get_ans_block_key(len(self.qas))
+                    qa_key = self.get_ans_block_key(qa_idx)
                     eb = EntropyBottleneck(1).cuda()
                     self.ans_entropy_bottlenecks[qa_key] = eb
-                if quant_type.lower() == "lsq":
+                if self.mixed_precision_relax_enabled:
+                    if len(candidate_bits) == 0:
+                        candidate_bits = (bit,)
+                    qa_module = RelaxedVanillaQuan(
+                        bit=bit,
+                        candidate_bits=candidate_bits,
+                        all_positive=False,
+                        symmetric=False,
+                        withzeropoint=vanilla_withzeropoint,
+                        encode=encode,
+                        shared_eb=eb,
+                        adaptive_block_quant=adaptive_block_quant,
+                        temperature=self.mixed_precision_gumbel_tau,
+                    ).cuda()
+                elif quant_type.lower() == "lsq":
                     qa_module = LsqQuan(
                         bit=bit,
                         init_yet=False,
@@ -2894,6 +3130,8 @@ class GaussianModel:
         print('初始化量化器')
         print('='*50)
         print(f'量化器类型: {quant_type.upper()}')
+        if self.mixed_precision_relax_enabled:
+            print(f'Mixed-precision relax: ON (tau={self.mixed_precision_gumbel_tau:.3f})')
         if quant_type.lower() in ("lsqplus", "lsq+"):
             print(f'LSQPlus offset mode: {"beta" if self.lsqplus_learnbeta else "zero_point"}')
         if quant_type.lower() == "vanilla":
@@ -2902,13 +3140,17 @@ class GaussianModel:
         print(f'块数量: {n_block}')
         print()
         print('量化位数配置:')
-        print(f'  opacity (1维):      {bit_config["opacity"]}-bit')
-        print(f'  euler (3维):        {bit_config["euler"]}-bit')
-        print(f'  f_dc (3维):         {bit_config["f_dc"]}-bit')
-        print(f'  f_rest_0 (9维):    {bit_config["f_rest_0"]}-bit  [SH degree 1]')
-        print(f'  f_rest_1 (15维):    {bit_config["f_rest_1"]}-bit  [SH degree 2]')
-        print(f'  f_rest_2 (21维):    {bit_config["f_rest_2"]}-bit  [SH degree 3]')
-        print(f'  scale (3维):        {bit_config["scale"]}-bit')
+        print(f'  opacity (1维):      {self.bit_config["opacity"]}-bit')
+        print(f'  euler (3维):        {self.bit_config["euler"]}-bit')
+        print(f'  f_dc (3维):         {self.bit_config["f_dc"]}-bit')
+        print(f'  f_rest_0 (9维):    {self.bit_config["f_rest_0"]}-bit  [SH degree 1]')
+        print(f'  f_rest_1 (15维):    {self.bit_config["f_rest_1"]}-bit  [SH degree 2]')
+        print(f'  f_rest_2 (21维):    {self.bit_config["f_rest_2"]}-bit  [SH degree 3]')
+        print(f'  scale (3维):        {self.bit_config["scale"]}-bit')
+        if self.mixed_precision_relax_enabled:
+            print('候选位深配置:')
+            for attr_group in ATTR_GROUP_ORDER:
+                print(f"  {attr_group:<12s}: {list(self.candidate_bits_config.get(attr_group, (self.bit_config[attr_group],)))}")
         print('='*50)
     
     
@@ -3333,11 +3575,13 @@ class GaussianModel:
         # 检查是否有量化位数配置（新格式）
         expected_params_without_bits = 2 + 55 * n_block * 2  # depth + n_block + (scale+zp)*55*n_block
         expected_params_with_bits = expected_params_without_bits + 55  # + 55个bit配置
+        expected_params_with_group_bits = expected_params_without_bits + 55 * n_block
         
         if len(trans_array) == expected_params_with_bits:
             # 新格式：包含每个维度的bit配置
             dim_bits = trans_array[expected_params_without_bits:].astype(int)
             self.dim_to_bit = dim_bits.tolist()
+            self.group_bit_config = expand_dim_bits_to_group_bits(self.dim_to_bit, n_block)
             print(f'  检测到多位数配置: {set(dim_bits)} bits')
             print(f'    opacity: {dim_bits[0]}-bit')
             print(f'    euler: {dim_bits[1]}-bit')
@@ -3346,13 +3590,23 @@ class GaussianModel:
             print(f'    f_rest_1: {dim_bits[22]}-bit')
             print(f'    f_rest_2: {dim_bits[37]}-bit')
             print(f'    scale: {dim_bits[52]}-bit')
+        elif len(trans_array) == expected_params_with_group_bits:
+            group_bits = trans_array[expected_params_without_bits:].astype(int)
+            self.group_bit_config = group_bits.tolist()
+            self.dim_to_bit = collapse_group_bits_to_dim_bits(self.group_bit_config, n_block)
+            print(f'  检测到按块位深配置: {set(group_bits)} bits')
         elif len(trans_array) == expected_params_without_bits:
             # 旧格式：所有维度8-bit
             self.dim_to_bit = [8] * 55
+            self.group_bit_config = expand_dim_bits_to_group_bits(self.dim_to_bit, n_block)
             print(f'  使用默认配置: 所有维度 8-bit')
         else:
-            print(f'  警告: 参数数量不匹配 ({len(trans_array)} vs {expected_params_with_bits} or {expected_params_without_bits})')
+            print(
+                f'  警告: 参数数量不匹配 ({len(trans_array)} vs '
+                f'{expected_params_with_bits} / {expected_params_with_group_bits} / {expected_params_without_bits})'
+            )
             self.dim_to_bit = [8] * 55
+            self.group_bit_config = expand_dim_bits_to_group_bits(self.dim_to_bit, n_block)
         
         # Load octree structure
         oct_vals = np.load(os.path.join(bin_dir , 'oct.npz'))
@@ -3407,20 +3661,35 @@ class GaussianModel:
             self.res_inv = inv_haar3D_param(V, depth)
             self.update_raht_subgroups()
 
-            if 'bit_config' in oef_vals:
+            group_bits = None
+            if 'group_bit_config' in oef_vals:
+                group_bits = oef_vals['group_bit_config'].astype(int).tolist()
+                self.group_bit_config = group_bits
+                self.dim_to_bit = collapse_group_bits_to_dim_bits(group_bits, n_block)
+                dim_bits = self.dim_to_bit
+                print(f"    {'Laplace' if is_laplace_packed else 'ANS'} 按块位宽配置: {set(group_bits)} bits")
+            elif 'bit_config' in oef_vals:
                 dim_bits = oef_vals['bit_config'].astype(int).tolist()
                 self.dim_to_bit = dim_bits
+                self.group_bit_config = expand_dim_bits_to_group_bits(dim_bits, n_block)
                 print(f"    {'Laplace' if is_laplace_packed else 'ANS'} 位宽配置: {set(dim_bits)} bits")
             else:
                 dim_bits = [8] * 55
                 self.dim_to_bit = dim_bits
+                self.group_bit_config = expand_dim_bits_to_group_bits(dim_bits, n_block)
             if 'signed_config' in oef_vals:
                 signed_flags = oef_vals['signed_config'].astype(int).tolist()
             else:
                 signed_flags = [1] * len(dim_bits)
 
             if is_laplace_packed:
-                q_raht_i = self.decompress_laplace_groups(oef_vals, ac_len, dim_bits, signed_flags=signed_flags)
+                q_raht_i = self.decompress_laplace_groups(
+                    oef_vals,
+                    ac_len,
+                    dim_bits,
+                    signed_flags=signed_flags,
+                    group_bits=self.group_bit_config,
+                )
             else:
                 q_raht_i = self.decompress_ans_groups(oef_vals, ac_len)
             q_raht_i = torch.tensor(q_raht_i, dtype=torch.float, device="cuda")
@@ -3432,18 +3701,33 @@ class GaussianModel:
             print(f'  检测到位打包格式')
             
             # 获取位宽配置
-            if 'bit_config' in oef_vals:
+            if 'group_bit_config' in oef_vals:
+                group_bits = oef_vals['group_bit_config'].tolist()
+                self.group_bit_config = [int(v) for v in group_bits]
+                dim_bits = collapse_group_bits_to_dim_bits(self.group_bit_config, n_block)
+                self.dim_to_bit = dim_bits
+                print(f'    从文件读取按块位宽配置: {set(group_bits)} bits')
+            elif 'bit_config' in oef_vals:
                 # 新格式：位宽配置存储在文件中
                 dim_bits = oef_vals['bit_config'].tolist()
+                self.group_bit_config = expand_dim_bits_to_group_bits(dim_bits, n_block)
                 print(f'    从文件读取位宽配置: {set(dim_bits)} bits')
             else:
                 # 旧格式：从 trans_array 中获取
                 expected_params_without_bits = 2 + 55 * n_block * 2
-                if len(trans_array) > expected_params_without_bits:
+                if len(trans_array) == expected_params_without_bits + 55 * n_block:
+                    group_bits = trans_array[expected_params_without_bits:].astype(int).tolist()
+                    self.group_bit_config = [int(v) for v in group_bits]
+                    dim_bits = collapse_group_bits_to_dim_bits(self.group_bit_config, n_block)
+                    self.dim_to_bit = dim_bits
+                    print(f'    从参数数组读取按块位宽配置: {set(group_bits)} bits')
+                elif len(trans_array) > expected_params_without_bits:
                     dim_bits = trans_array[expected_params_without_bits:].astype(int).tolist()
+                    self.group_bit_config = expand_dim_bits_to_group_bits(dim_bits, n_block)
                     print(f'    从参数数组读取位宽配置: {set(dim_bits)} bits')
                 else:
                     dim_bits = self.dim_to_bit
+                    self.group_bit_config = expand_dim_bits_to_group_bits(dim_bits, n_block)
                     print(f'    使用默认位宽配置: {set(dim_bits)} bits')
             
             print(f'    总位数: {sum(dim_bits)} bits/point')

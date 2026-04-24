@@ -18,7 +18,7 @@ from diff_gaussian_rasterization import (GaussianRasterizationSettings,
                                          GaussianRasterizerIndexed)
 from torch.autograd import Function
 
-from raht_torch import itransform_batched_torch, transform_batched_torch
+from raht_torch_mwh import itransform_batched_torch, transform_batched_torch
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
 from utils.quant_utils import (
@@ -788,8 +788,8 @@ def ft_render(
         "viewspace_points": screenspace_points,
         "visibility_filter": radii > 0,
         "radii": radii,
-        "total_bits": total_ans_bits
     }
+    result["total_bits"] = total_ans_bits
     
     # 如果使用RAHT且在训练模式，返回AC系数用于稀疏性损失
     if raht and training and 'C' in locals():

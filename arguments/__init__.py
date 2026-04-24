@@ -88,6 +88,7 @@ class ModelParams(ParamGroup):
         self.rate_grad_diag_interval=10
         self.rate_grad_diag_step=1e-4
         self.ans_subgroup_count=1
+        #------------使用公式进行自适应量化的配置（start）-------------------
         self.adaptive_block_quant=False  #使用公式进行自适应量化的开关
         self.adaptive_bootstrap_iters=200  
         self.adaptive_update_interval=8  
@@ -98,6 +99,27 @@ class ModelParams(ParamGroup):
         self.adaptive_step_clip_min=0.001
         self.adaptive_step_clip_max=2.0
         self.adaptive_keep_vanilla_zero_point=True
+        #------------使用公式进行自适应量化的配置（end）--------------------------
+        #######################################################################
+        #------------使用HMQ第一阶段选出最佳量化位深的配置（start）----------------
+        self.mixed_precision_relax=False  #HMQ中混合精度训练的松弛机制开关，第一阶段确定最佳位深
+        self.opacity_bit_candidates="8,9,10,11"
+        self.euler_bit_candidates="8,9,10,11"
+        self.f_dc_bit_candidates="8,9,10,11"
+        self.f_rest_0_bit_candidates="1,2,3,4"
+        self.f_rest_1_bit_candidates="1,2,3,4"
+        self.f_rest_2_bit_candidates="1,2,3,4"
+        self.scale_bit_candidates="9,10,11,12"
+        self.gumbel_tau_init=1.0    # 初始化温度系数
+        self.gumbel_tau_final=0.1   # 结束的温度系数
+        self.gumbel_anneal_iters=1000  # Gumbel退火迭代次数，0表示不退火，但如果为0，则迭代次数为stage1_max_frac*total_iters
+        self.bit_entropy_lambda=0.002 # bitdepth Gumbel-sofmax阶段的位熵损失权重，希望候选位深的概率熵小（也就是稳定）
+        self.stage1_min_frac=0.1    # HMQ最少迭代比例，如果gumbel_anneal_iters=0，迭代次数为stage1_max_frac*total_iters
+        self.stage1_max_frac=0.5    # HMQ最多迭代比例
+        self.stage1_sharpness_threshold=0.8
+        self.stage1_sharpness_patience=100
+        #------------使用HMQ第一阶段选出最佳量化位深的配置（end）----------------  
+        #使用eb拟合分布压缩时候需要离线拟合提高分布准确性
         self.export_ans_offline_fit=False
         self.export_ans_offline_fit_steps=100
         self.export_ans_offline_fit_plot_interval=100
@@ -142,6 +164,7 @@ class OptimizationParams(ParamGroup):
         self.rotation_lr = 0.001
         self.quant_scale_lr = 0.0001  # LSQ和LSQ+时的scale学习率
         self.quant_zero_point_lr = 0.0001 # LSQ+ offset（zero_point / beta）学习率
+        self.bit_logits_lr = 0.0005
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
         self.densification_interval = 100

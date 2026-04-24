@@ -3,6 +3,7 @@ import time
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.autograd import Function
 from compressai.entropy_models import EntropyBottleneck
 
@@ -575,6 +576,385 @@ def _write_quant_buffer(module, name, value):
         setattr(module, name, value.clone())
 
 
+def _compute_quant_thresholds(bit, all_positive, symmetric=False, adaptive_block_quant=False):
+    bit = int(bit)
+    if all_positive:
+        if symmetric:
+            raise AssertionError("Positive quantization cannot be symmetric")
+        thd_neg = 0
+        thd_pos = 2 ** bit - 1
+    else:
+        if symmetric:
+            thd_neg = -2 ** (bit - 1) + 1
+            thd_pos = 2 ** (bit - 1) - 1
+        else:
+            thd_neg = -2 ** (bit - 1)
+            thd_pos = 2 ** (bit - 1) - 1
+    if adaptive_block_quant:
+        thd_neg -= 10000
+        thd_pos += 10000
+    return int(thd_neg), int(thd_pos)
+
+
+def _estimate_single_group_laplace_bits(qa, symbols, zero_point, thd_neg, thd_pos):
+    if symbols.numel() == 0:
+        return symbols.new_zeros(())
+
+    symbols = symbols.reshape(1, 1, -1)
+    split_tensor = torch.tensor([symbols.shape[-1]], device=symbols.device, dtype=torch.long)
+    uses_zero_point = bool(getattr(qa, "withzeropoint", False))
+    zero_mean = (not uses_zero_point) and float(thd_neg) < 0.0 < float(thd_pos)
+    zero_inflation = bool(getattr(qa, "use_center_inflated_laplace", True)) and (zero_mean or uses_zero_point)
+    center_symbol = float(zero_point.item()) if uses_zero_point else 0.0
+
+    total_bits, _, _, _, _ = _estimate_zero_inflated_laplace_bits(
+        symbols,
+        split_tensor,
+        zero_mean_mask=torch.tensor([[[zero_mean]]], device=symbols.device, dtype=torch.bool),
+        zero_inflation_mask=torch.tensor([[[zero_inflation]]], device=symbols.device, dtype=torch.bool),
+        center_symbol_tensor=torch.tensor(
+            [[[center_symbol]]],
+            device=symbols.device,
+            dtype=symbols.dtype,
+        ),
+    )
+    return total_bits
+
+
+def _batched_relaxed_quantize_blocks(
+    x,
+    split,
+    qas,
+    return_symbols=False,
+    return_trans=False,
+    return_ans_bits=False,
+    return_profile=False,
+    profile_time=False,
+):
+    squeeze_output = False
+    if x.dim() == 1:
+        x = x.reshape(-1, 1)
+        squeeze_output = True
+    elif x.dim() != 2:
+        raise ValueError(f"Expected x to be 1D or 2D, got shape {tuple(x.shape)}")
+
+    quant_profile = {
+        "index_prepare": 0.0,
+        "pack_scatter": 0.0,
+        "block_stat": 0.0,
+        "quant_param_update": 0.0,
+        "quant_param_stack": 0.0,
+        "quant_core": 0.0,
+        "entropy_bits": 0.0,
+        "trans_collect": 0.0,
+        "total": 0.0,
+    } if return_profile else None
+    total_start = None
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        total_start = time.perf_counter()
+
+    flat_qas = list(qas)
+    n_points, n_dims = x.shape
+    n_blocks = len(split)
+    expected_qas = n_dims * n_blocks
+    if len(flat_qas) != expected_qas:
+        raise ValueError(f"Expected {expected_qas} quantizers, got {len(flat_qas)}")
+    if not all(hasattr(qa, "candidate_bits") for qa in flat_qas):
+        raise ValueError("Relaxed quantization expects every quantizer to define candidate_bits.")
+
+    stage_start = None
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        stage_start = time.perf_counter()
+    split_tensor, block_ids, local_ids = _build_block_index_tensors(split, x.device)
+    if int(split_tensor.sum().item()) != n_points:
+        raise ValueError(f"Split sum {int(split_tensor.sum().item())} does not match input length {n_points}")
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["index_prepare"] = time.perf_counter() - stage_start
+
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        stage_start = time.perf_counter()
+    max_block_len = int(split_tensor.max().item())
+    xt = x.transpose(0, 1).contiguous()
+    packed = xt.new_zeros((n_dims, n_blocks, max_block_len))
+    packed[:, block_ids, local_ids] = xt
+    out_packed = packed.new_zeros(packed.shape)
+    symbol_packed = packed.new_zeros(packed.shape) if return_symbols else None
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["pack_scatter"] = time.perf_counter() - stage_start
+
+    trans = [] if return_trans else None
+    ans_bits = x.new_zeros(())
+    encode_mode = getattr(flat_qas[0], "encode", "deflate").lower()
+    if return_ans_bits and encode_mode == "ans":
+        raise NotImplementedError(
+            "Relaxed mixed-precision currently supports Laplace rate estimation only."
+        )
+
+    use_soft_relaxation = torch.is_grad_enabled() and not return_symbols and not return_trans
+
+    candidate_count = len(flat_qas[0].candidate_bits)
+    can_use_candidate_major = (
+        use_soft_relaxation
+        and not return_ans_bits
+        and all(len(qa.candidate_bits) == candidate_count for qa in flat_qas)
+    )
+
+    if can_use_candidate_major:
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
+        valid_mask = (
+            torch.arange(max_block_len, device=x.device, dtype=torch.long)
+            .view(1, 1, -1)
+            < split_tensor.view(1, n_blocks, 1)
+        )
+        abs_packed = packed.abs()
+        neg_fill = torch.full_like(packed, torch.finfo(packed.dtype).min)
+        pos_fill = torch.full_like(packed, torch.finfo(packed.dtype).max)
+        block_abs_max = torch.where(valid_mask, abs_packed, abs_packed.new_zeros(1)).amax(dim=-1)
+        block_max = torch.where(valid_mask, packed, neg_fill).amax(dim=-1)
+        block_min = torch.where(valid_mask, packed, pos_fill).amin(dim=-1)
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            quant_profile["block_stat"] = time.perf_counter() - stage_start
+
+        flat_block_max = block_max.reshape(-1).detach()
+        flat_block_min = block_min.reshape(-1).detach()
+        flat_block_abs_max = block_abs_max.reshape(-1).detach()
+        valid_groups_flat = (
+            (split_tensor > 0)
+            .view(1, n_blocks)
+            .expand(n_dims, n_blocks)
+            .reshape(-1)
+        )
+
+        with_zero_point = bool(getattr(flat_qas[0], "withzeropoint", False))
+        all_positive = bool(getattr(flat_qas[0], "all_positive", False))
+        symmetric = bool(getattr(flat_qas[0], "symmetric", False))
+        adaptive_block_quant = bool(getattr(flat_qas[0], "adaptive_block_quant", False))
+
+        prev_max_flat = torch.cat(
+            [
+                _flatten_quant_buffer(qa.max_val, float("-inf"), x.device, x.dtype)
+                for qa in flat_qas
+            ],
+            dim=0,
+        )
+        prev_min_flat = torch.cat(
+            [
+                _flatten_quant_buffer(qa.min_val, float("inf"), x.device, x.dtype)
+                for qa in flat_qas
+            ],
+            dim=0,
+        )
+
+        if with_zero_point:
+            updated_max_flat = torch.maximum(prev_max_flat, flat_block_max)
+            updated_min_flat = torch.minimum(prev_min_flat, flat_block_min)
+            if all_positive:
+                updated_max_flat = torch.clamp(updated_max_flat, min=0.0)
+                updated_min_flat = torch.clamp(updated_min_flat, max=0.0)
+            updated_max_flat = torch.maximum(
+                updated_max_flat,
+                updated_min_flat + updated_max_flat.new_tensor(1e-8),
+            )
+        elif all_positive:
+            updated_max_flat = torch.maximum(prev_max_flat, flat_block_max).clamp(min=1e-8)
+            updated_min_flat = torch.zeros_like(updated_max_flat)
+        else:
+            updated_max_flat = torch.maximum(prev_max_flat, flat_block_abs_max).clamp(min=1e-8)
+            updated_min_flat = -updated_max_flat
+
+        invalid_max_default = torch.ones_like(updated_max_flat)
+        if with_zero_point or all_positive:
+            invalid_min_default = torch.zeros_like(updated_min_flat)
+        else:
+            invalid_min_default = -torch.ones_like(updated_min_flat)
+        updated_max_flat = torch.where(valid_groups_flat, updated_max_flat, invalid_max_default)
+        updated_min_flat = torch.where(valid_groups_flat, updated_min_flat, invalid_min_default)
+
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
+        with torch.no_grad():
+            for idx, qa in enumerate(flat_qas):
+                _write_quant_buffer(qa, "max_val", updated_max_flat[idx])
+                _write_quant_buffer(qa, "min_val", updated_min_flat[idx])
+        updated_max = updated_max_flat.detach().view(n_dims, n_blocks)
+        updated_min = updated_min_flat.detach().view(n_dims, n_blocks)
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            quant_profile["quant_param_update"] = time.perf_counter() - stage_start
+
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
+        prob_tensor = torch.stack(
+            [qa.get_bit_probabilities(sample=True, hard=False) for qa in flat_qas],
+            dim=0,
+        ).to(dtype=x.dtype).view(n_dims, n_blocks, candidate_count)
+        candidate_bits_tensor = torch.stack(
+            [qa.candidate_bits_tensor.to(device=x.device, dtype=x.dtype) for qa in flat_qas],
+            dim=0,
+        ).view(n_dims, n_blocks, candidate_count)
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            quant_profile["quant_param_stack"] = time.perf_counter() - stage_start
+
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
+        mixed_dequantized = packed.new_zeros(packed.shape)
+        for candidate_idx in range(candidate_count):
+            bits = candidate_bits_tensor[:, :, candidate_idx]
+            if all_positive:
+                thd_neg = torch.zeros_like(bits)
+                thd_pos = torch.pow(torch.full_like(bits, 2.0), bits) - 1.0
+            else:
+                half_range = torch.pow(torch.full_like(bits, 2.0), bits - 1.0)
+                thd_pos = half_range - 1.0
+                if symmetric:
+                    thd_neg = -half_range + 1.0
+                else:
+                    thd_neg = -half_range
+            if adaptive_block_quant:
+                thd_neg = thd_neg - 10000.0
+                thd_pos = thd_pos + 10000.0
+
+            if with_zero_point:
+                qrange = torch.clamp(thd_pos - thd_neg, min=1.0)
+                scales = torch.clamp((updated_max - updated_min) / qrange, min=1e-8)
+                offsets = thd_pos - (updated_max / scales)
+                offsets = torch.clamp(offsets, min=thd_neg, max=thd_pos).round()
+            else:
+                scales = torch.clamp(updated_max / torch.clamp(thd_pos, min=1.0), min=1e-8)
+                offsets = torch.zeros_like(scales)
+
+            scales = scales.unsqueeze(-1)
+            offsets = offsets.unsqueeze(-1)
+            thd_neg = thd_neg.unsqueeze(-1)
+            thd_pos = thd_pos.unsqueeze(-1)
+
+            if with_zero_point:
+                x_norm = offsets + (packed / scales)
+            else:
+                x_norm = packed / scales
+            x_clamped = torch.clamp(x_norm, thd_neg, thd_pos)
+            x_q = round_pass(x_clamped)
+            if with_zero_point:
+                dequantized = (x_q - offsets) * scales
+            else:
+                dequantized = x_q * scales
+            mixed_dequantized = mixed_dequantized + prob_tensor[:, :, candidate_idx].unsqueeze(-1) * dequantized
+
+        out_packed.copy_(mixed_dequantized)
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            quant_profile["quant_core"] = time.perf_counter() - stage_start
+    else:
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            stage_start = time.perf_counter()
+        for dim_idx in range(n_dims):
+            base = dim_idx * n_blocks
+            for block_idx, block_len in enumerate(split):
+                qa = flat_qas[base + block_idx]
+                block_len = int(block_len)
+                if block_len <= 0:
+                    continue
+                block_values = packed[dim_idx, block_idx, :block_len]
+                qa.update(block_values)
+
+                if use_soft_relaxation:
+                    probs = qa.get_bit_probabilities(sample=True, hard=False)
+                    mixed_dequantized = block_values.new_zeros(block_values.shape)
+                    mixed_bits = block_values.new_zeros(())
+                    for prob, bit in zip(probs, qa.candidate_bits):
+                        dequantized_k, symbols_k, _, zero_point_k, thd_neg_k, thd_pos_k = qa.quantize_with_bit(
+                            block_values,
+                            int(bit),
+                        )
+                        mixed_dequantized = mixed_dequantized + prob * dequantized_k
+                        if return_ans_bits and encode_mode == "laplace":
+                            mixed_bits = mixed_bits + prob * _estimate_single_group_laplace_bits(
+                                qa,
+                                symbols_k,
+                                zero_point_k,
+                                thd_neg_k,
+                                thd_pos_k,
+                            )
+                    out_packed[dim_idx, block_idx, :block_len] = mixed_dequantized
+                    ans_bits = ans_bits + mixed_bits
+                else:
+                    export_bit = qa.get_export_bit()
+                    qa.sync_export_quant_params(export_bit)
+                    dequantized, symbols, scale, zero_point, thd_neg, thd_pos = qa.quantize_with_bit(
+                        block_values,
+                        export_bit,
+                    )
+                    out_packed[dim_idx, block_idx, :block_len] = dequantized
+                    if symbol_packed is not None:
+                        symbol_packed[dim_idx, block_idx, :block_len] = symbols
+                    if trans is not None:
+                        trans.extend([float(scale.item()), float(zero_point.item())])
+                    if return_ans_bits and encode_mode == "laplace":
+                        ans_bits = ans_bits + _estimate_single_group_laplace_bits(
+                            qa,
+                            symbols,
+                            zero_point,
+                            thd_neg,
+                            thd_pos,
+                        )
+        if quant_profile is not None and profile_time:
+            _sync_profile_device(x.device)
+            quant_profile["quant_core"] = time.perf_counter() - stage_start
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["quant_core"] = time.perf_counter() - stage_start
+
+    flat_dequantized = out_packed[:, block_ids, local_ids].transpose(0, 1).contiguous()
+    flat_symbols = None
+    if symbol_packed is not None:
+        flat_symbols = symbol_packed[:, block_ids, local_ids].transpose(0, 1).contiguous()
+
+    if squeeze_output:
+        flat_dequantized = flat_dequantized.reshape(-1)
+        if flat_symbols is not None:
+            flat_symbols = flat_symbols.reshape(-1)
+
+    if quant_profile is not None and profile_time:
+        _sync_profile_device(x.device)
+        quant_profile["total"] = time.perf_counter() - total_start
+
+    if return_symbols and return_trans and return_ans_bits:
+        result = (flat_dequantized, flat_symbols, trans, ans_bits)
+    elif return_symbols and return_trans:
+        result = (flat_dequantized, flat_symbols, trans)
+    elif return_symbols and return_ans_bits:
+        result = (flat_dequantized, flat_symbols, ans_bits)
+    elif return_symbols:
+        result = (flat_dequantized, flat_symbols)
+    elif return_trans and return_ans_bits:
+        result = (flat_dequantized, trans, ans_bits)
+    elif return_trans:
+        result = (flat_dequantized, trans)
+    elif return_ans_bits:
+        result = (flat_dequantized, ans_bits)
+    else:
+        result = flat_dequantized
+
+    if return_profile:
+        if isinstance(result, tuple):
+            return (*result, quant_profile)
+        return result, quant_profile
+    return result
+
+
 def batched_quantize_blocks(
     x,
     split,
@@ -621,6 +1001,17 @@ def batched_quantize_blocks(
     expected_qas = n_dims * n_blocks
     if len(flat_qas) != expected_qas:
         raise ValueError(f"Expected {expected_qas} quantizers, got {len(flat_qas)}")
+    if any(hasattr(qa, "candidate_bits") for qa in flat_qas):
+        return _batched_relaxed_quantize_blocks(
+            x,
+            split,
+            flat_qas,
+            return_symbols=return_symbols,
+            return_trans=return_trans,
+            return_ans_bits=return_ans_bits,
+            return_profile=return_profile,
+            profile_time=profile_time,
+        )
 
     stage_start = None
     if quant_profile is not None and profile_time:
@@ -1521,3 +1912,182 @@ class VanillaQuan(Quantizer):
 
     def get_quant_params(self):
         return self.scale, self.zero_point, self.thd_neg < 0
+
+
+class RelaxedVanillaQuan(VanillaQuan):
+    def __init__(
+        self,
+        bit,
+        candidate_bits,
+        all_positive=True,
+        symmetric=False,
+        withzeropoint=None,
+        encode="deflate",
+        channels=1,
+        shared_eb=None,
+        adaptive_block_quant=False,
+        temperature=1.0,
+    ):
+        candidate_bits = sorted({int(v) for v in candidate_bits})
+        if len(candidate_bits) == 0:
+            raise ValueError("candidate_bits must contain at least one entry")
+        super().__init__(
+            bit=max(candidate_bits),
+            all_positive=all_positive,
+            symmetric=symmetric,
+            withzeropoint=withzeropoint,
+            encode=encode,
+            channels=channels,
+            shared_eb=shared_eb,
+            adaptive_block_quant=adaptive_block_quant,
+        )
+        self.candidate_bits = tuple(candidate_bits)
+        initial_bit = int(bit) if int(bit) in self.candidate_bits else int(self.candidate_bits[len(self.candidate_bits) // 2])
+        initial_idx = self.candidate_bits.index(initial_bit)
+        self.bit_logits = nn.Parameter(torch.zeros(len(self.candidate_bits)))
+        # 给基准位深更高的初始概率
+        #with torch.no_grad():
+        #    self.bit_logits.data[initial_idx] = 2.0
+        self.register_buffer(
+            "candidate_bits_tensor",
+            torch.tensor(self.candidate_bits, dtype=torch.float32),
+        )
+        self.register_buffer("temperature", torch.tensor([float(max(temperature, 1e-3))], dtype=torch.float32))
+        self.register_buffer("frozen_bit", torch.tensor([-1], dtype=torch.int32))
+        self.bit = initial_bit
+        self.hard_mode = False
+        self.last_bit_probs = None
+        self.sync_export_quant_params(self.bit)
+
+    def set_temperature(self, temperature):
+        self.temperature.fill_(float(max(temperature, 1e-3)))
+
+    def get_temperature(self):
+        return float(self.temperature.item())
+
+    def has_frozen_bit(self):
+        return int(self.frozen_bit.item()) > 0
+
+    def get_export_bit(self):
+        if self.has_frozen_bit():
+            return int(self.frozen_bit.item())
+        probs = torch.softmax(self.bit_logits.detach(), dim=0)
+        max_idx = int(torch.argmax(probs).item())
+        return int(self.candidate_bits[max_idx])
+
+    def get_bit_probabilities(self, sample=False, hard=False):
+        if self.has_frozen_bit():
+            export_bit = self.get_export_bit()
+            one_hot = self.bit_logits.new_zeros(self.bit_logits.shape)
+            one_hot[self.candidate_bits.index(export_bit)] = 1.0
+            self.last_bit_probs = one_hot.detach()
+            return one_hot
+
+        temperature = float(max(self.get_temperature(), 1e-3))
+        if sample:
+            probs = F.gumbel_softmax(self.bit_logits, tau=temperature, hard=bool(hard), dim=0)
+        else:
+            probs = torch.softmax(self.bit_logits / temperature, dim=0)
+            if hard:
+                max_idx = int(torch.argmax(probs).item())
+                hard_probs = probs.new_zeros(probs.shape)
+                hard_probs[max_idx] = 1.0
+                probs = hard_probs
+        self.last_bit_probs = probs.detach()
+        return probs
+
+    def get_bit_entropy(self):
+        temperature = float(max(self.get_temperature(), 1e-3))
+        probs = torch.softmax(self.bit_logits / temperature, dim=0)
+        probs = probs.clamp(min=1e-9)
+        return -(probs * probs.log()).sum()
+
+    def get_bit_sharpness(self):
+        temperature = float(max(self.get_temperature(), 1e-3))
+        probs = torch.softmax(self.bit_logits.detach() / temperature, dim=0)
+        return float(probs.max().item())
+
+    def freeze_bit(self, bit=None):
+        bit = self.get_export_bit() if bit is None else int(bit)
+        if bit not in self.candidate_bits:
+            raise ValueError(f"Bit {bit} not in candidate set {self.candidate_bits}")
+        self.frozen_bit.fill_(bit)
+        self.sync_export_quant_params(bit)
+
+    def unfreeze_bit(self):
+        self.frozen_bit.fill_(-1)
+
+    def get_thresholds_for_bit(self, bit):
+        return _compute_quant_thresholds(
+            bit,
+            all_positive=self.all_positive,
+            symmetric=self.symmetric,
+            adaptive_block_quant=self.adaptive_block_quant,
+        )
+
+    def _compute_quant_params_for_bit(self, bit):
+        thd_neg, thd_pos = self.get_thresholds_for_bit(bit)
+        qrange = max(float(thd_pos - thd_neg), 1.0)
+
+        if self.withzeropoint:
+            if self.max_val.nelement() == 0 or self.min_val.nelement() == 0:
+                scale = self.scale if self.scale.nelement() > 0 else self.zero_point.new_tensor(1.0)
+                zero_point = self.zero_point
+            else:
+                scale, zero_point = calcScaleZeroPoint(
+                    self.min_val,
+                    self.max_val,
+                    num_bits=int(bit),
+                    qmin=float(thd_neg),
+                    qmax=float(thd_pos),
+                )
+            scale = torch.clamp(scale.reshape(-1)[0], min=1e-8)
+            zero_point = zero_point.reshape(-1)[0].to(device=scale.device, dtype=scale.dtype)
+            return scale, zero_point, thd_neg, thd_pos
+
+        if self.all_positive:
+            max_val = self.max_val.reshape(-1)[0] if self.max_val.nelement() > 0 else self.zero_point.new_tensor(1.0)
+            max_val = torch.clamp(max_val, min=1e-8)
+            scale = torch.clamp(max_val / max(float(thd_pos), 1.0), min=1e-8)
+            zero_point = scale.new_zeros(())
+            return scale, zero_point, thd_neg, thd_pos
+
+        max_val = self.max_val.reshape(-1)[0] if self.max_val.nelement() > 0 else self.zero_point.new_tensor(1.0)
+        max_val = torch.clamp(max_val, min=1e-8)
+        scale = torch.clamp(max_val / max(float(thd_pos), 1.0), min=1e-8)
+        zero_point = scale.new_zeros(())
+        return scale, zero_point, thd_neg, thd_pos
+
+    def sync_export_quant_params(self, bit=None):
+        bit = self.get_export_bit() if bit is None else int(bit)
+        scale, zero_point, thd_neg, thd_pos = self._compute_quant_params_for_bit(bit)
+        self.bit = bit
+        self.thd_neg = int(thd_neg)
+        self.thd_pos = int(thd_pos)
+        with torch.no_grad():
+            _write_quant_buffer(self, "scale", scale.reshape(1))
+            if hasattr(self, "zero_point"):
+                self.zero_point.data.copy_(
+                    zero_point.to(device=self.zero_point.device, dtype=self.zero_point.dtype).reshape_as(self.zero_point)
+                )
+
+    def quantize_with_bit(self, x, bit):
+        bit = int(bit)
+        scale, zero_point, thd_neg, thd_pos = self._compute_quant_params_for_bit(bit)
+        x_norm = zero_point + (x / scale) if self.withzeropoint else x / scale
+        x_clamped = torch.clamp(x_norm, float(thd_neg), float(thd_pos))
+        x_symbols = round_pass(x_clamped)
+        if self.withzeropoint:
+            x_dequantized = scale * (x_symbols - zero_point)
+        else:
+            x_dequantized = scale * x_symbols
+        return x_dequantized, x_symbols, scale, zero_point, thd_neg, thd_pos
+
+    def forward(self, x):
+        self.update(x)
+        export_bit = self.get_export_bit()
+        self.sync_export_quant_params(export_bit)
+        x_dequantized, x_symbols, _, _, _, _ = self.quantize_with_bit(x, export_bit)
+        if self.encode.lower() == "ans":
+            self.last_clamped = x_symbols
+        return x_dequantized

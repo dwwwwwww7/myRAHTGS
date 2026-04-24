@@ -32,6 +32,16 @@ from utils.loss_utils import l1_loss, ssim
 
 MACRO_ENABLE_SAVE_PROBABILITY_PLOTS_SAVE_HOOK = True
 
+DEFAULT_STAGE_BIT_CONFIG = {
+    'opacity': 8,
+    'euler': 8,
+    'scale': 10,
+    'f_dc': 8,
+    'f_rest_0': 4,
+    'f_rest_1': 4,
+    'f_rest_2': 2,
+}
+
 try:
     from torch.utils.tensorboard import SummaryWriter
     TENSORBOARD_FOUND = True
@@ -54,6 +64,33 @@ def get_backward_detail_csv_path(csv_path):
     return str(path.with_name(path.stem + "_backward_detail" + path.suffix))
 
 
+def build_stage_bit_config():
+    return dict(DEFAULT_STAGE_BIT_CONFIG)
+
+
+def parse_bit_candidates(text_value, fallback_bit):
+    if text_value is None:
+        return (int(fallback_bit),)
+    values = []
+    for part in str(text_value).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        values.append(int(part))
+    values = sorted(set(values))
+    if not values:
+        values = [int(fallback_bit)]
+    return tuple(values)
+
+
+def build_mixed_precision_candidate_config(dataset, bit_config):
+    config = {}
+    for attr_group, fallback_bit in bit_config.items():
+        attr_name = f"{attr_group}_bit_candidates"
+        config[attr_group] = parse_bit_candidates(getattr(dataset, attr_name, None), fallback_bit)
+    return config
+
+
 def format_quant_config_summary(dataset, pipe, opt=None):
     target_quant_type = getattr(dataset, 'quant_type', 'unknown')
     active_quant_type = getattr(dataset, 'active_quant_type', target_quant_type)
@@ -66,6 +103,7 @@ def format_quant_config_summary(dataset, pipe, opt=None):
         #f"per_channel_quant={bool(getattr(dataset, 'per_channel_quant', False))}",
         f"n_block={int(getattr(dataset, 'n_block', getattr(pipe, 'n_block', 1)))}",
         f"adaptive_quant={bool(getattr(dataset, 'adaptive_block_quant', False))}",
+        f"mixed_precision={bool(getattr(dataset, 'mixed_precision_relax', False))}",
     ]
     
     # 用公式定义的自适应量化步长的各种参数
@@ -96,6 +134,8 @@ def format_quant_config_summary(dataset, pipe, opt=None):
     parts.extend([
             f"quant_scale_lr={float(getattr(opt, 'quant_scale_lr', 0.001)):.3g}",
             f"quant_zero_point_lr={float(getattr(opt, 'quant_zero_point_lr', 0.0005)):.3g}",
+            f"bit_logits_lr={float(getattr(opt, 'bit_logits_lr', 0.0005)):.3g}",
+            f"bit_entropy_lambda={float(getattr(dataset, 'bit_entropy_lambda', 0.0)):.3g}",
             ])
     # 优化器信息
     # if opt is not None:
@@ -118,6 +158,128 @@ def ensure_result_csv_initialized(csv_path, dataset, pipe, opt=None):
         else:
             f.write("\n")
         f.write("# CONFIG: " + format_quant_config_summary(dataset, pipe, opt) + "\n")
+
+
+def init_active_quantizers_for_training(
+    dataset,
+    gaussians,
+    quant_type_name,
+    mixed_precision_relax_enabled,
+    group_bit_config=None,
+):
+    dataset.active_quant_type = quant_type_name
+    stage_uses_relax = (
+        mixed_precision_relax_enabled
+        and str(quant_type_name).lower() == "vanilla"
+        and bool(getattr(dataset, "per_block_quant", False))
+    )
+    bit_config = build_stage_bit_config()
+    candidate_bits_config = build_mixed_precision_candidate_config(dataset, bit_config)
+    if stage_uses_relax:
+        for attr_group, candidate_bits in candidate_bits_config.items():
+            if len(candidate_bits) < 2:
+                raise ValueError(
+                    f"{attr_group}_bit_candidates must contain at least 2 candidate bits, got {candidate_bits}"
+                )
+
+    if dataset.per_channel_quant:
+        print("  量化模式：per_channel_quant")
+        dataset.n_block = 1
+        gaussians.init_qas(
+            dataset.n_block,
+            bit_config=bit_config,
+            group_bit_config=group_bit_config,
+            candidate_bits_config=candidate_bits_config,
+            quant_type=quant_type_name,
+            lsqplus_learnbeta=getattr(dataset, 'LSQplus_learnbeta', False),
+            vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
+            encode=getattr(dataset, 'encode', 'deflate'),
+            ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
+            use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
+            mixed_precision_relax=stage_uses_relax,
+            gumbel_tau_init=getattr(dataset, 'gumbel_tau_init', 1.0),
+            adaptive_block_quant=(getattr(dataset, 'adaptive_block_quant', False) and not stage_uses_relax),
+            adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
+            adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 8),
+            adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
+            adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
+            adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-6),
+            adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
+            adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
+            adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
+            adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
+        )
+        print("  通道量化: 启用")
+        return
+
+    if dataset.per_block_quant:
+        print("  量化模式：per_block_quant")
+        gaussians.init_qas(
+            dataset.n_block,
+            bit_config=bit_config,
+            group_bit_config=group_bit_config,
+            candidate_bits_config=candidate_bits_config,
+            quant_type=quant_type_name,
+            lsqplus_learnbeta=getattr(dataset, 'LSQplus_learnbeta', False),
+            vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
+            encode=getattr(dataset, 'encode', 'deflate'),
+            ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
+            use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
+            mixed_precision_relax=stage_uses_relax,
+            gumbel_tau_init=getattr(dataset, 'gumbel_tau_init', 1.0),
+            adaptive_block_quant=(getattr(dataset, 'adaptive_block_quant', False) and not stage_uses_relax),
+            adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
+            adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 10),
+            adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
+            adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
+            adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-8),
+            adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
+            adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
+            adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
+            adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
+        )
+        if stage_uses_relax:
+            print("  Mixed-precision relax: 启用")
+        return
+
+    print("未知的量化模式")
+
+
+def refresh_finetune_optimizers(gaussians, opt, encode_mode):
+    gaussians.finetuning_setup(copy.deepcopy(opt))
+
+    aux_optimizer = None
+    if encode_mode == "ans" and hasattr(gaussians, 'ans_entropy_bottlenecks'):
+        aux_quantiles = [eb.quantiles for eb in gaussians.ans_entropy_bottlenecks.values()]
+        if aux_quantiles:
+            aux_optimizer = torch.optim.Adam(aux_quantiles, lr=1e-3)
+            print(f"\n【ANS 编码】已启用，初始化 aux_optimizer 管理 {len(aux_quantiles)} 个 CDF 参数")
+    return aux_optimizer
+
+
+def maybe_update_relax_temperature(gaussians, dataset, iteration, relax_stage_max_iter):
+    if not gaussians.has_relaxed_mixed_precision():
+        return None
+    tau_init = float(getattr(dataset, 'gumbel_tau_init', 1.0))
+    tau_final = float(getattr(dataset, 'gumbel_tau_final', 0.1))
+    anneal_iters = int(getattr(dataset, 'gumbel_anneal_iters', 0))
+    if anneal_iters <= 0:
+        anneal_iters = relax_stage_max_iter
+    progress = min(max(float(iteration) / max(float(anneal_iters), 1.0), 0.0), 1.0)
+    temperature = tau_init + (tau_final - tau_init) * progress
+    gaussians.set_mixed_precision_temperature(temperature)
+    return temperature
+
+
+def maybe_print_hmq_snapshot(gaussians, iteration, max_quantizers_per_attr=10):
+    if not gaussians.has_relaxed_mixed_precision():
+        return
+    if int(iteration) != 0 and int(iteration) % 100 != 0:
+        return
+    gaussians.print_mixed_precision_snapshot(
+        iteration=iteration,
+        max_quantizers_per_attr=max_quantizers_per_attr,
+    )
 
 
 def get_rate_diag_param_groups(gaussians):
@@ -1088,94 +1250,44 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
 
     target_quant_type = str(getattr(dataset, 'quant_type', 'vanilla')).lower()
     learnable_quant_start_iter = max(int(getattr(dataset, 'learnable_quant_start_iter', 0)), 0)
+    requested_mixed_precision_relax = bool(getattr(dataset, 'mixed_precision_relax', False))
     use_two_stage_learnable_quant = (
         target_quant_type in ("lsq", "lsqplus", "lsq+")
-        and learnable_quant_start_iter > 0
+        and (learnable_quant_start_iter > 0 or requested_mixed_precision_relax)
     )
     active_quant_type = "vanilla" if use_two_stage_learnable_quant else target_quant_type
     dataset.active_quant_type = active_quant_type
 
     if use_two_stage_learnable_quant:
-        print(
-            f"  两阶段量化: 前 {learnable_quant_start_iter} iter 使用 VANILLA，"
-            f"随后切换到 {target_quant_type.upper()}"
-        )
-        if learnable_quant_start_iter >= opt.iterations:
+        if bool(getattr(dataset, 'mixed_precision_relax', False)):
             print(
-                f"  提示: learnable_quant_start_iter={learnable_quant_start_iter} >= total_iters={opt.iterations}，"
-                "本次训练将全程保持 VANILLA 量化"
-            )
-
-    def init_active_quantizers(quant_type_name):
-        dataset.active_quant_type = quant_type_name
-        if dataset.per_channel_quant:
-            print(f"  量化模式：per_channel_quant")
-            dataset.n_block = 1    #一个属性只用一个量化器，不使用之前定义的n_block
-            bit_config = {
-                'opacity': 8,
-                'euler': 8,
-                'scale': 10,
-                'f_dc': 8,
-                'f_rest_0': 4,
-                'f_rest_1': 4,
-                'f_rest_2': 2,
-            }
-            gaussians.init_qas(
-                dataset.n_block,
-                bit_config=bit_config,
-                quant_type=quant_type_name,
-                lsqplus_learnbeta=getattr(dataset, 'LSQplus_learnbeta', False),
-                vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
-                encode=getattr(dataset, 'encode', 'deflate'),
-                ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
-                use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
-                adaptive_block_quant=getattr(dataset, 'adaptive_block_quant', False),
-                adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
-                adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 8),
-                adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
-                adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
-                adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-6),
-                adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
-                adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
-                adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
-                adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
-            )
-            print(f"  通道量化: 启用")
-        elif dataset.per_block_quant:
-            print(f"  量化模式：per_block_quant")
-            bit_config = {
-                'opacity': 8,       # alpha
-                'euler': 8,         # rotation (欧拉角)
-                'scale': 10,        # 需要更高精度
-                'f_dc': 8,          # sh_0
-                'f_rest_0': 4,      # sh_1 (SH degree 1: 9维)
-                'f_rest_1': 4,      # sh_2 (SH degree 2: 15维)
-                'f_rest_2': 2,      # sh_3 (SH degree 3: 21维)
-            }
-            gaussians.init_qas(
-                dataset.n_block,
-                bit_config=bit_config,
-                quant_type=quant_type_name,
-                lsqplus_learnbeta=getattr(dataset, 'LSQplus_learnbeta', False),
-                vanilla_withzeropoint=getattr(dataset, 'vanilla_withzeropoint', None),
-                encode=getattr(dataset, 'encode', 'deflate'),
-                ans_subgroup_count=getattr(dataset, 'ans_subgroup_count', 1),
-                use_center_inflated_laplace=not getattr(dataset, 'disable_center_inflated_laplace', False),
-                adaptive_block_quant=getattr(dataset, 'adaptive_block_quant', False),
-                adaptive_bootstrap_iters=getattr(dataset, 'adaptive_bootstrap_iters', 200),
-                adaptive_update_interval=getattr(dataset, 'adaptive_update_interval', 10),
-                adaptive_step_alpha=getattr(dataset, 'adaptive_step_alpha', 0.35),
-                adaptive_step_beta=getattr(dataset, 'adaptive_step_beta', 0.25),
-                adaptive_step_eps=getattr(dataset, 'adaptive_step_eps', 1e-8),
-                adaptive_step_ema_decay=getattr(dataset, 'adaptive_step_ema_decay', 0.9),
-                adaptive_step_clip_min=getattr(dataset, 'adaptive_step_clip_min', 0.5),
-                adaptive_step_clip_max=getattr(dataset, 'adaptive_step_clip_max', 2.0),
-                adaptive_keep_vanilla_zero_point=getattr(dataset, 'adaptive_keep_vanilla_zero_point', True),
+                f"  两阶段量化: Stage 1 使用 VANILLA + bit relaxation，"
+                f"满足条件后自动切换到 {target_quant_type.upper()}"
             )
         else:
-            print(f"未知的量化模式")
+            print(
+                f"  两阶段量化: 前 {learnable_quant_start_iter} iter 使用 VANILLA，"
+                f"随后切换到 {target_quant_type.upper()}"
+            )
+            if learnable_quant_start_iter >= opt.iterations:
+                print(
+                    f"  提示: learnable_quant_start_iter={learnable_quant_start_iter} >= total_iters={opt.iterations}，"
+                    "本次训练将全程保持 VANILLA 量化"
+                )
 
-    init_active_quantizers(active_quant_type)
+    mixed_precision_relax_enabled = bool(getattr(dataset, 'mixed_precision_relax', False))
+    if mixed_precision_relax_enabled and str(getattr(dataset, 'encode', 'deflate')).lower() != "laplace":
+        print("  提示: mixed_precision_relax 当前仅建议与 Laplace 码率代理一起使用，已自动关闭该开关")
+        mixed_precision_relax_enabled = False
+        dataset.mixed_precision_relax = False
+    stage2_group_bit_config = None
+
+    init_active_quantizers_for_training(
+        dataset,
+        gaussians,
+        active_quant_type,
+        mixed_precision_relax_enabled,
+    )
 
     # VQ训练（本项目不使用VQ，已删去VQ内部函数，进入vq_fe函数后会直接返回）
     # gaussians.vq_fe(imp, dataset.codebook_size, dataset.batch_size, dataset.steps)
@@ -1264,18 +1376,17 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             print("  当前损失模式: distortion-only (loss_D)")
     print("="*70 + "\n")
     
-    def refresh_finetune_optimizers():
-        gaussians.finetuning_setup(copy.deepcopy(opt)) #微调，需要固定位置，只对外观微调
+    aux_optimizer = refresh_finetune_optimizers(gaussians, opt, encode_mode)
 
-        local_aux_optimizer = None
-        if encode_mode == "ans" and hasattr(gaussians, 'ans_entropy_bottlenecks'):
-            aux_quantiles = [eb.quantiles for eb in gaussians.ans_entropy_bottlenecks.values()]
-            if aux_quantiles:
-                local_aux_optimizer = torch.optim.Adam(aux_quantiles, lr=1e-3)
-                print(f"\n【ANS 编码】已启用，初始化 aux_optimizer 管理 {len(aux_quantiles)} 个 CDF 参数")
-        return local_aux_optimizer
+    relax_stage_min_iter = max(int(opt.iterations * float(getattr(dataset, 'stage1_min_frac', 0.3))), 1)
+    relax_stage_max_iter = max(int(opt.iterations * float(getattr(dataset, 'stage1_max_frac', 0.5))), relax_stage_min_iter)
+    relax_sharpness_threshold = float(getattr(dataset, 'stage1_sharpness_threshold', 0.97))
+    relax_sharpness_patience = max(int(getattr(dataset, 'stage1_sharpness_patience', 100)), 1)
+    relax_sharpness_counter = 0
 
-    aux_optimizer = refresh_finetune_optimizers()
+    if gaussians.has_relaxed_mixed_precision():
+        maybe_update_relax_temperature(gaussians, dataset, 0, relax_stage_max_iter)
+        maybe_print_hmq_snapshot(gaussians, 0)
 
     # 输出初始LSQ scale参数
     if dataset.per_block_quant and getattr(dataset, 'active_quant_type', dataset.quant_type).lower() in ("lsq", "lsqplus", "lsq+"):
@@ -1289,7 +1400,7 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
     progress_bar = tqdm(range(opt.iterations), desc="微调进度")
     psnr_train = 0
     for iteration in range(1, opt.iterations + 1):    
-        if use_two_stage_learnable_quant and iteration == learnable_quant_start_iter + 1:
+        if (not mixed_precision_relax_enabled) and use_two_stage_learnable_quant and iteration == learnable_quant_start_iter + 1:
             print("\n" + "-"*50)
             print(f"【Stage Switch】Iter {iteration}")
             print("-"*50)
@@ -1297,14 +1408,25 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 f"  已完成 {learnable_quant_start_iter} 次 VANILLA 恢复，"
                 f"开始初始化 {target_quant_type.upper()} 可学习量化器"
             )
-            init_active_quantizers(target_quant_type)
-            aux_optimizer = refresh_finetune_optimizers()
+            init_active_quantizers_for_training(
+                dataset,
+                gaussians,
+                target_quant_type,
+                mixed_precision_relax_enabled,
+            )
+            aux_optimizer = refresh_finetune_optimizers(gaussians, opt, encode_mode)
             gaussians.clear_static_eval_quant_cache()
             if dataset.per_block_quant and target_quant_type in ("lsq", "lsqplus", "lsq+"):
                 gaussians.print_lsq_scale_evolution(iteration)
             use_two_stage_learnable_quant = False
 
         gaussians.clear_static_eval_quant_cache()
+        current_relax_temperature = maybe_update_relax_temperature(
+            gaussians,
+            dataset,
+            iteration,
+            relax_stage_max_iter,
+        )
         iter_start.record()
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
@@ -1370,14 +1492,18 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
         # 提取概率并计算 Rate Loss (码率约束)
         # ==========================================
         loss_R = torch.tensor(0.0, device="cuda")
+        loss_B = torch.tensor(0.0, device="cuda")
+        num_points = gaussians.get_xyz.shape[0]
 
         if "total_bits" in render_pkg:
             total_bits = render_pkg["total_bits"]
-            num_points = gaussians.get_xyz.shape[0]
             if num_points > 0:
                 if iteration % 10 == 0:
                     print(f"迭代 {iteration}: 当前总比特数 = {total_bits.item():.2f} bits, 平均每点 = {total_bits.item()/num_points:.4f} bits/point")
                 loss_R = total_bits / num_points
+
+        if gaussians.has_relaxed_mixed_precision():
+            loss_B = gaussians.get_mixed_precision_entropy_loss()
         
         # ==========================================
         # 组装最终 Loss
@@ -1391,6 +1517,9 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
             loss = (1-dataset.lambda_sparsity) * loss + dataset.lambda_sparsity * loss_S
         if uses_rate_model and dataset.lambda_rate > 0:
             loss = (1-dataset.lambda_rate) * loss + dataset.lambda_rate * loss_R
+        if gaussians.has_relaxed_mixed_precision() and float(getattr(dataset, 'bit_entropy_lambda', 0.0)) > 0.0:
+            loss = loss + float(getattr(dataset, 'bit_entropy_lambda', 0.0)) * loss_B
+            
         if PROFILE_TIME:
             t_loss_end.record()
 
@@ -1539,13 +1668,34 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 if dataset.lambda_sparsity > 0 and isinstance(loss_S, torch.Tensor):
                     postfix_dict["稀疏"] = f"{loss_S.item():.2e}"
                 if uses_rate_model and isinstance(loss_R, torch.Tensor):
-                    postfix_dict["码率loss"] = f"{loss_R.item():.2e}"
+                    postfix_dict["loss_R"] = f"{loss_R.item():.2e}"
+                if gaussians.has_relaxed_mixed_precision():
+                    relax_stats = gaussians.collect_mixed_precision_stats()
+                    postfix_dict["loss_B"] = f"{loss_B.item():.2e}"
+                    postfix_dict["bit_maxp"] = f"{relax_stats['avg_max_prob']:.3f}"
+                    if current_relax_temperature is not None:
+                        postfix_dict["tau"] = f"{current_relax_temperature:.3f}"
+
                 progress_bar.set_postfix(postfix_dict)
                 progress_bar.update(10)
             
             # # 每100次迭代输出LSQ scale参数演化
             if iteration % 10 == 0:
                 gaussians.print_lsq_scale_evolution(iteration)
+                if gaussians.has_relaxed_mixed_precision():
+                    relax_stats = gaussians.collect_mixed_precision_stats()
+                    print(
+                        "[mixed-precision] "
+                        f"iter={iteration} "
+                        f"loss_B={loss_B.item():.4e} "
+                        f"weighted_loss_B={(float(getattr(dataset, 'bit_entropy_lambda', 0.0)) * loss_B.item()):.4e} "
+                        f"loss_R={loss_R.item():.4e} "
+                        f"tau={(current_relax_temperature if current_relax_temperature is not None else 0.0):.4f} "
+                        f"groups={relax_stats['num_groups']} "
+                        f"avg_max_prob={relax_stats['avg_max_prob']:.4f} "
+                        f"avg_entropy={relax_stats['avg_entropy']:.4f}"
+                    )
+                    maybe_print_hmq_snapshot(gaussians, iteration)
             
             # # 每50次迭代输出简要统计信息
             # if iteration % 50 == 0 and dataset.per_block_quant and dataset.quant_type.lower() == "lsq":
@@ -1616,6 +1766,47 @@ def training(dataset, opt, pipe, testing_iterations, given_ply_path=None):
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 gaussians.update_learning_rate(iteration+30000)
                 gaussians.clear_static_eval_quant_cache()
+                if gaussians.has_relaxed_mixed_precision():
+                    relax_stats = gaussians.collect_mixed_precision_stats()
+                    if iteration >= relax_stage_min_iter and relax_stats["avg_max_prob"] >= relax_sharpness_threshold:
+                        relax_sharpness_counter += 1
+                    else:
+                        relax_sharpness_counter = 0
+
+                    should_switch_to_stage2 = (
+                        target_quant_type in ("lsq", "lsqplus", "lsq+")
+                        and (
+                            iteration >= relax_stage_max_iter
+                            or relax_sharpness_counter >= relax_sharpness_patience
+                        )
+                    )
+                    if should_switch_to_stage2:
+                        stage2_group_bit_config = gaussians.freeze_mixed_precision_group_bits()
+                        print("\n" + "-"*50)
+                        print(f"【Auto Stage Switch】Iter {iteration}")
+                        print("-"*50)
+                        print(
+                            f"  mixed-precision stage结束: avg_max_prob={relax_stats['avg_max_prob']:.4f}, "
+                            f"counter={relax_sharpness_counter}/{relax_sharpness_patience}"
+                        )
+                        print(
+                            f"  固定位宽后切换到 {target_quant_type.upper()}，"
+                            f"按块位深集合: {sorted(set(stage2_group_bit_config))}"
+                        )
+                        init_active_quantizers_for_training(
+                            dataset,
+                            gaussians,
+                            target_quant_type,
+                            mixed_precision_relax_enabled,
+                            group_bit_config=stage2_group_bit_config,
+                        )
+                        aux_optimizer = refresh_finetune_optimizers(gaussians, opt, encode_mode)
+                        gaussians.clear_static_eval_quant_cache()
+                        mixed_precision_relax_enabled = False
+                        use_two_stage_learnable_quant = False
+                        relax_sharpness_counter = 0
+                        if dataset.per_block_quant and target_quant_type in ("lsq", "lsqplus", "lsq+"):
+                            gaussians.print_lsq_scale_evolution(iteration)
                 if PROFILE_TIME:
                     t_opt_end.record()
                     torch.cuda.synchronize()

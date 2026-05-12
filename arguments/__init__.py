@@ -103,18 +103,18 @@ class ModelParams(ParamGroup):
         #######################################################################
         #------------使用HMQ第一阶段选出最佳量化位深的配置（start）----------------
         self.mixed_precision_relax=False  #HMQ中混合精度训练的松弛机制开关，第一阶段确定最佳位深
-        self.opacity_bit_candidates="8,9,10,11"
-        self.euler_bit_candidates="8,9,10,11"
-        self.f_dc_bit_candidates="8,9,10,11"
+        self.opacity_bit_candidates="7,8,9,10"
+        self.euler_bit_candidates="7,8,9,10"
+        self.f_dc_bit_candidates="7,8,9,10"
         self.f_rest_0_bit_candidates="1,2,3,4"
         self.f_rest_1_bit_candidates="1,2,3,4"
         self.f_rest_2_bit_candidates="1,2,3,4"
-        self.scale_bit_candidates="9,10,11,12"
+        self.scale_bit_candidates="8,9,10,11"
         self.gumbel_tau_init=1.0    # 初始化温度系数
         self.gumbel_tau_final=0.1   # 结束的温度系数
-        self.gumbel_anneal_iters=1000  # Gumbel退火迭代次数，0表示不退火，但如果为0，则迭代次数为stage1_max_frac*total_iters
+        self.gumbel_anneal_iters=500  # Gumbel退火迭代次数，0表示不退火，但如果为0，则迭代次数为stage1_max_frac*total_iters
         self.bit_entropy_lambda=0.002 # bitdepth Gumbel-sofmax阶段的位熵损失权重，希望候选位深的概率熵小（也就是稳定）
-        self.stage1_min_frac=0.1    # HMQ最少迭代比例，如果gumbel_anneal_iters=0，迭代次数为stage1_max_frac*total_iters
+        self.stage1_min_frac=0.05   # HMQ最少迭代比例，如果gumbel_anneal_iters=0，迭代次数为stage1_max_frac*total_iters
         self.stage1_max_frac=0.5    # HMQ最多迭代比例
         self.stage1_sharpness_threshold=0.8
         self.stage1_sharpness_patience=100

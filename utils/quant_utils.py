@@ -313,6 +313,24 @@ def _estimate_zero_inflated_laplace_bits(
     zero_inflation_mask=None,
     center_symbol_tensor=None,
 ):
+    per_group_bits, block_mean, raw_scale, block_zero_probs, block_center_symbols = _estimate_zero_inflated_laplace_bits_per_group(
+        symbols,
+        split_tensor,
+        zero_mean_mask=zero_mean_mask,
+        zero_inflation_mask=zero_inflation_mask,
+        center_symbol_tensor=center_symbol_tensor,
+    )
+    total_bits = per_group_bits.sum()
+    return total_bits, block_mean, raw_scale, block_zero_probs, block_center_symbols
+
+
+def _estimate_zero_inflated_laplace_bits_per_group(
+    symbols,
+    split_tensor,
+    zero_mean_mask=None,
+    zero_inflation_mask=None,
+    center_symbol_tensor=None,
+):
     max_block_len = symbols.shape[-1]
     valid_mask = (
         torch.arange(max_block_len, device=symbols.device, dtype=torch.long)
@@ -341,8 +359,8 @@ def _estimate_zero_inflated_laplace_bits(
         center_symbol_tensor=block_center_symbols.unsqueeze(-1),
     )
     per_element_bits = -torch.log2(probs)
-    total_bits = (per_element_bits * valid_mask_f).sum()
-    return total_bits, block_mean, raw_scale, block_zero_probs, block_center_symbols
+    per_group_bits = (per_element_bits * valid_mask_f).sum(dim=-1)
+    return per_group_bits, block_mean, raw_scale, block_zero_probs, block_center_symbols
 
 
 def _laplace_bits_with_tail_clip(quantized_symbols, block_scale, block_mean=None, sigma=3.0):
@@ -700,7 +718,6 @@ def _batched_relaxed_quantize_blocks(
     candidate_count = len(flat_qas[0].candidate_bits)
     can_use_candidate_major = (
         use_soft_relaxation
-        and not return_ans_bits
         and all(len(qa.candidate_bits) == candidate_count for qa in flat_qas)
     )
 
@@ -806,6 +823,14 @@ def _batched_relaxed_quantize_blocks(
             _sync_profile_device(x.device)
             quant_profile["quant_param_stack"] = time.perf_counter() - stage_start
 
+        use_center_inflation_mask = None
+        if return_ans_bits and encode_mode == "laplace":
+            use_center_inflation_mask = torch.tensor(
+                [bool(getattr(qa, "use_center_inflated_laplace", True)) for qa in flat_qas],
+                device=x.device,
+                dtype=torch.bool,
+            ).view(n_dims, n_blocks, 1)
+
         if quant_profile is not None and profile_time:
             _sync_profile_device(x.device)
             stage_start = time.perf_counter()
@@ -851,6 +876,25 @@ def _batched_relaxed_quantize_blocks(
             else:
                 dequantized = x_q * scales
             mixed_dequantized = mixed_dequantized + prob_tensor[:, :, candidate_idx].unsqueeze(-1) * dequantized
+            if return_ans_bits and encode_mode == "laplace":
+                if with_zero_point:
+                    zero_mean_mask = torch.zeros_like(use_center_inflation_mask)
+                    zero_inflation_mask = use_center_inflation_mask
+                    center_symbol_tensor = offsets.detach()
+                else:
+                    zero_mean_mask = (thd_neg < 0.0) & (0.0 < thd_pos)
+                    zero_inflation_mask = use_center_inflation_mask & zero_mean_mask
+                    center_symbol_tensor = torch.zeros_like(offsets)
+                per_group_bits, _, _, _, _ = _estimate_zero_inflated_laplace_bits_per_group(
+                    x_q,
+                    split_tensor,
+                    zero_mean_mask=zero_mean_mask,
+                    zero_inflation_mask=zero_inflation_mask,
+                    center_symbol_tensor=center_symbol_tensor,
+                )
+                ans_bits = ans_bits + (
+                    per_group_bits * prob_tensor[:, :, candidate_idx]
+                ).sum()
 
         out_packed.copy_(mixed_dequantized)
         if quant_profile is not None and profile_time:
